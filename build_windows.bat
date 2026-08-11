@@ -42,11 +42,10 @@ if not exist "%TOOLCHAIN_PATH%\bin\riscv64-unknown-elf-gcc.exe" (
 
 rem ---- PATH ----
 set "PATH=%~dp0tools;%TOOLCHAIN_PATH%\bin;%BL_SDK_BASE%\tools\make;%BL_SDK_BASE%\tools\cmake\bin;%BL_SDK_BASE%\tools\ninja;%PATH%"
-rem GitHub-hosted Windows runners expose Git Bash as SHELL.  The SDK passes
-rem native drive-letter paths to recipe commands, which Bash strips into
-rem invalid paths (for example D:\a\... becomes D:a...).  Force the bundled
-rem Windows make to execute recipes through cmd.exe.
-set "SHELL=cmd.exe"
+rem GitHub-hosted Windows runners can pass Git Bash to GNU make as a command-line
+rem variable.  Environment-only overrides lose to that value, so every top-level
+rem make invocation below explicitly sets SHELL=cmd.exe.  Recursive $(MAKE)
+rem calls inherit it and keep native drive-letter paths intact.
 
 set "ACTION=%~1"
 if "%ACTION%"=="" set "ACTION=build"
@@ -57,7 +56,7 @@ if /i "%ACTION%"=="both"  goto :both
 
 rem build / rebuild
 if /i "%ACTION%"=="rebuild" (
-    if exist build make clean 2>nul
+    if exist build make SHELL=cmd.exe clean 2>nul
 )
 call :build_one
 if errorlevel 1 exit /b !errorlevel!
@@ -109,14 +108,14 @@ goto :done
         set /p PREV_KEY=<"%BOARD_STAMP%"
         if not "!PREV_KEY!"=="%BUILD_KEY%" (
             echo [build] Config changed ^(!PREV_KEY! -^> %BUILD_KEY%^), forcing clean...
-            if exist build make clean 2>nul
+            if exist build make SHELL=cmd.exe clean 2>nul
         )
     ) else if exist "build\CMakeCache.txt" (
         echo [build] Build stamp missing, forcing CMake reconfigure...
-        make clean 2>nul
+        make SHELL=cmd.exe clean 2>nul
     )
     echo [build] Target: %BOARD_TYPE%  USB: %USB_SPEED%  LOG: %DS5_LOG_LEVEL%
-    make -j%NUMBER_OF_PROCESSORS%
+    make SHELL=cmd.exe -j%NUMBER_OF_PROCESSORS%
     if errorlevel 1 exit /b 1
     if not exist build mkdir build
     >"%BOARD_STAMP%" echo %BUILD_KEY%
@@ -129,13 +128,13 @@ goto :done
     goto :eof
 
 :clean
-make clean
+make SHELL=cmd.exe clean
 goto :done
 
 :flash
 set "COMX=%~2"
 if "%COMX%"=="" set "COMX=COM5"
-make flash COMX=%COMX%
+make SHELL=cmd.exe flash COMX=%COMX%
 goto :done
 
 :done
