@@ -1,179 +1,358 @@
-# M61 DualSense Dongle
+# DS5Dongle BL618
 
-[简体中文](README.zh-CN.md)
+> Windows users: the multi-board one-file flasher, verified package format, and release workflow are documented in [docs/FLASHER.md](docs/FLASHER.md).
 
-An open-source, single-chip DualSense-to-USB bridge for the Ai-M61-32s-Kit
-(BL616/BL618 family). The M61 connects to a real DualSense over Bluetooth
-Classic HIDP and exposes a native USB `054C:0CE6` DualSense composite device
-to the host PC.
+[中文文档 (Chinese)](README_CN.md)
 
-```text
-DualSense -- Bluetooth Classic HIDP --> M61 -- native USB --> PC
+A wireless DualSense controller adapter based on BL616/BL618. It bridges a DualSense or DualSense Edge gamepad over Bluetooth Classic (BR/EDR) HID to a host PC via USB HID, appearing as a standard wired DualSense (VID 054C / PID 0CE6) or DualSense Edge (PID 0DF2). Fully compatible with Steam, SDL, PS Remote Play, and more.
+
+Ported from [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) (Raspberry Pi Pico 2W). The BT stack was migrated from BTstack to Bouffalo SDK (Zephyr-based), and the USB stack from TinyUSB to CherryUSB.
+
+> **Unofficial project** — not affiliated with or endorsed by Sony Interactive Entertainment. "DualSense", "DualSense Edge" and "PlayStation" are trademarks of Sony Interactive Entertainment. The USB VID/PID values (054C:0CE6 / 0DF2) are emulated so the host sees a standard wired controller; use at your own risk.
+
+## Supported Boards
+
+| Board | Chip | USB | LED | Debug |
+|-------|------|-----|-----|-------|
+| **LCTech BL616** | BL616 QFN32 | Type-C native | 1x blue (GPIO27) | External USB-TTL |
+| **Ai-M61-32S-Kit** (default) | BL618 QFN56 | GPIO37/38 fly-wire | RGB + white (4 LED) | Type-C CH340 |
+| **Sipeed M0S Dock** | BL616 QFN32 | Type-C native | 2x red (GPIO27/28) | External USB-TTL |
+
+> **The default build target is Ai-M61-32S-Kit.** Run the build scripts without `BOARD_TYPE`; use `BOARD_TYPE=lctech616` or `BOARD_TYPE=m0sdock` only when explicitly targeting another board.
+
+LED pin assignments and USB topology differ per board and are handled at compile time via `board_config.h`.
+
+## Hardware Requirements
+
+- **LCTech BL616**, **Ai-M61-32S-Kit**, or **Sipeed M0S Dock** dev board
+- **DualSense controller** (standard 0CE6) or **DualSense Edge** (0DF2, auto-detected)
+- LCTech BL616 / M0S Dock: just a USB-C cable (native USB)
+- For Ai-M61-32S-Kit: **USB data cable** (cut and wire to USB_DM/USB_DP header pins)
+- For LCTech / M0S Dock serial debug: **USB-TTL adapter** (CH340/CH341, 3.3V)
+
+### USB Wiring (Ai-M61-32S-Kit only)
+
+The on-board Type-C port is a UART bridge (for flashing/debug). Native USB must be wired from header pins:
+
+```
+Pin 37 (USB_DM) → USB D- (white)
+Pin 38 (USB_DP) → USB D+ (green)
+GND              → USB GND (black)
 ```
 
-This is an independent community project. It is not affiliated with or
-endorsed by Sony Interactive Entertainment. “DualSense” is a trademark of
-its respective owner.
+If the host does not supply power over USB, the board needs separate power via its Type-C port.
 
-New users should begin with [Quick start](docs/QUICK_START.md): download the
-graphical flasher, enter BOOT+RESET, wire the board's dedicated
-`USB_DP`/`USB_DM` headers, pair the controller, and save the WebUI settings.
+> **LCTech BL616 / M0S Dock**: USB is natively connected via Type-C. No wiring needed.
 
-## Current capabilities
+## Getting Started
 
-| Area | Implemented |
-| --- | --- |
-| Bluetooth | BR/EDR discovery, pairing/security, SDP, HID control/interrupt L2CAP, saved-device reconnect |
-| USB HID | DualSense descriptors and input reports, output reports, complete Feature GET/SET proxy |
-| Controller output | Light bar/player LEDs, mute LED, standard rumble, adaptive triggers |
-| Audio and haptics | 48 kHz/16-bit four-channel USB OUT, speaker/headset routing, HD haptics, Opus transport |
-| Microphone | DualSense Opus decode to 48 kHz/16-bit stereo USB IN (duplicated controller mono) |
-| Runtime controls | Persistent audio routing/buffer hint, hardware-PWM LED brightness, 320/384/400 MHz DVFS, stick deadzones, idle power-off, and 250/500 Hz USB report modes |
-| WebUI | Versioned WebHID configuration, Flash persistence, controller management, and bounded telemetry |
-| Diagnostics | Serial status/bring-up commands, compile-gated HPM/pipeline/runtime profiling, host validation tools |
+### 1. Bouffalo SDK (DS5Dongle fork — required)
 
-The production defaults are conservative and deterministic: 320 MHz manual
-CPU mode, microphone disabled, automatic speaker route, no overclock, no stick
-deadzone, 12% status-LED brightness, audio buffer length 48, no inactivity
-power-off, and realtime Bluetooth report forwarding.
-See [Features and limitations](docs/FEATURES.md) for validation status and
-known constraints.
+> The official Bouffalo SDK will **not** work with this project — it is missing the required BT HID net_buf pools and USB Audio request handling. You must use the project's SDK fork:
 
-Configure these persistent settings from the M61-specific WebHID application:
-<https://ds5.766677.xyz/>. Use a Chromium-based
-browser over HTTPS, connect the M61, read the current configuration, then save
-the complete configuration to Flash. The USB report choices are realtime
-fresh-report forwarding and hardware-validated fixed 250 Hz or 500 Hz modes;
-fixed modes may repeat the latest Bluetooth sample and do not raise the
-controller's native sampling rate.
-
-The supported controller target is the standard DualSense. DualSense Edge is
-not supported or hardware-qualified. During long wireless speaker playback,
-the sound can occasionally become temporarily muffled and later recover; this
-known limitation does not affect USB enumeration or controller input.
-
-## Using a prebuilt Release
-
-Normal Windows users only need `M61-Flasher-Windows.exe` from the project
-[Releases](https://github.com/ccc007ccc/DS5Dongle/releases). Double-click it to
-open the graphical interface, select a firmware version from the complete
-verified Release list, and follow
-the BOOT+RESET instructions. It detects the M61 CH340 port, downloads and
-checks the selected complete firmware ZIP, and can download the signed
-official WCH driver when the connected CH340 has no usable COM port.
-
-No repository clone, Python, Rust, SDK, or compiler is required. The community
-EXE is not Authenticode code-signed, so Windows SmartScreen may ask for
-confirmation. Download it only from this repository and verify the SHA256
-published beside it. The manual three-BIN developer path remains documented in
-[Building and flashing](docs/BUILDING.md).
-
-The flasher GUI supports Simplified Chinese and English, defaults from the
-Windows user locale, and provides an in-app language selector.
-For offline or custom flashing, select a downloaded
-`M61-Firmware-<version>.zip` directly; an advanced three-file directory option
-is also available. The log supports mouse selection and a Copy all button.
-
-## Performance-reproducible build
-
-The default build is the measured release profile, not an SDK fallback:
-
-- Bouffalo SDK `2.3.24` at commit
-  `d9306a4a221db414131337ec95113e3adaf7072b`;
-- Xuantie/T-Head GCC 10.2.0 V2.6.1 at a pinned platform commit;
-- Opus 1.2.1 downloaded by SHA256 and rebuilt with the tracked 11-patch E907
-  optimization stack;
-- `m61_usb_gamepad.c` at `-O2`, Opus at `-O2 -flto`, 160 KiB WRAM, 1 ms
-  codec window, Flash-resident nibble CRC, and decode-MDCT SRAM placement;
-- HPM, pipeline, task-runtime, and Opus-stage instrumentation disabled.
-
-`build_windows.ps1` and `build.sh` reject an unpinned SDK/toolchain by default.
-Every successful build emits a JSON provenance manifest beside the firmware.
-The complete lock is
-[`reproducible-build.lock.json`](m61/dualsense_hidp_probe/reproducible-build.lock.json).
-
-## Developer build (Windows)
-
-Clone the three repositories at their locked commits:
-
-```powershell
-git clone https://github.com/ccc007ccc/DS5Dongle.git
-git clone https://github.com/bouffalolab/bl_mcu_sdk.git
-git -C bl_mcu_sdk checkout d9306a4a221db414131337ec95113e3adaf7072b
-git clone https://github.com/bouffalolab/toolchain_gcc_t-head_windows.git
-git -C toolchain_gcc_t-head_windows checkout 072fc29d765774d66366c57a4d962e90c366ef1b
-
-cd DS5Dongle\m61\dualsense_hidp_probe
-.\build_windows.ps1 -Command All `
-  -SdkPath C:\path\to\bl_mcu_sdk `
-  -ToolchainBin C:\path\to\toolchain_gcc_t-head_windows\bin
+```bash
+git clone https://github.com/sqlCRT/bouffalo_sdk.git bouffalo_sdk
 ```
 
-The script downloads and verifies Opus automatically. Release artifacts are
-written to:
+The build script expects the SDK in `../bouffalo_sdk` (a sibling directory of this repository) and builds against the fork's `master` branch. The fork is based on upstream v2.3.28 with targeted DS5Dongle BL618 modifications; see its README for details.
 
-```text
-m61/dualsense_hidp_probe/build-win/build_out/
-  m61_dualsense_hidp_probe_bl616.bin
-  m61_dualsense_hidp_probe_bl616.elf
-  m61_dualsense_hidp_probe_bl616.map
-  m61_dualsense_hidp_probe_bl616.manifest.json
+### 2. Dependencies
+
+```bash
+# macOS
+brew install cmake
+brew install make          # GNU Make 4.0+ required by SDK
+
+# Linux (Ubuntu)
+sudo apt install cmake make
 ```
 
-Read [Building and flashing](docs/BUILDING.md) before overriding any release
-option. An override intentionally produces a `custom` manifest and is not a
-performance-equivalent release build.
+### 3. RISC-V Toolchain
 
-## Hardware
+BL616/BL618 uses the T-Head extended ISA. A standard `riscv64-elf-gcc` will not work.
 
-The Ai-M61-32s-Kit header directly exposes `USB_DP`, `USB_DM`, `5V`, and
-`GND`; GPIO numbers are not needed. Its onboard Type-C connector is attached
-to CH340 and is used for UART flashing, logs, and power, not game-controller
-enumeration.
+```bash
+# macOS ARM64 — community pre-built T-Head toolchain
+curl -L https://github.com/beckmx/bouffalo_labs_mac_toolchain/releases/download/v1.0/riscv64-unknown-elf-toolchain.tar.gz \
+  | tar xz -C ~/riscv-toolchain
 
-For normal use, connect only native USB so `5V`, `GND`, `USB_DP`, and
-`USB_DM` provide both power and controller data. For flashing, unplug native
-USB and connect only Type-C/CH340. Never let both USB paths supply 5 V at the
-same time. See [Quick start](docs/QUICK_START.md) and
-[Hardware and wiring](docs/HARDWARE.md) for the diagram and safety details.
-
-## Flash and verify
-
-Normal users run `M61-Flasher-Windows.exe`, select a firmware Release, and
-follow its on-screen instructions. Disconnect native USB while flashing and
-connect only Type-C/CH340. After flashing succeeds, unplug Type-C before
-connecting the four-wire native USB cable for normal use.
-
-Source development and hardware diagnostics use the repository commands below:
-
-```powershell
-python tools\flash_m61_firmware.py -p COM5 --windows-build
-python tools\check_m61_usb_windows.py
-python tools\validate_m61_usb_hardware.py -p COM5
+# Linux — the SDK ships its own toolchain, or download from T-Head
 ```
 
-The normal flasher default is 460800 baud. Select the board's CH340 UART
-(`1A86:7523`, typically COM5), not another transient USB serial port. Add
-`-b 115200` only as a conservative fallback for an unstable cable or hub.
+`build_macos.sh` auto-detects the toolchain under `~/riscv-toolchain/toolchain/bin`.
 
-`--reboot-isp` is a best-effort development convenience: some BL616 boards
-warm-reset into BootROM but then fail its eFuse read. Holding BOOT, tapping
-RESET, and releasing BOOT is the reliable recovery and flashing procedure.
+### 4. Build
 
-## Documentation
+```bash
+cd ds5dongle-bl618
 
-- [Quick start](docs/QUICK_START.md)
-- [Features and limitations](docs/FEATURES.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Building and flashing](docs/BUILDING.md)
-- [Hardware and wiring](docs/HARDWARE.md)
-- [Protocol and audio formats](docs/PROTOCOL.md)
-- [Performance and benchmark policy](docs/PERFORMANCE.md)
-- [Development and validation](docs/DEVELOPMENT.md)
-- [Dependencies, licensing, and redistribution](docs/OPEN_SOURCE.md)
+# Ai-M61-32S-Kit — default
+bash build_macos.sh build      # incremental compile (-j auto)
+bash build_macos.sh rebuild    # clean + compile
+
+# LCTech BL616
+BOARD_TYPE=lctech616 bash build_macos.sh rebuild
+# or: bash build_lctech616.sh rebuild
+
+# Sipeed M0S Dock
+BOARD_TYPE=m0sdock bash build_macos.sh rebuild
+# or: bash build_m0sdock.sh rebuild
+
+# USB speed — Full-Speed is the default (best cable compatibility);
+# use USB_SPEED=hs for the High-Speed 480 Mbps variant
+USB_SPEED=hs bash build_macos.sh rebuild
+
+# Other commands
+bash build_macos.sh clean      # clean only
+bash build_macos.sh strip      # remove .o/.a to shrink build dir
+```
+
+- **Default board: Ai-M61-32S-Kit** (`BOARD_TYPE=aim61`).
+- **Default USB speed: Full-Speed (12 Mbps)**; pass `USB_SPEED=hs` to build the High-Speed variant (higher polling ceiling, more sensitive to cable quality).
+- **Default firmware log level: `DS5_LOG_LEVEL=2`** (errors, warnings, and lifecycle events). `DS5_LOG_LEVEL=3` enables diagnostic aggregate logs; values outside `0..3` are rejected by CMake.
+- Switching `BOARD_TYPE`, `USB_SPEED`, or `DS5_LOG_LEVEL` triggers an automatic clean rebuild on Windows (CMake cache incompatible).
+
+Output: `firmware/{board}/ds5dongle-{board}.bin` (~800 KB) plus boot2/partition files and a `flash_prog_cfg.ini`. Built binaries are git-ignored — attach them to a GitHub Release if you want to distribute prebuilt firmware.
+
+#### Ai-M61 PSRAM policy
+
+Ai-M61 builds enable the module's 4 MiB PSRAM without registering it as a general-purpose heap. Only explicitly cold data, currently Bluetooth discovery results and Feature Report cache payloads, is placed there. USB endpoint/DMA buffers, PCM and microphone rings, Opus state, Bluetooth TX queues, and FreeRTOS stacks remain in internal SRAM/TCM. This frees internal capacity without adding external-memory cache-miss latency to the 1 ms USB and full-duplex DS5 audio paths. LCTech BL616 and M0S Dock builds do not enable PSRAM.
+
+#### Windows
+
+On Windows, clone the T-Head toolchain and use the provided script:
+
+```bat
+git clone https://gitee.com/bouffalolab/toolchain_gcc_t-head_windows.git
+
+build_windows.bat both         rem build Full-Speed + High-Speed variants
+build_windows.bat rebuild      rem Ai-M61, Full-Speed
+build_windows.bat              rem incremental build
+build_windows.bat flash COM5   rem flash via serial
+set DS5_LOG_LEVEL=3
+build_windows.bat rebuild      rem diagnostic build; production defaults to 2
+```
+
+`build_windows.bat both` produces both `ds5dongle-aim61.bin` (Full-Speed) and `ds5dongle-aim61-hs.bin` (High-Speed); a single High-Speed build is also possible via `USB_SPEED=hs build_windows.bat rebuild`.
+
+The script expects the DS5Dongle BL618 SDK fork at `..\bouffalo_sdk` (step 1) and the toolchain at `%USERPROFILE%\Desktop\toolchain_gcc_t-head_windows` by default. Override with the `BL_SDK_BASE` / `TOOLCHAIN_PATH` environment variables; other boards via `BOARD_TYPE=lctech616` / `BOARD_TYPE=m0sdock`. `DS5_LOG_LEVEL` accepts exactly `0`, `1`, `2`, or `3`; changing it is part of the Windows build key so an incremental build cannot silently retain an older CMake value.
+
+### 5. Flash
+
+#### Ai-M61-32S-Kit — default target
+
+1. Build the Full-Speed firmware with `build_windows.bat rebuild`. The complete raw flash set is written to `firmware/aim61/`.
+2. Create a verified local package:
+
+   ```powershell
+   python tools\package_firmware.py --board aim61 --usb-speed fs --version local --firmware-dir firmware\aim61 --output-dir dist
+   ```
+
+3. Connect the Ai-M61 through its on-board CH340 Type-C port. Hold **BOOT** while resetting or reconnecting the board to enter UART ISP mode.
+4. Open `DS5Dongle-Flasher-Windows.exe`, choose the generated `DS5Dongle-aim61-fs-vlocal.zip`, select the M61 COM port, and flash it. Full-Speed is recommended for initial hardware validation.
+
+#### LCTech BL616 — Dev Cube (UART/ISP mode)
+
+1. Build the firmware first — the build script outputs `ds5dongle-lctech616.bin`, `boot2_bl616_isp_release_v8.1.8.bin` and `partition_cfg_4M_nosec.toml` into `firmware/lctech616/`.
+2. Hold the **BOOT** button on the LCTech BL616, then plug the board into the PC via USB-C, keeping BOOT held until the board enters UART (ISP) download mode.
+3. Open [Bouffalo Lab Dev Cube](https://dev.bouffalolab.com/download), select chip **BL616**, and use the **ISP (UART)** flashing mode.
+4. Select the board's COM port, then load these files:
+   - Partition table: `firmware/lctech616/partition_cfg_4M_nosec.toml`
+   - Boot2: `firmware/lctech616/boot2_bl616_isp_release_v8.1.8.bin`
+   - Firmware: `firmware/lctech616/ds5dongle-lctech616.bin`
+5. Start the download.
+
+> Use the `_nosec` partition table (`partition_cfg_4M_nosec.toml`), not `partition_cfg_4M.toml`.
+
+Alternatively, flash via the build script:
+
+```bash
+bash build_macos.sh flash /dev/tty.usbserial-xxx
+```
+
+Other boards follow the same Dev Cube flow; use the files generated under `firmware/{board}/`.
+
+## Usage
+
+1. Power the Ai-M61 from its Type-C port, then connect its native USB pins (GPIO37/38/GND) to the target host as described above.
+2. Put the controller in pairing mode (hold **PS + Create** for 3 seconds, light bar flashes)
+3. Watch the on-board RGB/white LEDs for status (see LED table below)
+4. The host should see "DualSense Wireless Controller"
+
+> **Ai-M61-32S-Kit note:** its Type-C port is a UART bridge (flashing/debug only) — native USB must be wired from header pins (USB_DM/USB_DP/GND) to the target host, see USB Wiring above.
+
+### LED Status Indicators
+
+Ai-M61 uses its RGB and white LEDs for distinct state colors:
+
+| State | Ai-M61 pattern |
+|-------|----------------|
+| Idle / waiting to pair | Purple slow blink (~1Hz) |
+| Scanning | Purple fast blink (~3Hz) |
+| Connected | Green solid |
+| Just disconnected | Red slow blink for ~3s, then purple idle blink |
+| Battery ≤20% (discharging) | Green-yellow medium blink |
+| Battery ≤10% (discharging) | Red medium blink |
+| Auto-off | Off after 1 min (on by default; battery warnings unaffected) |
+| Event acknowledge | Blue single flash |
+| Bonds cleared | Blue triple flash |
+
+> **LCTech BL616 note (single blue LED):** idle = slow blink; scanning = fast blink; connected = solid; disconnect/battery warnings are distinguished by blink cadence; event acknowledge = single flash; bonds cleared = triple flash.
+>
+> **Sipeed M0S Dock note (two red LEDs, GPIO27/28):** LED0 (near Type-C) blinks for idle/scanning, LED1 stays solid when connected; disconnect = both sync blink; battery warning = LED0 fast blink; critical = both blink.
+
+### BOOT Button Gestures
+
+| Gesture | Action |
+|---------|--------|
+| **Single click** | Switch to the next paired controller (up to 8 remembered) |
+| **Double click** | Disconnect current controller + scan for a new one (link keys preserved) |
+| **Long press (3s)** | Clear all bonds + start scanning (triple LED flash to confirm) |
+
+## Features
+
+### Implemented
+
+- BT Classic HID Host: inquiry, SDP, L2CAP, SSP auto-pairing
+- Full input passthrough: sticks, buttons, triggers, gyro, accelerometer, touchpad, battery
+- Full output passthrough: rumble, RGB light bar, player indicators, adaptive triggers
+- Audio passthrough (bidirectional): UAC1 4ch 48kHz OUT → Opus encode → BT 0x39 dual-frame report (547B, speaker/headset); BT mic Opus → decode → UAC1 2ch 48kHz IN (microphone)
+- HD haptics: USB Audio Ch2/Ch3 → 16:1 decimation → BT 0x92 haptic tag
+- DualSense Edge full support: auto-detect → unlock handshake → profile prefetch → 437B descriptor, PID auto-switch (0DF2)
+- Multi-controller memory: remembers up to 8 paired controllers, single click to switch
+- Controller-initiated reconnect via L2CAP server registration (passive model)
+- Robust reconnection: periodic scan retry (~30s), connection watchdog (3s no-input detection), Link Supervision Timeout (5s), system reset fallback for stale ACL cleanup
+- Idle timeout: configurable 0–60 min auto-disconnect (default 30 min)
+- PS shortcut: short press → Win+G, long press → Win+Tab
+- Configurable polling rate: 250Hz / 500Hz / real-time (~750Hz, follows the BT report rate)
+- Button remap: remap any controller button to another controller button (Feature Report 0xFB)
+- MuteLight: mic button LED control (toggle on/off via the controller mute button)
+- USB remote wakeup: 6-state FSM + Boot Keyboard + auto power-off after 5s suspend
+- USB stealth mode: hide the USB device until a controller connects (configurable)
+- Custom controller light-bar color (default white), plus on-board RGB status LED
+- USB serial number: unique chip ID from eFuse (configurable, on by default)
+- Trigger motor power reduction: configurable 0–10 levels
+- Volume lock: prevent the host from changing controller speaker/headset volume
+- LED auto-off: steady LEDs turn off after 1 min (on by default; battery warnings unaffected)
+- Battery alerts: ≤20% green-yellow blink warning, ≤10% red blink critical
+- Multi-board support: Ai-M61-32S-Kit (default), LCTech BL616, Sipeed M0S Dock — compile-time board selection
+- Build-time log level control (`LOG_LEVEL` 0–3)
+- FreeRTOS multi-task architecture (BT / USB / Audio / Mic)
+
+### Known Limitations
+
+| Item | Description |
+|------|-------------|
+| Single active controller | One controller connected at a time; up to 8 pairings remembered (single click switches) |
+
+### Controller Feature Compatibility
+
+The USB side presents DualSense-compatible HID descriptors (auto-switching between DS and Edge; standard wired layout plus dongle-config Feature Reports 0xF6–0xF9 / 0xFB), so hosts treat the dongle like a wired controller.
+
+| Feature | Data Path | Supported |
+|---------|-----------|-----------|
+| Sticks / Buttons / Triggers | HID Input passthrough | Yes |
+| Gyro / Accelerometer | HID Input passthrough | Yes |
+| Touchpad | HID Input passthrough | Yes |
+| Battery level | HID Input passthrough | Yes (+ on-board LED low-battery alert) |
+| **Adaptive triggers** | HID Output SetStateData | Yes |
+| **Rumble** | HID Output SetStateData | Yes |
+| RGB light bar / Player LEDs | HID Output SetStateData | Yes |
+| **HD haptics** | USB Audio Ch2/Ch3 → BT 0x92 | Yes |
+| Controller speaker | USB Audio Ch0/Ch1 → Opus → BT 0x39 tag 0x93 | Yes |
+| Controller microphone | BT Input → Opus decode → USB Audio IN | Yes |
+| 3.5mm headset (output) | USB Audio → Opus → BT 0x39 tag 0x96 | Yes |
+| Mic mute LED | BT Input mute button → MuteLight control | Yes |
+
+## Configuration
+
+Settings persist via `bt_settings` and are read/written over USB Feature Reports 0xF6–0xF9. They can be changed from a web page without rebuilding (see Web Configuration). Highlights (defaults):
+
+| Option | Default |
+|--------|---------|
+| Controller mode | Auto (DS5 / Edge / Auto) |
+| Polling rate | 250Hz (250 / 500 / real-time ~750Hz) |
+| Idle auto-disconnect | 30 min (0–60, 0 = off) |
+| LED auto-off | On (after 1 min) |
+| Custom light-bar color | White |
+| USB serial number | On |
+| USB stealth mode | Off |
+| PS shortcut | Off |
+| USB remote wakeup | Off |
+| Haptics gain | 1.0 (1.0–2.0) |
+| Trigger motor reduction | 0 (0–10) |
+| Volume lock | Off |
+| Mic / speaker passthrough | On |
+
+## Project Structure
+
+```
+src/
+├── main.c              Entry + FreeRTOS task orchestration + data bridge
+├── bt_hid_host.c/h     BT Classic HID Host (Inquiry + SDP + L2CAP + SSP)
+├── ds5_protocol.c/h    DualSense protocol definitions + CRC32
+├── usb_gamepad.c/h     USB composite device (Gamepad + Boot Keyboard)
+├── ds5_usb_audio.c/h   USB Audio Class 1 (4ch 48kHz ISO OUT + 2ch 48kHz ISO IN)
+├── audio.c/h           Audio pipeline (sinc resample + Opus encode/decode + haptics + mic)
+├── usb_wake.c/h        USB remote wakeup FSM
+├── state_mgr.c/h       SetStateData conditional merge manager
+├── config.c/h          Configuration system (bt_settings + 0xF6-0xF9)
+├── dse.c/h             DualSense Edge profile management
+├── remap.c/h           Button remap
+├── led_status.c/h      LED status indicator (RGB on Ai-M61 / dual-red on M0S Dock / single on LCTech)
+├── board_config.h      Board abstraction (LED pins/polarity, USB type, board name)
+├── memory_layout.h     Ai-M61 cold-data PSRAM placement policy
+├── debug_log.h         Build-time log level macros (LOG_ERR/WRN/INF/DBG/ISR)
+└── FreeRTOSConfig.h    FreeRTOS configuration
+lib/
+├── opus/               Opus codec (fixed-point, xiph/opus)
+├── opus.cmake          Opus source file list
+└── opus_config.h       Opus build configuration
+firmware/               Board flash configs + local build output (binaries git-ignored)
+```
+
+## Architecture
+
+```
+┌──────────────┐          ┌──────────────┐          ┌──────────────┐
+│  DualSense   │◄─ BT ──►│ BL616/BL618  │◄─ USB ──►│   Host PC    │
+│  Controller  │  BR/EDR  │ LCTech/M0S/ │  HID     │  Steam/SDL   │
+└──────────────┘  HID     │   Ai-M61    │  Device   └──────────────┘
+                          └──────────────┘
+```
+
+**Data flows:**
+
+- **Input (Controller → Host):** BT L2CAP receives Report 0x31 → strip HID header/seq/CRC → 63-byte payload sent as USB Report 0x01
+- **Output (Host → Controller):** USB EP OUT receives Report 0x02 → State Manager conditional merge → BT Report 0x31 (78B with CRC32) → L2CAP send
+- **Audio OUT (Host → Controller):** USB Audio ISO OUT (4ch 48kHz) → double-buffer PCM accumulation → polyphase sinc resample 512→480 → Opus CBR encode (160kbps) → haptics decimation → 0x39 dual-frame report (547B) → L2CAP send
+- **Audio IN (Controller → Host):** BT 0x31 mic Opus frame → queue → Opus decode (48kHz mono) → mono-to-stereo → ring buffer → USB Audio ISO IN (2ch 48kHz)
+- **Feature (bidirectional):** GET_REPORT from BT-side cache (DSE profiles support NAK gating) | SET_REPORT adds CRC32 and forwards via L2CAP control channel
+
+## Web Configuration
+
+The repository includes a WebHID configuration and OTA client under `web/`. Online OTA currently targets **Ai-M61-32S-Kit in USB Full-Speed mode only**. The first installation must be a complete serial flash of the OTA-capable baseline firmware (Boot2 + partition table + application); subsequent web updates replace the application image only and must never write Boot2 or the partition table. See [docs/OTA.md](docs/OTA.md) for the signed release manifest, P-256 verification, transport protocol, power-loss tests, and rollback requirements.
+
+### Runtime diagnostics
+
+Low-disturbance diagnostics combine the on-board CH340 UART event log with native USB/WebHID snapshots. On Windows, `tools/m61-diagnostics.ps1` produces an exact local log, redacted events, a health summary, and a share-safe archive without sending serial data or resetting the board. See [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) for usage and the real-time paths where packet-by-packet logging is forbidden.
+
+## Acknowledgements
+
+- [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) — original Pico 2W implementation, core protocol reference
+- [bouffalolab/bouffalo_sdk](https://github.com/bouffalolab/bouffalo_sdk) — BL618 SDK + Zephyr BT stack
+- [CherryUSB](https://github.com/cherry-embedded/CherryUSB) — USB stack
+- [xiph/opus](https://github.com/xiph/opus) — Opus audio codec (fixed-point mode)
+- Linux kernel `hid-playstation.c` — DualSense protocol offset reference
+- BL618 porting developed with [Cursor](https://www.cursor.com/) + Claude Opus 4.6
 
 ## License
 
-Project-owned source and documentation are released under the
-[MIT License](LICENSE). External SDKs and Opus retain their own licenses; see
-[Third-party notices](THIRD_PARTY_NOTICES.md).
+This project is licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0). Anyone who uses or modifies this code in a distributed product must make their source code available under the same license.
+
+### Third-Party Notices
+
+- Code is ported/adapted from [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle), which is licensed under the MIT License (Copyright (c) 2026 awalol) — see [NOTICE](NOTICE) for the full text.
+- [lib/opus](lib/opus) is the [xiph/opus](https://github.com/xiph/opus) codec, BSD-3-Clause licensed (see `lib/opus/LICENSE_PLEASE_READ.txt`).
+- [CherryUSB](https://github.com/cherry-embedded/CherryUSB) and [bouffalolab/bouffalo_sdk](https://github.com/bouffalolab/bouffalo_sdk) are external build dependencies, Apache-2.0 licensed.
+- The Linux kernel `hid-playstation.c` (GPL-2.0) was used as a protocol/offset reference only; no kernel code is included.
