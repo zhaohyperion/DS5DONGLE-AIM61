@@ -50,7 +50,7 @@ test("help center ships FAQ, changelog, and PWA controls", async () => {
   assert.match(referenceSource, /Web 0\.3\.0/);
   assert.match(referenceSource, /Web 0\.3\.1/);
   assert.match(referenceSource, /Web 0\.3\.2/);
-  assert.match(referenceSource, /Firmware 3\.5\.2/);
+  assert.match(referenceSource, /Firmware 3\.5\.1/);
   assert.match(referenceSource, /HID maintenance lock/);
   assert.match(referenceSource, /常见问题/);
   assert.match(referenceSource, /项目更新日志/);

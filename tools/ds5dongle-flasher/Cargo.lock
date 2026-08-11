@@ -468,6 +468,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "ds5dongle-flasher"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "eframe",
+ "hex",
+ "hidapi",
+ "reqwest",
+ "rfd",
+ "serde",
+ "serde_json",
+ "sha2",
+ "windows-sys 0.61.2",
+ "zip",
+]
+
+[[package]]
 name = "ecolor"
 version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -890,6 +908,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hidapi"
+version = "2.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c78dadfc12f865bc3fcac3897e64533b930737ceb9ef245c8277de98d0b010e9"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "pkg-config",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1283,23 +1314,6 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
-name = "ds5dongle-flasher"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "base64",
- "eframe",
- "hex",
- "reqwest",
- "rfd",
- "serde",
- "serde_json",
- "sha2",
- "windows-sys 0.61.2",
- "zip",
-]
 
 [[package]]
 name = "memchr"

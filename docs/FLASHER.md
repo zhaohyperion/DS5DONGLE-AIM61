@@ -1,6 +1,6 @@
 # DS5Dongle Windows 一键刷写器
 
-`DS5Dongle-Flasher-Windows.exe` 是面向 Ai-M61-32S-Kit、LCTech BL616 和 Sipeed M0S Dock 的单文件 GUI/CLI 刷写器。它可以读取本仓库 GitHub Release，也可以刷写本地完整固件 ZIP 或解包目录。
+`DS5Dongle-Flasher-Windows.exe` 是 DS5DONGLE-AIM61 的单文件 GUI/CLI 刷写器。它可以读取本仓库 GitHub Release，也可以刷写本地完整固件 ZIP 或解包目录。
 
 ## 普通用户：在线选择固件并刷写
 
@@ -10,6 +10,12 @@
 4. 启动刷写器，选择物理板型、USB Full-Speed/High-Speed 和正确 COM 口。
 5. 在“在线 Release”中选择版本；默认推荐 Ai-M61 Full-Speed 稳定版。
 6. 开始刷写。工具会下载并验证完整包，然后写入 Boot2、分区表和应用固件。
+
+刷写器启动后还会通过运行态 USB HID `0xF8` Feature Report 读取当前设备的固件版本。该读取不会进入 ISP、不会访问 Flash 写入路径；设备必须已正常启动并以 USB 游戏控制器连接。也可以点击“重新读取”，或使用 CLI：
+
+```powershell
+.\DS5Dongle-Flasher-Windows.exe --device-info
+```
 7. 成功后按 RESET 正常启动。460800 失败时可在 GUI 中用 115200 重试。
 
 本仓库首次发布带完整固件 ZIP 的 GitHub Release 前，在线列表为空属于正常现象；可以使用下文的本地完整包流程。
@@ -64,6 +70,7 @@ DS5Dongle-Flasher-Windows.exe [options]
 ```powershell
 # 检测串口并列出本仓库可用完整包
 .\DS5Dongle-Flasher-Windows.exe --list
+.\DS5Dongle-Flasher-Windows.exe --device-info
 .\DS5Dongle-Flasher-Windows.exe --list-releases --board aim61 --usb-speed fs
 
 # 只下载并验证，不接触设备

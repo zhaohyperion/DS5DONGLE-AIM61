@@ -1,6 +1,6 @@
 # DS5Dongle Ai-M61 Device Studio
 
-基于 WebHID 的 Ai-M61-32S-Kit 配置与安全 OTA 网页。页面只支持 Sony VID `054C`、PID `0CE6/0DF2`，并把 OTA 目标锁定为 Ai-M61 / USB Full-Speed / RAW `.bin.ota`。
+基于 WebHID 的 Ai-M61-32S-Kit 配置与安全 OTA 网页。页面只支持 Sony VID `054C`、PID `0CE6/0DF2`，并把 OTA 目标锁定为 Ai-M61 / 当前设备 USB Full-Speed 或 High-Speed / RAW `.bin.ota`；只允许同速升级。
 
 ## 本地运行
 

@@ -176,6 +176,8 @@ OTA 只更新应用分区。第一次安装必须通过 UART ISP 完整写入 Bo
 3. 按住 **BOOT**，短按 **RESET**（也可按住 BOOT 重新插线），然后松开 BOOT。
 4. 打开刷写器，选择 `Ai-M61-32S-Kit`、`Full-Speed` 和对应 COM 口。
 5. 选择在线 Release，或加载本地完整固件 ZIP/目录；确认目标板型和 USB 速度后开始刷写。
+
+刷写器会自动读取已正常启动设备的 USB HID `0xF8` 固件版本信息；也可使用 `--device-info` 单独查询，不会进入 ISP 或写入 Flash。
 6. 成功后按 RESET 正常启动。若 460800 波特率失败，可在界面中改用 115200 重试。
 
 刷写器会先验证包结构、文件名、尺寸和 SHA-256，再调用内置并校验过的 Bouffalo `BLFlashCommand`。不要给 Ai-M61 刷入 LCTech/M0S 包，也不要把 OTA `.bin.ota` 当作完整线刷包。
@@ -370,7 +372,7 @@ docs/                        OTA、诊断和刷写器详细文档
 
 ### 工具、网页与开发协助
 
-- Windows 刷写器由 Rust 构建，直接依赖 `anyhow`、`base64`、`eframe/egui`、`reqwest/rustls`、`rfd`、`serde`、`sha2`、`windows-sys` 和 `zip` 等项目；精确版本与完整传递依赖见 [`Cargo.toml`](tools/ds5dongle-flasher/Cargo.toml) 和 [`Cargo.lock`](tools/ds5dongle-flasher/Cargo.lock)。刷写后端来自 Bouffalo Lab `BLFlashCommand`；可选串口驱动由 [WCH](https://www.wch-ic.com/) 提供，驱动不会提交进仓库。
+- Windows 刷写器由 Rust 构建，直接依赖 `anyhow`、`base64`、`eframe/egui`、`hidapi`（Windows 原生 `hid.dll` 后端）、`reqwest/rustls`、`rfd`、`serde`、`sha2`、`windows-sys` 和 `zip` 等项目；精确版本与完整传递依赖见 [`Cargo.toml`](tools/ds5dongle-flasher/Cargo.toml) 和 [`Cargo.lock`](tools/ds5dongle-flasher/Cargo.lock)。刷写后端来自 Bouffalo Lab `BLFlashCommand`；可选串口驱动由 [WCH](https://www.wch-ic.com/) 提供，驱动不会提交进仓库。
 - Web 配置器使用 [React](https://github.com/facebook/react)、[Vinext](https://github.com/cloudflare/vinext)、[Vite](https://github.com/vitejs/vite)、[Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) 和 Cloudflare 工具链；精确版本见 [`package.json`](web/package.json) 与 [`package-lock.json`](web/package-lock.json)。
 - BL618 移植阶段使用 Cursor 与 Claude Opus 4.6 辅助开发；当前代码审计、OTA/刷写流程和文档整理使用 OpenAI Codex 辅助。所有合入结果仍由仓库维护者负责审查、测试与发布。
 

@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-const PRODUCT_NAME: &str = "DS5Dongle BL616/BL618 Flasher";
+const PRODUCT_NAME: &str = "DS5DONGLE-AIM61 Flasher";
 const FLASHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_API: &str =
     "https://api.github.com/repos/zhaohyperion/DS5DONGLE-AIM61/releases?per_page=30";
@@ -70,6 +70,9 @@ const FIRMWARE_MANIFEST_NAME: &str = "firmware.json";
 const CHECKSUM_MANIFEST_NAME: &str = "SHA256SUMS.txt";
 const MAX_FIRMWARE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BOOT2_BYTES: usize = 1024 * 1024;
+const SONY_VENDOR_ID: u16 = 0x054c;
+const DUALSENSE_PRODUCT_IDS: [u16; 2] = [0x0ce6, 0x0df2];
+const FIRMWARE_VERSION_REPORT_ID: u8 = 0xf8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -200,6 +203,7 @@ struct Options {
     dry_run: bool,
     assume_yes: bool,
     list: bool,
+    device_info: bool,
     list_releases: bool,
     assets_info: bool,
     install_driver: bool,
@@ -217,6 +221,14 @@ struct Ch340Device {
     error_code: u32,
     status: String,
     port: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FirmwareDeviceInfo {
+    product_name: String,
+    vendor_id: u16,
+    product_id: u16,
+    firmware_version: String,
 }
 
 struct RuntimeDirectory {
@@ -275,6 +287,11 @@ fn run() -> Result<()> {
 
     if options.list {
         print_devices(&probe_ch340_devices()?);
+        return Ok(());
+    }
+
+    if options.device_info {
+        print_firmware_devices(&probe_firmware_devices()?);
         return Ok(());
     }
 
@@ -436,6 +453,7 @@ fn print_help() {
            --port COM5       Select a serial/BootROM COM port\n  \
            --baud RATE       460800 (default) or 115200\n  \
            --list            List detected M61 CH340 devices\n  \
+           --device-info     Read running DS5DONGLE-AIM61 firmware information over USB HID\n  \
            --list-releases   List complete firmware Releases\n  \
            --release TAG     Select a Release without the menu\n  \
            --verify-release  Download and verify a Release without flashing\n  \
@@ -494,6 +512,7 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options> {
             "--dry-run" => options.dry_run = true,
             "--yes" => options.assume_yes = true,
             "--list" => options.list = true,
+            "--device-info" => options.device_info = true,
             "--list-releases" => options.list_releases = true,
             "--release" => {
                 options.release = Some(
@@ -1096,6 +1115,93 @@ fn print_devices(devices: &[Ch340Device]) {
     }
 }
 
+fn decode_firmware_version_report(report: &[u8]) -> Option<String> {
+    let payload = report
+        .first()
+        .is_some_and(|byte| *byte == FIRMWARE_VERSION_REPORT_ID)
+        .then(|| &report[1..])
+        .unwrap_or(report);
+    let end = payload
+        .iter()
+        .rposition(|byte| !matches!(byte, 0x00 | 0xff))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let version = std::str::from_utf8(&payload[..end]).ok()?.trim();
+    let components = version
+        .split('.')
+        .map(|component| component.parse::<u16>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if components.len() != 3 || components.iter().any(|component| *component > 254) {
+        return None;
+    }
+    Some(version.to_owned())
+}
+
+#[cfg(windows)]
+fn probe_firmware_devices() -> Result<Vec<FirmwareDeviceInfo>> {
+    let api = hidapi::HidApi::new().context("failed to initialize Windows HID access")?;
+    let mut devices = Vec::new();
+    for info in api.device_list().filter(|info| {
+        info.vendor_id() == SONY_VENDOR_ID
+            && DUALSENSE_PRODUCT_IDS.contains(&info.product_id())
+            && info.usage_page() == 0x01
+            && info.usage() == 0x05
+    }) {
+        let Ok(device) = info.open_device(&api) else {
+            continue;
+        };
+        let mut report = [0_u8; 64];
+        report[0] = FIRMWARE_VERSION_REPORT_ID;
+        let Ok(length) = device.get_feature_report(&mut report) else {
+            continue;
+        };
+        let Some(firmware_version) = decode_firmware_version_report(&report[..length]) else {
+            continue;
+        };
+        devices.push(FirmwareDeviceInfo {
+            product_name: info
+                .product_string()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("DS5DONGLE-AIM61")
+                .to_owned(),
+            vendor_id: info.vendor_id(),
+            product_id: info.product_id(),
+            firmware_version,
+        });
+    }
+    devices.sort_by(|left, right| {
+        (&left.product_name, left.product_id, &left.firmware_version).cmp(&(
+            &right.product_name,
+            right.product_id,
+            &right.firmware_version,
+        ))
+    });
+    devices.dedup();
+    Ok(devices)
+}
+
+#[cfg(not(windows))]
+fn probe_firmware_devices() -> Result<Vec<FirmwareDeviceInfo>> {
+    bail!("firmware information is available on Windows only")
+}
+
+fn print_firmware_devices(devices: &[FirmwareDeviceInfo]) {
+    if devices.is_empty() {
+        println!("No running DS5DONGLE-AIM61 firmware was detected over USB HID.");
+        return;
+    }
+    for (index, device) in devices.iter().enumerate() {
+        println!(
+            "{}. {} | firmware={} | VID:PID={:04X}:{:04X}",
+            index + 1,
+            device.product_name,
+            device.firmware_version,
+            device.vendor_id,
+            device.product_id
+        );
+    }
+}
+
 fn choose_port(devices: &[&Ch340Device]) -> Result<String> {
     if devices.len() == 1 {
         let device = devices[0];
@@ -1420,6 +1526,7 @@ fn run_flash(runtime: &Path, port: &str, baud: u32) -> Result<std::process::Exit
 enum GuiEvent {
     Releases(std::result::Result<Vec<FlashRelease>, String>),
     Devices(std::result::Result<Vec<Ch340Device>, String>),
+    FirmwareDevices(std::result::Result<Vec<FirmwareDeviceInfo>, String>),
     Log(String),
     DriverDone(std::result::Result<(), String>),
     FlashDone {
@@ -1513,6 +1620,7 @@ struct FlasherApp {
     rx: Receiver<GuiEvent>,
     releases: Vec<FlashRelease>,
     devices: Vec<Ch340Device>,
+    firmware_devices: Vec<FirmwareDeviceInfo>,
     selected_release: usize,
     firmware_mode: FirmwareMode,
     local_firmware: Option<FirmwareSet>,
@@ -1520,6 +1628,7 @@ struct FlasherApp {
     baud: u32,
     loading_releases: bool,
     loading_devices: bool,
+    loading_firmware_devices: bool,
     busy: Option<String>,
     status: String,
     log: String,
@@ -1540,6 +1649,7 @@ impl FlasherApp {
             rx,
             releases: Vec::new(),
             devices: Vec::new(),
+            firmware_devices: Vec::new(),
             selected_release: 0,
             firmware_mode: FirmwareMode::Online,
             local_firmware: None,
@@ -1547,6 +1657,7 @@ impl FlasherApp {
             baud: 460_800,
             loading_releases: false,
             loading_devices: false,
+            loading_firmware_devices: false,
             busy: None,
             status: language.tr("正在初始化...", "Initializing...").to_owned(),
             log: String::new(),
@@ -1557,6 +1668,7 @@ impl FlasherApp {
         };
         app.refresh_releases();
         app.refresh_devices();
+        app.refresh_firmware_devices();
         app
     }
 
@@ -1601,6 +1713,18 @@ impl FlasherApp {
         thread::spawn(move || {
             let result = probe_ch340_devices().map_err(|error| format!("{error:#}"));
             let _ = tx.send(GuiEvent::Devices(result));
+        });
+    }
+
+    fn refresh_firmware_devices(&mut self) {
+        if self.loading_firmware_devices {
+            return;
+        }
+        self.loading_firmware_devices = true;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = probe_firmware_devices().map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::FirmwareDevices(result));
         });
     }
 
@@ -2086,6 +2210,45 @@ impl FlasherApp {
                         Language::En => format!("Device detection error: {error}"),
                     });
                 }
+                GuiEvent::FirmwareDevices(Ok(devices)) => {
+                    self.loading_firmware_devices = false;
+                    self.firmware_devices = devices;
+                    if self.firmware_devices.is_empty() {
+                        self.append_log(self.language.tr(
+                            "未检测到已正常启动且支持 0xF8 信息报告的 DS5DONGLE-AIM61。",
+                            "No running DS5DONGLE-AIM61 with the 0xF8 information report was detected.",
+                        ));
+                    } else {
+                        let summaries = self
+                            .firmware_devices
+                            .iter()
+                            .map(|device| {
+                                format!(
+                                    "{} {} ({:04X}:{:04X})",
+                                    device.product_name,
+                                    device.firmware_version,
+                                    device.vendor_id,
+                                    device.product_id
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        self.append_log(match self.language {
+                            Language::ZhCn => format!("设备固件信息：{summaries}"),
+                            Language::En => format!("Device firmware information: {summaries}"),
+                        });
+                    }
+                }
+                GuiEvent::FirmwareDevices(Err(error)) => {
+                    self.loading_firmware_devices = false;
+                    self.firmware_devices.clear();
+                    self.append_log(match self.language {
+                        Language::ZhCn => format!("读取设备固件信息失败：{error}"),
+                        Language::En => {
+                            format!("Failed to read device firmware information: {error}")
+                        }
+                    });
+                }
                 GuiEvent::Log(line) => self.append_log(line),
                 GuiEvent::DriverDone(Ok(())) => {
                     self.busy = None;
@@ -2161,6 +2324,34 @@ impl FlasherApp {
             )
         }
     }
+
+    fn firmware_device_text(&self) -> String {
+        if self.loading_firmware_devices {
+            return self.language.tr("正在读取...", "Reading...").to_owned();
+        }
+        if self.firmware_devices.is_empty() {
+            return self
+                .language
+                .tr(
+                    "未检测到运行中的项目固件",
+                    "No running project firmware detected",
+                )
+                .to_owned();
+        }
+        self.firmware_devices
+            .iter()
+            .map(|device| {
+                format!(
+                    "{} · v{} · {:04X}:{:04X}",
+                    device.product_name,
+                    device.firmware_version,
+                    device.vendor_id,
+                    device.product_id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 impl eframe::App for FlasherApp {
@@ -2170,10 +2361,7 @@ impl eframe::App for FlasherApp {
         let language = self.language;
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Title(format!(
             "{} {FLASHER_VERSION}",
-            language.tr(
-                "DS5Dongle BL616/BL618 刷写器",
-                "DS5Dongle BL616/BL618 Flasher"
-            )
+            language.tr("DS5DONGLE-AIM61 刷写器", "DS5DONGLE-AIM61 Flasher")
         )));
         if busy && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
@@ -2189,8 +2377,8 @@ impl eframe::App for FlasherApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.heading(language.tr(
-                    "DS5Dongle BL616/BL618 刷写器",
-                    "DS5Dongle BL616/BL618 Flasher",
+                    "DS5DONGLE-AIM61 刷写器",
+                    "DS5DONGLE-AIM61 Flasher",
                 ));
                 ui.separator();
                 ui.label(language.tr("语言", "Language"));
@@ -2210,8 +2398,8 @@ impl eframe::App for FlasherApp {
                     });
             });
             ui.label(language.tr(
-                "选择在线 Release 或本地固件 ZIP，检测串口，并安全刷写 BL616/BL618",
-                "Use an online Release or local firmware ZIP, detect serial ports, and safely flash BL616/BL618",
+                "读取当前设备固件信息，选择在线 Release 或本地固件，并安全刷写 Ai-M61",
+                "Read the connected firmware information and safely flash Ai-M61 from an online Release or local package",
             ));
             ui.add_space(8.0);
         });
@@ -2219,8 +2407,8 @@ impl eframe::App for FlasherApp {
         eframe::egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.small(language.tr(
-                "固件不内置于 EXE；可下载主仓库完整固件 ZIP，也可选择本地 ZIP/目录。在线下载时请保持联网。WebUI：https://ds5.766677.xyz/",
-                "Firmware is not embedded. Download a complete ZIP from the main repository, or choose a local ZIP/directory. Stay online for Release downloads. WebUI: https://ds5.766677.xyz/",
+                "固件不内置于 EXE；在线固件仅来自 zhaohyperion/DS5DONGLE-AIM61，也可选择本地 ZIP/目录。",
+                "Firmware is not embedded. Online packages come only from zhaohyperion/DS5DONGLE-AIM61; local ZIPs/directories are also supported.",
             ));
             ui.add_space(4.0);
         });
@@ -2349,6 +2537,24 @@ impl eframe::App for FlasherApp {
                                     .map(|set| set.label.as_str())
                                     .unwrap_or(language.tr("尚未选择", "Not selected")),
                             );
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label(language.tr("设备固件信息", "Device firmware"));
+                    ui.horizontal(|ui| {
+                        if self.loading_firmware_devices {
+                            ui.spinner();
+                        }
+                        ui.label(self.firmware_device_text());
+                        if ui
+                            .add_enabled(
+                                !busy && !self.loading_firmware_devices,
+                                eframe::egui::Button::new(language.tr("重新读取", "Read again")),
+                            )
+                            .clicked()
+                        {
+                            self.refresh_firmware_devices();
                         }
                     });
                     ui.end_row();
@@ -2577,7 +2783,7 @@ impl eframe::App for FlasherApp {
                 });
         }
 
-        if busy || self.loading_devices || self.loading_releases {
+        if busy || self.loading_devices || self.loading_firmware_devices || self.loading_releases {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -2739,6 +2945,23 @@ mod tests {
         assert_eq!(normalize_port("com12").unwrap(), "COM12");
         assert!(normalize_port("COM").is_err());
         assert!(normalize_port("ttyUSB0").is_err());
+    }
+
+    #[test]
+    fn decodes_only_project_semver_firmware_reports() {
+        let mut report = [0_u8; 64];
+        report[0] = FIRMWARE_VERSION_REPORT_ID;
+        report[1..6].copy_from_slice(b"3.5.1");
+        assert_eq!(
+            decode_firmware_version_report(&report),
+            Some("3.5.1".to_owned())
+        );
+        assert_eq!(
+            decode_firmware_version_report(b"254.5.0\0\0"),
+            Some("254.5.0".into())
+        );
+        assert_eq!(decode_firmware_version_report(b"255.0.0"), None);
+        assert_eq!(decode_firmware_version_report(b"DualSense"), None);
     }
 
     #[test]

@@ -136,7 +136,7 @@ const CHANGES: Array<{ version: string; date: string; items: LocalizedText[] }> 
     ],
   },
   {
-    version: "Firmware 3.5.2",
+    version: "Firmware 3.5.1",
     date: "2026-08-10",
     items: [
       {
