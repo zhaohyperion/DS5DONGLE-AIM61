@@ -72,6 +72,7 @@ jobs:
             Remove-Item Env:DS5_OTA_PUBLIC_KEY_FILE -ErrorAction SilentlyContinue
           }
           .\build_windows.bat rebuild
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ("${{ github.event_name }}" -eq "release") {
             $generatedKeyHeader = "build\generated\ds5_ota\ota_release_public_key.h"
             if (-not (Select-String -LiteralPath $generatedKeyHeader -Quiet `
@@ -115,7 +116,7 @@ jobs:
           cargo fmt --manifest-path tools\ds5dongle-flasher\Cargo.toml -- --check
           cargo test --manifest-path tools\ds5dongle-flasher\Cargo.toml
           cargo build --release --manifest-path tools\ds5dongle-flasher\Cargo.toml
-          New-Item -ItemType Directory dist
+          New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item tools\ds5dongle-flasher\target\release\ds5dongle-flasher.exe dist\DS5Dongle-Flasher-Windows.exe
           (Get-FileHash dist\DS5Dongle-Flasher-Windows.exe -Algorithm SHA256).Hash.ToLowerInvariant() + '  DS5Dongle-Flasher-Windows.exe' | Set-Content dist\DS5Dongle-Flasher-Windows.exe.sha256 -Encoding ascii
       - uses: actions/upload-artifact@v4

@@ -42,6 +42,11 @@ if not exist "%TOOLCHAIN_PATH%\bin\riscv64-unknown-elf-gcc.exe" (
 
 rem ---- PATH ----
 set "PATH=%~dp0tools;%TOOLCHAIN_PATH%\bin;%BL_SDK_BASE%\tools\make;%BL_SDK_BASE%\tools\cmake\bin;%BL_SDK_BASE%\tools\ninja;%PATH%"
+rem GitHub-hosted Windows runners expose Git Bash as SHELL.  The SDK passes
+rem native drive-letter paths to recipe commands, which Bash strips into
+rem invalid paths (for example D:\a\... becomes D:a...).  Force the bundled
+rem Windows make to execute recipes through cmd.exe.
+set "SHELL=cmd.exe"
 
 set "ACTION=%~1"
 if "%ACTION%"=="" set "ACTION=build"
