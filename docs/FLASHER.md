@@ -34,7 +34,7 @@ GUI 可选择 `DS5Dongle-<board>-<fs|hs>-v<version>.zip`，也可选择已解包
 python tools\package_firmware.py `
   --board aim61 `
   --usb-speed fs `
-  --version v3.5.0 `
+  --version v3.5.1 `
   --firmware-dir firmware\aim61 `
   --output-dir dist
 ```
@@ -67,13 +67,13 @@ DS5Dongle-Flasher-Windows.exe [options]
 .\DS5Dongle-Flasher-Windows.exe --list-releases --board aim61 --usb-speed fs
 
 # 只下载并验证，不接触设备
-.\DS5Dongle-Flasher-Windows.exe --verify-release --release v3.5.0 --board aim61 --usb-speed fs
+.\DS5Dongle-Flasher-Windows.exe --verify-release --release v3.5.1 --board aim61 --usb-speed fs
 
 # 验证设备、工具和命令，但不执行写入
-.\DS5Dongle-Flasher-Windows.exe --release v3.5.0 --board aim61 --usb-speed fs --port COM5 --dry-run
+.\DS5Dongle-Flasher-Windows.exe --release v3.5.1 --board aim61 --usb-speed fs --port COM5 --dry-run
 
 # 受控自动化刷写；务必先确认 COM 口和物理板型
-.\DS5Dongle-Flasher-Windows.exe --release v3.5.0 --board aim61 --usb-speed fs --port COM5 --yes
+.\DS5Dongle-Flasher-Windows.exe --release v3.5.1 --board aim61 --usb-speed fs --port COM5 --yes
 ```
 
 ## 自行构建刷写器

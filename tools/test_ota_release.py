@@ -44,15 +44,16 @@ class OtaReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ota_release.OtaReleaseError, "at most 8"):
                     ota_release._validate_version(version)
 
-    def test_release_workflow_builds_and_signs_m61_fs_ota(self) -> None:
+    def test_release_workflow_builds_and_signs_m61_fs_and_hs_ota(self) -> None:
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn('$env:FIRMWARE_VERSION = $firmwareVersion', workflow)
         self.assertIn('$env:PROJECT_SDK_VERSION = $firmwareVersion', workflow)
         self.assertIn('$firmwareVersion.Length -gt 8', workflow)
-        self.assertIn("DS5Dongle-aim61-fs-v$version.bin.ota", workflow)
-        self.assertIn("DS5Dongle-aim61-fs-stable.ota.json", workflow)
+        self.assertIn('DS5Dongle-aim61-$($env:USB_SPEED)-v$version.bin.ota', workflow)
+        self.assertIn('for usb_speed in fs hs', workflow)
+        self.assertIn('DS5Dongle-aim61-${usb_speed}-stable.ota.json', workflow)
         self.assertIn("secrets.OTA_P256_PRIVATE_KEY_B64", workflow)
         self.assertIn("vars.OTA_P256_KEY_ID", workflow)
         self.assertGreaterEqual(
@@ -111,6 +112,22 @@ class OtaReleaseTests(unittest.TestCase):
         self.assertEqual(first["body_size"], info.body_size)
         self.assertEqual(first["body_sha256"], info.body_sha256)
         ota_release.verify_manifest(first, info, allow_unsigned_dev=True)
+
+    def test_high_speed_manifest_binds_high_speed_target(self) -> None:
+        info = ota_release.parse_ota_bytes(make_raw_ota())
+        manifest = ota_release.build_manifest(
+            info,
+            channel="dev",
+            version="1.2.3",
+            url="https://downloads.example.test/DS5Dongle-aim61-hs.bin.ota",
+            usb_speed="hs",
+            allow_unsigned_dev=True,
+        )
+        self.assertEqual(manifest["usb_speed"], "hs")
+        canonical = ota_release.signature_payload(manifest, info)
+        self.assertEqual(canonical[16], ota_release.MANIFEST_BOARD_ID)
+        self.assertEqual(canonical[17], ota_release.MANIFEST_USB_SPEED_IDS["hs"])
+        ota_release.verify_manifest(manifest, info, allow_unsigned_dev=True)
 
     def test_stable_manifest_cannot_be_unsigned(self) -> None:
         info = ota_release.parse_ota_bytes(make_raw_ota())
@@ -230,7 +247,7 @@ class OtaReleaseTests(unittest.TestCase):
         )
         mutations = {
             "board": "lctech616",
-            "usb_speed": "hs",
+            "usb_speed": "ss",
             "version": "1.2.255",
             "body_size": info.body_size + 1,
             "body_sha256": "00" * 32,
@@ -299,6 +316,16 @@ class OtaReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ota_release.OtaReleaseError, "verification failed"):
                 ota_release.verify_manifest(
                     corrupted,
+                    info,
+                    public_key=public_key,
+                    expected_key_id="test-p256",
+                    openssl=openssl,
+                )
+            wrong_speed = json.loads(ota_release.manifest_bytes(first))
+            wrong_speed["usb_speed"] = "hs"
+            with self.assertRaisesRegex(ota_release.OtaReleaseError, "verification failed"):
+                ota_release.verify_manifest(
+                    wrong_speed,
                     info,
                     public_key=public_key,
                     expected_key_id="test-p256",

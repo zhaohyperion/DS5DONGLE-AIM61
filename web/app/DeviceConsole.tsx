@@ -23,6 +23,7 @@ import {
   type OtaImageInfo,
   type OtaManifest,
   type OtaStatus,
+  type OtaUsbSpeed,
   type RemapEntry,
 } from "./lib/protocol";
 import {
@@ -53,8 +54,10 @@ interface FirmwareCandidate {
   trusted: boolean;
 }
 
-const DEFAULT_MANIFEST_URL =
-  "https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json";
+const DEFAULT_MANIFEST_URLS: Record<OtaUsbSpeed, string> = {
+  fs: "https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json",
+  hs: "https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-hs-stable.ota.json",
+};
 
 const ERROR_NAMES = [
   "OK",
@@ -92,7 +95,8 @@ export function DeviceConsole() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [candidate, setCandidate] = useState<FirmwareCandidate | null>(null);
-  const [manifestUrl, setManifestUrl] = useState(DEFAULT_MANIFEST_URL);
+  const [otaProfile, setOtaProfile] = useState<OtaUsbSpeed>("fs");
+  const [manifestUrl, setManifestUrl] = useState(DEFAULT_MANIFEST_URLS.fs);
   const [otaProgress, setOtaProgress] = useState(0);
   const [otaPhase, setOtaPhase] = useState("idle");
   const [otaConfirmed, setOtaConfirmed] = useState(false);
@@ -130,7 +134,13 @@ export function DeviceConsole() {
     setDeviceStatus(nextStatus);
     setRemap(nextRemap);
     try {
-      setOtaCapability(await next.otaCapability());
+      const capability = await next.otaCapability();
+      const speed: OtaUsbSpeed = capability.usbSpeed === 1 ? "hs" : "fs";
+      setOtaCapability(capability);
+      setOtaProfile(speed);
+      setManifestUrl(DEFAULT_MANIFEST_URLS[speed]);
+      setCandidate(null);
+      setOtaConfirmed(false);
     } catch {
       setOtaCapability(null);
     }
@@ -208,6 +218,27 @@ export function DeviceConsole() {
 
   const chooseDevice = () => run("connect", async () => attach(await Ds5DongleClient.choose()));
 
+  const selectOtaProfile = (speed: OtaUsbSpeed) => {
+    if (otaCapability && otaCapability.usbSpeed !== (speed === "hs" ? 1 : 0)) {
+      setError(tr("所选USB档位与当前设备不匹配", "Selected USB profile does not match the device"));
+      return;
+    }
+    setOtaProfile(speed);
+    setManifestUrl(DEFAULT_MANIFEST_URLS[speed]);
+    setCandidate(null);
+    setOtaConfirmed(false);
+    setError("");
+  };
+
+  const assertManifestTarget = (manifest: OtaManifest) => {
+    if (manifest.usb_speed !== otaProfile) {
+      throw new Error(tr("清单USB档位与当前选择不匹配", "Manifest USB profile does not match the selection"));
+    }
+    if (otaCapability && otaCapability.usbSpeed !== (manifest.usb_speed === "hs" ? 1 : 0)) {
+      throw new Error(tr("清单USB档位与当前设备不匹配", "Manifest USB profile does not match the device"));
+    }
+  };
+
   const loadLocalFirmware = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -215,7 +246,7 @@ export function DeviceConsole() {
     await run("firmware", async () => {
       const bytes = new Uint8Array(await file.arrayBuffer());
       const info = await inspectOtaImage(bytes);
-      validateLocalOtaFilename(file.name, info);
+      validateLocalOtaFilename(file.name, info, otaProfile);
       setCandidate({ bytes, info, name: file.name, manifest: null, trusted: false });
       setOtaConfirmed(false);
       setNotice(tr("本地镜像校验通过", "Local image verified"));
@@ -228,6 +259,7 @@ export function DeviceConsole() {
       const manifestResponse = await fetch(manifestUrl, { cache: "no-store" });
       if (!manifestResponse.ok) throw new Error(`Manifest HTTP ${manifestResponse.status}`);
       const manifest = parseManifest(await manifestResponse.json(), manifestResponse.url);
+      assertManifestTarget(manifest);
       const imageResponse = await fetch(manifest.url, { cache: "no-store" });
       if (!imageResponse.ok) throw new Error(`Firmware HTTP ${imageResponse.status}`);
       const bytes = new Uint8Array(await imageResponse.arrayBuffer());
@@ -259,6 +291,7 @@ export function DeviceConsole() {
     if (!file || !candidate) return;
     await run("manifest", async () => {
       const manifest = parseManifest(JSON.parse(await file.text()));
+      assertManifestTarget(manifest);
       const info = await validateManifestImage(manifest, candidate.bytes);
       await verifyManifestSignature(
         manifest,
@@ -280,12 +313,17 @@ export function DeviceConsole() {
     const controller = new AbortController();
     abortRef.current = controller;
     try {
+      if (!candidate.manifest) {
+        throw new Error(tr("安全升级需要签名清单", "Safe OTA requires a signed manifest"));
+      }
+      assertManifestTarget(candidate.manifest);
       const finalStatus = await withHidMaintenanceLock(
         () => client.transferOta(
           candidate.bytes,
           candidate.info,
           candidate.manifest?.version || candidate.info.firmwareVersion,
           candidate.manifest?.signature || null,
+          candidate.manifest.usb_speed,
           {
             signal: controller.signal,
             onProgress: (accepted, total, status) => {
@@ -375,7 +413,7 @@ export function DeviceConsole() {
         <div className="hero-target" aria-label="target hardware">
           <span>{tr("当前目标", "Target")}</span>
           <strong>Ai-M61-32S-Kit</strong>
-          <small>BL618 · USB Full-Speed · 4 MB Flash</small>
+          <small>BL618 · USB {otaProfile === "hs" ? "High-Speed" : "Full-Speed"} · 4 MB Flash</small>
         </div>
       </section>
 
@@ -477,7 +515,7 @@ export function DeviceConsole() {
             <div className={`ota-capability ${otaCapability ? "is-ready" : ""}`}>
               <span>{tr("设备能力", "DEVICE CAPABILITY")}</span>
               <strong>{otaCapability ? tr("可以安全升级", "Ready for safe OTA") : tr("请连接支持 OTA 的固件", "Connect OTA-capable firmware")}</strong>
-              <small>{otaCapability ? `A/B · SHA-256 · RAW · ${otaCapability.maxImageSize.toLocaleString()} B` : "0xFC capability probe"}</small>
+              <small>{otaCapability ? `Ai-M61 · ${otaCapability.usbSpeed === 1 ? "HS" : "FS"} · A/B · SHA-256 · RAW · ${otaCapability.maxImageSize.toLocaleString()} B` : "0xFC capability probe"}</small>
             </div>
           </div>
 
@@ -485,33 +523,32 @@ export function DeviceConsole() {
             <article className="firmware-source-card">
               <div className="card-number">01</div>
               <h3>{tr("选择固件来源", "Choose firmware source")}</h3>
-              <p>{tr("先确认 USB 档位，再选择签名发布或本地镜像。当前 Ai-M61 固件与 A/B 分区仅接受 Full-Speed 目标。", "Confirm the USB profile before choosing a signed release or local image. The current Ai-M61 firmware and A/B layout accept Full-Speed targets only.")}</p>
+              <p>{tr("先确认 USB 档位，再选择同档位的签名发布或本地镜像。FS 与 HS 清单、签名和设备端目标必须完全一致。", "Choose the USB profile first, then use a signed release or local image for the same profile. The manifest, signature, and device target must all agree.")}</p>
               <div className="firmware-profile-grid" aria-label={tr("固件档位", "Firmware profile")}>
                 <button
-                  className="firmware-profile is-active"
+                  className={`firmware-profile ${otaProfile === "fs" ? "is-active" : ""}`}
                   type="button"
-                  aria-pressed="true"
-                  onClick={() => setManifestUrl(DEFAULT_MANIFEST_URL)}
+                  aria-pressed={otaProfile === "fs"}
+                  onClick={() => selectOtaProfile("fs")}
                 >
                   <span>USB FS · 12 Mb/s</span>
                   <strong>{tr("普通 / 全速", "Standard / Full-Speed")}</strong>
                   <small>{tr("Ai-M61 已验证 · 可升级", "Validated for Ai-M61 · available")}</small>
                 </button>
                 <button
-                  className="firmware-profile"
+                  className={`firmware-profile ${otaProfile === "hs" ? "is-active" : ""}`}
                   type="button"
-                  disabled
-                  aria-pressed="false"
-                  title={tr("当前 M61 构建未发布高速签名清单", "No signed high-speed M61 release is published")}
+                  aria-pressed={otaProfile === "hs"}
+                  onClick={() => selectOtaProfile("hs")}
                 >
                   <span>USB HS · 480 Mb/s</span>
                   <strong>{tr("高速", "High-Speed")}</strong>
-                  <small>{tr("当前 M61 硬件目标已锁定", "Locked for the current M61 target")}</small>
+                  <small>{tr("Ai-M61 已验证 · 可升级", "Validated for Ai-M61 · available")}</small>
                 </button>
               </div>
               <div className="firmware-profile-note">
-                <strong>{tr("为什么锁定高速？", "Why is high-speed locked?")}</strong>
-                <span>{tr("设备能力报告为 Ai-M61 / FS，网页和设备端都会拒绝 HS 或其他板型镜像。", "The capability report identifies Ai-M61 / FS; both the page and device reject HS or other-board images.")}</span>
+                <strong>{tr("同速升级保护", "Same-speed update protection")}</strong>
+                <span>{tr("连接设备后会自动锁定其 FS/HS 档位；网页签名校验和设备端都会拒绝另一档位或其他板型镜像。", "After connection, the device FS/HS profile is locked automatically; both web signature validation and firmware reject the other profile or board.")}</span>
               </div>
               <label className="upload-zone">
                 <input type="file" accept=".ota,.bin.ota,application/octet-stream" onChange={loadLocalFirmware} disabled={Boolean(busy) || otaPhase === "transferring"} />
@@ -546,14 +583,14 @@ export function DeviceConsole() {
                 <div className="firmware-details">
                   <div className="firmware-name"><span>{candidate.trusted ? "✓" : "L"}</span><div><strong>{candidate.name}</strong><small>{candidate.trusted ? tr("已验证的在线发布", "Verified online release") : tr("用户选择的本地镜像", "User-selected local image")}</small></div></div>
                   <dl>
-                    <div><dt>{tr("目标", "Target")}</dt><dd>Ai-M61 · FS</dd></div>
+                    <div><dt>{tr("目标", "Target")}</dt><dd>Ai-M61 · {(candidate.manifest?.usb_speed || otaProfile).toUpperCase()}</dd></div>
                     <div><dt>{tr("版本", "Version")}</dt><dd>{candidate.info.firmwareVersion}</dd></div>
                     <div><dt>{tr("大小", "Size")}</dt><dd>{formatBytes(candidate.info.fileSize)}</dd></div>
                     <div><dt>RAW Body SHA-256</dt><dd title={candidate.info.bodySha256}>{shortHash(candidate.info.bodySha256)}</dd></div>
                     <div><dt>{tr("容器 SHA-256", "Container SHA-256")}</dt><dd title={candidate.info.fileSha256}>{shortHash(candidate.info.fileSha256)}</dd></div>
                     <div><dt>{tr("发布签名", "Release signature")}</dt><dd className={candidate.trusted ? "verified" : "manual"}>{candidate.trusted ? tr("可信", "Trusted") : tr("未授权", "Not authorized")}</dd></div>
                   </dl>
-                  <label className="confirmation"><input type="checkbox" checked={otaConfirmed} onChange={(event) => setOtaConfirmed(event.target.checked)} /><span>{tr("我确认设备为 Ai-M61-32S-Kit，升级期间不会拔线。", "I confirm this is an Ai-M61-32S-Kit and will keep it connected.")}</span></label>
+                  <label className="confirmation"><input type="checkbox" checked={otaConfirmed} onChange={(event) => setOtaConfirmed(event.target.checked)} /><span>{tr("我确认设备为 Ai-M61-32S-Kit、USB档位匹配，升级期间不会拔线。", "I confirm this is an Ai-M61-32S-Kit with a matching USB profile and will keep it connected.")}</span></label>
                 </div>
               )}
               <div className="progress-block">
@@ -570,7 +607,7 @@ export function DeviceConsole() {
           </div>
 
           <div className="safety-strip">
-            <SafetyItem index="A" title={tr("目标锁定", "Target locked")} text="Ai-M61 · FS · RAW" />
+            <SafetyItem index="A" title={tr("目标锁定", "Target locked")} text={`Ai-M61 · ${otaProfile.toUpperCase()} · RAW`} />
             <SafetyItem index="B" title={tr("双重哈希", "Two hashes")} text="Container + firmware body" />
             <SafetyItem index="C" title={tr("非活动分区", "Inactive slot")} text="Power-loss safe before switch" />
             <SafetyItem index="D" title={tr("重启确认", "Reboot verification")} text="Reconnect + version check" />

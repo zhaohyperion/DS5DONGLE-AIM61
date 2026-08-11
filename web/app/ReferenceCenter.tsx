@@ -98,6 +98,16 @@ const STEPS: LocalizedText[] = [
 
 const CHANGES: Array<{ version: string; date: string; items: LocalizedText[] }> = [
   {
+    version: "Web 0.3.2",
+    date: "2026-08-11",
+    items: [
+      {
+        zh: "开放 Ai-M61 High-Speed 签名 OTA；网页会按设备能力自动选择 FS/HS 清单，并在签名、传输和设备端执行同速校验。",
+        en: "Enabled signed Ai-M61 High-Speed OTA with automatic FS/HS manifest selection and same-speed validation in the signature, transport, and firmware.",
+      },
+    ],
+  },
+  {
     version: "Web 0.3.1",
     date: "2026-08-10",
     items: [

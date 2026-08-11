@@ -107,11 +107,13 @@ export interface OtaSignature {
   value: string;
 }
 
+export type OtaUsbSpeed = "fs" | "hs";
+
 export interface OtaManifest {
   schema: 1;
   channel: "dev" | "beta" | "stable";
   board: "aim61";
-  usb_speed: "fs";
+  usb_speed: OtaUsbSpeed;
   version: string;
   size: number;
   sha256: string;
@@ -458,8 +460,8 @@ export function parseManifest(
   if (!(["dev", "beta", "stable"] as unknown[]).includes(raw.channel)) {
     throw new ProtocolError("清单通道无效", "manifest-channel");
   }
-  if (raw.board !== "aim61" || raw.usb_speed !== "fs") {
-    throw new ProtocolError("当前网页仅接受 Ai-M61 Full-Speed 固件", "manifest-target");
+  if (raw.board !== "aim61" || (raw.usb_speed !== "fs" && raw.usb_speed !== "hs")) {
+    throw new ProtocolError("网页仅接受 Ai-M61 FS/HS 固件清单", "manifest-target");
   }
   if (
     typeof raw.version !== "string" ||
@@ -505,7 +507,7 @@ export function parseManifest(
     schema: 1,
     channel: raw.channel as OtaManifest["channel"],
     board: "aim61",
-    usb_speed: "fs",
+    usb_speed: raw.usb_speed,
     version: raw.version,
     size: raw.size as number,
     sha256: raw.sha256,
@@ -580,7 +582,11 @@ export async function validateManifestImage(
   return info;
 }
 
-export function otaAuthorizationCanonical(info: OtaImageInfo, version: string): Uint8Array {
+export function otaAuthorizationCanonical(
+  info: OtaImageInfo,
+  version: string,
+  usbSpeed: OtaUsbSpeed = "fs",
+): Uint8Array {
   const marker = new TextEncoder().encode("DS5DONGLE-OTA-V1");
   if (marker.byteLength !== 16) throw new ProtocolError("OTA canonical marker 长度错误", "ota-canonical");
   const semver = versionTriplet(version);
@@ -588,7 +594,7 @@ export function otaAuthorizationCanonical(info: OtaImageInfo, version: string): 
   const view = new DataView(payload.buffer);
   payload.set(marker, 0);
   payload[16] = 1; // Ai-M61
-  payload[17] = 0; // Full-Speed
+  payload[17] = usbSpeed === "hs" ? 1 : 0;
   payload.set(semver, 18);
   view.setUint32(21, info.bodyLength, true);
   payload.set(hexBytes(info.bodySha256), 25);
@@ -641,19 +647,24 @@ export async function verifyManifestSignature(
     { name: "ECDSA", hash: "SHA-256" },
     key,
     copyBuffer(signature),
-    copyBuffer(otaAuthorizationCanonical(info, manifest.version)),
+    copyBuffer(otaAuthorizationCanonical(info, manifest.version, manifest.usb_speed)),
   );
   if (!valid) throw new ProtocolError("OTA 发布签名验证失败", "manifest-signature");
 }
 
-export function validateLocalOtaFilename(filename: string, info: OtaImageInfo): void {
+export function validateLocalOtaFilename(
+  filename: string,
+  info: OtaImageInfo,
+  expectedSpeed?: OtaUsbSpeed,
+): void {
   if (!filename.toLowerCase().endsWith(".bin.ota")) {
     throw new ProtocolError("请选择 RAW .bin.ota 文件", "ota-file-name");
   }
   const lower = filename.toLowerCase();
-  if (!lower.includes("aim61") || !/(?:^|[-_.])fs(?:[-_.]|$)/.test(lower)) {
+  const speed = lower.match(/(?:^|[-_.])(fs|hs)(?:[-_.]|$)/)?.[1] as OtaUsbSpeed | undefined;
+  if (!lower.includes("aim61") || !speed || (expectedSpeed && speed !== expectedSpeed)) {
     throw new ProtocolError(
-      "本地文件名必须明确包含 aim61 和 fs，避免把其他板型或 High-Speed 固件刷入设备",
+      "本地文件名必须明确包含 aim61 和匹配的 fs/hs 档位",
       "ota-file-target",
     );
   }
@@ -731,12 +742,13 @@ export function encodeOtaBegin(
   info: OtaImageInfo,
   version: string,
   signed: boolean,
+  usbSpeed: OtaUsbSpeed = "fs",
 ): Uint8Array {
   const semver = versionTriplet(version);
   const data = new Uint8Array(42);
   const view = new DataView(data.buffer);
   data[0] = 1; // Ai-M61
-  data[1] = 0; // USB Full-Speed
+  data[1] = usbSpeed === "hs" ? 1 : 0;
   data.set(semver, 2);
   data[5] = signed ? 1 : 0;
   view.setUint32(6, info.bodyLength, true);

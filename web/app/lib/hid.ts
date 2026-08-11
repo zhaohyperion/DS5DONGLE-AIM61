@@ -17,6 +17,7 @@ import {
   type OtaImageInfo,
   type OtaSignature,
   type OtaStatus,
+  type OtaUsbSpeed,
   type RemapEntry,
 } from "./protocol";
 import { LegacyHidClient } from "./legacy-hid";
@@ -122,7 +123,7 @@ export class Ds5DongleClient {
     const status = await this.readOtaStatus();
     if (
       status.board !== 1 ||
-      status.usbSpeed !== 0 ||
+      (status.usbSpeed !== 0 && status.usbSpeed !== 1) ||
       status.format !== 1 ||
       status.maxData !== 46 ||
       (status.capabilities & 0x3fb) !== 0x3fb
@@ -137,12 +138,17 @@ export class Ds5DongleClient {
     info: OtaImageInfo,
     version: string,
     signature: OtaSignature | null,
+    targetSpeed: OtaUsbSpeed,
     options: {
       signal: AbortSignal;
       onProgress: (accepted: number, total: number, status: OtaStatus) => void;
     },
   ): Promise<OtaStatus> {
     const capability = await this.otaCapability();
+    const targetSpeedId = targetSpeed === "hs" ? 1 : 0;
+    if (capability.usbSpeed !== targetSpeedId) {
+      throw new Error("OTA manifest USB speed does not match the connected device");
+    }
     if (bytes.byteLength > capability.maxImageSize) {
       throw new Error(`固件 ${bytes.byteLength} B 超过设备 OTA 上限 ${capability.maxImageSize} B`);
     }
@@ -155,7 +161,14 @@ export class Ds5DongleClient {
     try {
       await this.device.sendFeatureReport(
         REPORT_OTA_CONTROL,
-        encodeOtaBegin(session, bytes.byteLength, info, version, Boolean(signature)),
+        encodeOtaBegin(
+          session,
+          bytes.byteLength,
+          info,
+          version,
+          Boolean(signature),
+          targetSpeed,
+        ),
       );
 
       let status = await this.waitForStatus(

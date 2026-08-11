@@ -17,11 +17,14 @@ test("device studio integrates legacy configuration without replacing secure OTA
   assert.match(consoleSource, /TelemetryStrip/);
   assert.match(consoleSource, /普通 \/ 全速/);
   assert.match(consoleSource, /高速/);
-  assert.match(consoleSource, /className="firmware-profile"[\s\S]*?disabled/);
+  assert.match(consoleSource, /selectOtaProfile\("fs"\)/);
+  assert.match(consoleSource, /selectOtaProfile\("hs"\)/);
+  assert.match(consoleSource, /DS5Dongle-aim61-hs-stable\.ota\.json/);
   assert.match(consoleSource, /zhaohyperion\/DS5DONGLE-AIM61/);
   assert.doesNotMatch(consoleSource, /sqlCRT\/ds5dongle-bl618-opensource\/releases\/latest/);
   assert.match(hidSource, /new LegacyHidClient\(this\.device\)/);
   assert.match(hidSource, /transferOta/);
+  assert.match(hidSource, /capability\.usbSpeed !== targetSpeedId/);
   assert.match(hidSource, /REPORT_OTA_CONTROL/);
   assert.match(panelsSource, /Keyboard HID/);
   assert.match(panelsSource, /REMAP_FLAG_EXTRA_KEY/);
@@ -46,6 +49,7 @@ test("help center ships FAQ, changelog, and PWA controls", async () => {
   assert.match(consoleSource, /PwaRegistrar/);
   assert.match(referenceSource, /Web 0\.3\.0/);
   assert.match(referenceSource, /Web 0\.3\.1/);
+  assert.match(referenceSource, /Web 0\.3\.2/);
   assert.match(referenceSource, /Firmware 3\.5\.2/);
   assert.match(referenceSource, /HID maintenance lock/);
   assert.match(referenceSource, /常见问题/);

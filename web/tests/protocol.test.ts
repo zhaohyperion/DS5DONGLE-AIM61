@@ -20,6 +20,7 @@ import {
   parseManifest,
   sha256Hex,
   validateManifestImage,
+  validateLocalOtaFilename,
   validateOtaWindowAck,
   verifyManifestSignature,
   versionTriplet,
@@ -83,6 +84,9 @@ test("BEGIN and AUTH frames match the shared firmware/Python vectors", () => {
   const info = imageInfo({ bodyLength: 0x000d29f0, bodySha256: BODY_HASH });
   const begin = encodeOtaBegin(0x12345678, 0x000d2bf0, info, "1.2.3", true);
   assert.equal(hex(begin), BEGIN_VECTOR);
+  const hsBegin = encodeOtaBegin(0x12345678, 0x000d2bf0, info, "1.2.3", true, "hs");
+  assert.equal(hsBegin[14], 1);
+  assert.notEqual(hex(hsBegin), BEGIN_VECTOR);
 
   const signature: OtaSignature = {
     algorithm: "ECDSA-P256-SHA256",
@@ -118,6 +122,7 @@ test("57-byte P-256 canonical matches the cross-language vector", () => {
     hex(otaAuthorizationCanonical(info, "1.2.3")),
     "445335444f4e474c452d4f54412d5631010001020304030201" + "00".repeat(31) + "ff",
   );
+  assert.equal(otaAuthorizationCanonical(info, "1.2.3", "hs")[17], 1);
 });
 
 test("window ACK waits for the exact window end and rejects regression/overshoot", () => {
@@ -142,7 +147,8 @@ test("manifest rejects extra fields, wrong target, insecure URL, and unsigned re
   assert.equal(parseManifest(valid).board, "aim61");
   assert.throws(() => parseManifest({ ...valid, extra: true }), /字段集合/);
   assert.throws(() => parseManifest({ ...valid, board: "m62" }), /Ai-M61/);
-  assert.throws(() => parseManifest({ ...valid, usb_speed: "hs" }), /Ai-M61/);
+  assert.equal(parseManifest({ ...valid, usb_speed: "hs" }).usb_speed, "hs");
+  assert.throws(() => parseManifest({ ...valid, usb_speed: "ss" }), /Ai-M61/);
   assert.throws(() => parseManifest({ ...valid, url: "http://example.com/fw.bin.ota" }), /HTTPS/);
   assert.throws(() => parseManifest({ ...valid, url: "http://localhost.evil.example/fw.bin.ota" }), /HTTPS/);
   assert.match(parseManifest({ ...valid, url: "http://localhost/fw.bin.ota" }).url, /^http:\/\/localhost\//);
@@ -153,6 +159,16 @@ test("manifest rejects extra fields, wrong target, insecure URL, and unsigned re
   assert.equal(
     parseManifest({ ...valid, channel: "dev", signature: null }, undefined, { allowUnsignedDev: true }).signature,
     null,
+  );
+});
+
+test("local OTA filenames require the selected FS or HS profile", () => {
+  const info = imageInfo({ firmwareVersion: "1.2.3" });
+  assert.doesNotThrow(() => validateLocalOtaFilename("DS5Dongle-aim61-fs-v1.2.3.bin.ota", info, "fs"));
+  assert.doesNotThrow(() => validateLocalOtaFilename("DS5Dongle-aim61-hs-v1.2.3.bin.ota", info, "hs"));
+  assert.throws(
+    () => validateLocalOtaFilename("DS5Dongle-aim61-fs-v1.2.3.bin.ota", info, "hs"),
+    /fs\/hs/,
   );
 });
 

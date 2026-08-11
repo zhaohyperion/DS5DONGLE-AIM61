@@ -1,12 +1,12 @@
 # M61 网页 OTA 发布与传输规范
 
-本项目的网页 OTA 只更新 **Ai-M61-32S-Kit / USB Full-Speed** 的应用固件。第一次部署仍必须通过串口完整刷写受支持的 `boot2`、`partition.bin` 和带 OTA 功能的应用；完成这次基线刷写后，网页才可以更新单个 RAW 应用镜像。
+本项目的网页 OTA 更新 **Ai-M61-32S-Kit / USB Full-Speed 或 High-Speed** 应用固件。设备只能执行同速升级（FS→FS、HS→HS），不能通过 OTA 改变 USB 档位。第一次部署仍必须通过串口完整刷写受支持的 `boot2`、`partition.bin` 和带 OTA 功能的应用；完成这次基线刷写后，网页才可以更新单个 RAW 应用镜像。
 
 ## 用户快速升级
 
 1. 使用 Chrome 或 Edge 打开部署在 HTTPS/localhost 的 `web/` 页面。
 2. 通过原生 USB 飞线连接 DS5Dongle，点击“连接设备”。板载 CH340 Type-C 只负责供电、串口日志和线刷，不能替代原生 USB 数据线。
-3. 在 OTA 页面确认设备报告 `aim61`、`fs`、RAW OTA、A/B 分区、强制签名和已配置发布公钥。
+3. 在 OTA 页面确认设备报告 `aim61`、当前 `fs`/`hs` 档位、RAW OTA、A/B 分区、强制签名和已配置发布公钥。
 4. 加载默认在线稳定版，网页会先验证清单、目标、版本、完整容器 SHA-256、RAW body SHA-256 和 P-256 签名。
 5. 确认后开始升级。不要断电、拔线、关闭页面或让电脑休眠。
 6. 设备写入非活动槽并重启；重新连接后确认版本。新固件未通过健康确认时，Boot2 应回滚旧槽。
@@ -18,23 +18,26 @@
 - `boot2_bl616_*.bin`
 - `partition.bin`（包括两份分区表）
 - 完整线刷 ZIP 或其中的任意地址配置
-- High-Speed、其他开发板或超过 M61 备用 FW 槽的镜像
+- 与当前设备不同的 FS/HS 镜像、其他开发板镜像或超过 M61 备用 FW 槽的镜像
 
 网页只接受后缀为 `.bin.ota` 的 Bouffalo RAW OTA 容器。容器由 512 字节 `BL60X_OTA` 头和应用 body 组成；M61 备用 FW 槽最多容纳 `0x168000`（1,474,560）字节的 RAW body。
 
 ## 发布清单
 
-稳定版固定发布两个资产：
+稳定版为两种USB档位各发布镜像和清单，共四个资产：
 
 - `DS5Dongle-aim61-fs-v<version>.bin.ota`
 - `DS5Dongle-aim61-fs-stable.ota.json`
+- `DS5Dongle-aim61-hs-v<version>.bin.ota`
+- `DS5Dongle-aim61-hs-stable.ota.json`
 
-Release 工作流只接受 `v?major.minor.patch` 标签：每部分为 0..254，且去掉可选 `v` 后的规范版本字符串最长 8 个 ASCII 字符。Bouffalo SDK 的 `ver_software[16]` 必须容纳 `EVENT_V<version>` 和终止 NUL；因此 `254.5.0` 可用，而 `254.254.254` 必须在构建前拒绝。工作流把同一个规范版本同时注入 `FIRMWARE_VERSION` 与 `PROJECT_SDK_VERSION`，SDK 生成的 OTA 头必须精确等于 `EVENT_Vmajor.minor.patch`，并与 manifest `version` 一致；发布工具在生成和验证阶段都会检查这条版本链。非 Release CI 构建使用 `3.5.0`。
+Release 工作流只接受 `v?major.minor.patch` 标签：每部分为 0..254，且去掉可选 `v` 后的规范版本字符串最长 8 个 ASCII 字符。Bouffalo SDK 的 `ver_software[16]` 必须容纳 `EVENT_V<version>` 和终止 NUL；因此 `254.5.0` 可用，而 `254.254.254` 必须在构建前拒绝。工作流把同一个规范版本同时注入 `FIRMWARE_VERSION` 与 `PROJECT_SDK_VERSION`，SDK 生成的 OTA 头必须精确等于 `EVENT_Vmajor.minor.patch`，并与 manifest `version` 一致；发布工具在生成和验证阶段都会检查这条版本链。非 Release CI 构建使用 `3.5.1`。
 
 网页可通过 GitHub 的 latest 别名读取清单：
 
 ```text
 https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json
+https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-hs-stable.ota.json
 ```
 
 清单 schema 1 的字段集合是固定的，不允许缺失或附加字段：
@@ -136,6 +139,7 @@ python tools\ota_release.py generate `
   --image build\build_out\ds5dongle_bl618_bl616.bin.ota `
   --manifest dist\DS5Dongle-aim61-fs-dev.ota.json `
   --channel dev --version v1.2.3 --allow-unsigned-dev `
+  --usb-speed fs `
   --url https://downloads.example.test/DS5Dongle-aim61-fs-v1.2.3.bin.ota
 ```
 
@@ -146,6 +150,7 @@ python tools\ota_release.py generate `
   --image dist\DS5Dongle-aim61-fs-v1.2.3.bin.ota `
   --manifest dist\DS5Dongle-aim61-fs-stable.ota.json `
   --channel stable --version v1.2.3 `
+  --usb-speed fs `
   --url https://github.com/example/project/releases/download/v1.2.3/DS5Dongle-aim61-fs-v1.2.3.bin.ota `
   --private-key C:\secure\ota-p256-private.pem --key-id release-2026
 ```
@@ -158,6 +163,8 @@ python tools\ota_release.py verify `
   --manifest dist\DS5Dongle-aim61-fs-stable.ota.json `
   --public-key ota-p256-public.pem --expected-key-id release-2026
 ```
+
+High-Speed 使用完全相同的流程：把文件名中的 `fs` 改为 `hs`，并把 `generate` 命令的 `--usb-speed fs` 改为 `--usb-speed hs`。`usb_speed` 会进入57字节签名 canonical，不能在签名后修改；网页还会把清单档位与设备 `STATUS.usb_speed` 比较，设备端 `BEGIN` 再做一次同速校验。
 
 签名和验证调用 OpenSSL 的 ECDSA P-256 实现，并要求 OpenSSL 3.5 或更新版本的 provider 支持 RFC 6979 deterministic nonce（`nonce-type:1`）；相同镜像、版本、URL、密钥和 `key_id` 会生成逐字节相同的清单。工具负责 DER 与固定 64 字节 raw `r||s` 的严格转换；找不到或版本过旧的 OpenSSL 时工具直接失败，也可以通过 `--openssl <路径>` 指定可执行文件。Release 发布任务固定使用带 OpenSSL 3.5+ 的 Windows Runner，不能改回仍只有 OpenSSL 3.0 的 `ubuntu-24.04`。
 
@@ -227,7 +234,7 @@ ERROR  = 4f5401ff78563412001000002c0611030100100000f02b0d0000821600fb03000001000
 
 推荐流程：
 
-1. 读取 `STATUS`，确认设备是 `aim61/fs`、协议版本匹配且当前不在升级。
+1. 读取 `STATUS`，确认设备是 `aim61/fs` 或 `aim61/hs`、协议版本匹配且当前不在升级。
 2. `BEGIN` 发送总长度、目标、semver、签名 flag、RAW body 长度和 body SHA。
 3. stable 更新用两个 `AUTH` 帧发送 64 字节 P-256 raw `r||s`；设备重建 canonical 并验签成功后才进入接收状态。
 4. 用 `0xFA` 发送最多 46 字节的数据块。offset 是幂等序号；设备只确认连续写入的下一个 offset，重试同一 offset 不得重复推进。

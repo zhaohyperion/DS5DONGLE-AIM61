@@ -19,7 +19,7 @@ elseif(DEFINED ENV{PROJECT_SDK_VERSION} AND
        NOT "$ENV{PROJECT_SDK_VERSION}" STREQUAL "")
     set(DS5_SELECTED_VERSION "$ENV{PROJECT_SDK_VERSION}")
 else()
-    set(DS5_SELECTED_VERSION "3.5.0")
+    set(DS5_SELECTED_VERSION "3.5.1")
 endif()
 if(NOT DS5_SELECTED_VERSION MATCHES
    "^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])\\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])\\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])$")

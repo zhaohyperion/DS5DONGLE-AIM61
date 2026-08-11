@@ -40,7 +40,7 @@ jobs:
           USB_SPEED: ${{ matrix.speed }}
           OTA_P256_PUBLIC_KEY_SEC1_B64: ${{ vars.OTA_P256_PUBLIC_KEY_SEC1_B64 }}
         run: |
-          $firmwareVersion = "${{ github.event_name == 'release' && github.event.release.tag_name || '3.5.0' }}" -replace '^v', ''
+          $firmwareVersion = "${{ github.event_name == 'release' && github.event.release.tag_name || '3.5.1' }}" -replace '^v', ''
           if ($firmwareVersion -notmatch '^(?:[0-9]|[1-9][0-9]{1,2})\.(?:[0-9]|[1-9][0-9]{1,2})\.(?:[0-9]|[1-9][0-9]{1,2})$') {
             throw "Release tag must be v?MAJOR.MINOR.PATCH with components 0..254"
           }
@@ -80,10 +80,10 @@ jobs:
             }
           }
           python tools\package_firmware.py --board $env:BOARD_TYPE --usb-speed $env:USB_SPEED --version "${{ github.event.release.tag_name || github.sha }}" --firmware-dir "firmware\$env:BOARD_TYPE" --output-dir dist
-          if ($env:BOARD_TYPE -eq "aim61" -and $env:USB_SPEED -eq "fs") {
+          if ($env:BOARD_TYPE -eq "aim61") {
             $version = "${{ github.event.release.tag_name || github.sha }}".TrimStart("v")
             $otaSource = "build\build_out\ds5dongle_bl618_bl616.bin.ota"
-            $otaTarget = "dist\DS5Dongle-aim61-fs-v$version.bin.ota"
+            $otaTarget = "dist\DS5Dongle-aim61-$($env:USB_SPEED)-v$version.bin.ota"
             python tools\ota_release.py inspect --image $otaSource
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             Copy-Item -LiteralPath $otaSource -Destination $otaTarget
@@ -180,26 +180,30 @@ jobs:
             echo "::error::release private key does not match OTA_P256_PUBLIC_KEY_SEC1_B64" >&2
             exit 1
           fi
-          ota_image="$(find dist -maxdepth 1 -type f -name 'DS5Dongle-aim61-fs-v*.bin.ota' -print -quit)"
-          if [[ -z "$ota_image" ]]; then
-            echo "::error::M61 Full-Speed RAW OTA asset was not built" >&2
-            exit 1
-          fi
-          ota_name="$(basename "$ota_image")"
-          ota_url="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ github.event.release.tag_name }}/$ota_name"
-          python tools/ota_release.py generate \
-            --image "$ota_image" \
-            --manifest dist/DS5Dongle-aim61-fs-stable.ota.json \
-            --channel stable \
-            --version "${{ github.event.release.tag_name }}" \
-            --url "$ota_url" \
-            --private-key "$private_key" \
-            --key-id "$OTA_P256_KEY_ID"
-          python tools/ota_release.py verify \
-            --image "$ota_image" \
-            --manifest dist/DS5Dongle-aim61-fs-stable.ota.json \
-            --public-key "$public_key" \
-            --expected-key-id "$OTA_P256_KEY_ID"
+          for usb_speed in fs hs; do
+            ota_image="$(find dist -maxdepth 1 -type f -name "DS5Dongle-aim61-${usb_speed}-v*.bin.ota" -print -quit)"
+            if [[ -z "$ota_image" ]]; then
+              echo "::error::M61 ${usb_speed} RAW OTA asset was not built" >&2
+              exit 1
+            fi
+            ota_name="$(basename "$ota_image")"
+            ota_manifest="dist/DS5Dongle-aim61-${usb_speed}-stable.ota.json"
+            ota_url="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ github.event.release.tag_name }}/$ota_name"
+            python tools/ota_release.py generate \
+              --image "$ota_image" \
+              --manifest "$ota_manifest" \
+              --channel stable \
+              --version "${{ github.event.release.tag_name }}" \
+              --usb-speed "$usb_speed" \
+              --url "$ota_url" \
+              --private-key "$private_key" \
+              --key-id "$OTA_P256_KEY_ID"
+            python tools/ota_release.py verify \
+              --image "$ota_image" \
+              --manifest "$ota_manifest" \
+              --public-key "$public_key" \
+              --expected-key-id "$OTA_P256_KEY_ID"
+          done
       - name: Upload release assets
         shell: bash
         env:

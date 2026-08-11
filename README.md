@@ -22,9 +22,9 @@
 | 默认硬件 | Ai-M61-32S-Kit / BL618 |
 | 默认 USB 模式 | Full-Speed 12 Mbps，兼容性优先 |
 | 可选 USB 模式 | High-Speed 480 Mbps |
-| 固件开发版本 | `3.5.0`；正式 Release 版本由标签注入 |
+| 固件开发版本 | `3.5.1`；正式 Release 版本由标签注入 |
 | 音频编解码 | Opus 1.5.2，固定点，E907 DSP 快速路径 |
-| Web OTA | 仅 Ai-M61 Full-Speed，P-256 签名、A/B 分区、试运行回滚 |
+| Web OTA | Ai-M61 Full-Speed / High-Speed，P-256 签名、同速校验、A/B 分区、试运行回滚 |
 | 本地普通构建 | 可串口刷写；未注入发布公钥时，生产 OTA 会安全拒绝 |
 
 当前仓库以 Ai-M61 为主要目标，同时保留 LCTech BL616 与 Sipeed M0S Dock 的构建支持。
@@ -152,7 +152,7 @@ BOARD_TYPE=m0sdock bash build_macos.sh rebuild
 | `BOARD_TYPE` | `aim61` / `lctech616` / `m0sdock` | `aim61` |
 | `USB_SPEED` | `fs` / `hs` | `fs` |
 | `DS5_LOG_LEVEL` | `0`..`3` | `2` |
-| `FIRMWARE_VERSION` | `X.Y.Z`，每段 0..254 | `3.5.0` |
+| `FIRMWARE_VERSION` | `X.Y.Z`，每段 0..254 | `3.5.1` |
 
 主要输出位于：
 
@@ -187,8 +187,8 @@ OTA 只更新应用分区。第一次安装必须通过 UART ISP 完整写入 Bo
 ```powershell
 .\DS5Dongle-Flasher-Windows.exe --list
 .\DS5Dongle-Flasher-Windows.exe --list-releases --board aim61 --usb-speed fs
-.\DS5Dongle-Flasher-Windows.exe --verify-release --release v3.5.0 --board aim61 --usb-speed fs
-.\DS5Dongle-Flasher-Windows.exe --release v3.5.0 --board aim61 --usb-speed fs --port COM5 --dry-run
+.\DS5Dongle-Flasher-Windows.exe --verify-release --release v3.5.1 --board aim61 --usb-speed fs
+.\DS5Dongle-Flasher-Windows.exe --release v3.5.1 --board aim61 --usb-speed fs --port COM5 --dry-run
 ```
 
 #### 从本地构建生成完整包
@@ -247,19 +247,19 @@ Web 功能包括：
 - 灯光、音量、轮询率、休眠及音频选项
 - 手柄按键映射
 - 电量、RSSI、USB/蓝牙/音频运行期诊断
-- Ai-M61 Full-Speed 签名 OTA
+- Ai-M61 Full-Speed / High-Speed 签名 OTA
 
 ### 在线 OTA 使用条件
 
-- 目前只支持 **Ai-M61-32S-Kit + USB Full-Speed + RAW `.bin.ota`**；High-Speed 和其他板型必须线刷。
+- 支持 **Ai-M61-32S-Kit + USB Full-Speed/High-Speed + RAW `.bin.ota`**；只允许 FS→FS、HS→HS，同一设备不能跨USB档位OTA。
 - 设备必须先完整线刷本项目的 OTA 分区表、Boot2 和带相同发布公钥的基础固件。
 - 原生 USB 的 D+/D-/GND 飞线必须稳定；升级期间不要断电、拔线或关闭页面。
-- 网页默认从本仓库 latest Release 读取 `DS5Dongle-aim61-fs-stable.ota.json`；也可手动填写其他受信任清单 URL。
+- 网页根据设备能力从 latest Release 读取 `DS5Dongle-aim61-fs-stable.ota.json` 或 `DS5Dongle-aim61-hs-stable.ota.json`；也可手动填写其他受信任清单 URL。
 
 用户升级流程：
 
 1. 在 HTTPS 页面中点击连接设备，并选择当前 DS5Dongle。
-2. 打开 OTA 页，读取设备版本和能力；目标必须显示 `Ai-M61 · FS · RAW`。
+2. 打开 OTA 页，读取设备版本和能力；目标必须显示与当前固件一致的 `Ai-M61 · FS/HS · RAW`。
 3. 加载在线稳定版清单，等待网页完成清单、目标、容器哈希、固件体哈希和 P-256 签名校验。
 4. 勾选升级确认后开始传输。固件写入非活动槽，升级期间会暂停实时蓝牙/音频业务。
 5. 设备验证完成后重启；重新连接并确认新版本。试运行未确认或启动失败时，由 Boot2 回滚到旧槽。
@@ -291,7 +291,7 @@ Web 功能包括：
 ## 已知限制
 
 - 一次只桥接一个活动手柄。
-- Web OTA 当前只接受 Ai-M61 Full-Speed RAW OTA 镜像。
+- Web OTA 只接受与当前设备USB档位一致的 Ai-M61 RAW OTA 镜像，不支持 FS/HS 交叉升级。
 - Ai-M61 High-Speed 对 USB 飞线、接头和主机控制器更敏感。
 - 键盘映射类型属于预留协议；当前固件只保证手柄到手柄的按键映射。
 - 首次安装和 Boot2/分区表变更必须使用串口完整刷写。

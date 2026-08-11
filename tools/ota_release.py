@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify DS5Dongle M61 Full-Speed OTA release manifests.
+"""Build and verify DS5Dongle M61 FS/HS OTA release manifests.
 
 The Bouffalo SDK emits a 512-byte ``BL60X_OTA`` header followed by the
 application body.  This tool deliberately accepts RAW application images only;
@@ -29,9 +29,8 @@ OTA_RAW_TYPE = b"RAW "
 M61_BACKUP_SLOT_SIZE = 0x168000
 MANIFEST_SCHEMA = 1
 MANIFEST_BOARD = "aim61"
-MANIFEST_USB_SPEED = "fs"
 MANIFEST_BOARD_ID = 1
-MANIFEST_USB_SPEED_ID = 0
+MANIFEST_USB_SPEED_IDS = {"fs": 0, "hs": 1}
 SIGNATURE_ALGORITHM = "ECDSA-P256-SHA256"
 SIGNATURE_SCOPE = "DS5DONGLE-OTA-V1"
 SIGNATURE_CANONICAL_MAGIC = SIGNATURE_SCOPE.encode("ascii")
@@ -157,6 +156,12 @@ def _validate_url(url: Any) -> str:
     return url
 
 
+def _validate_usb_speed(usb_speed: Any) -> str:
+    if not isinstance(usb_speed, str) or usb_speed not in MANIFEST_USB_SPEED_IDS:
+        raise OtaReleaseError("OTA manifest usb_speed must be fs or hs")
+    return usb_speed
+
+
 def signature_payload(manifest: dict[str, Any], info: OtaImageInfo) -> bytes:
     """Return the exact 57-byte P-256 authorization canonical."""
     if type(manifest.get("schema")) is not int or manifest.get("schema") != MANIFEST_SCHEMA:
@@ -166,8 +171,7 @@ def signature_payload(manifest: dict[str, Any], info: OtaImageInfo) -> bytes:
         raise OtaReleaseError(f"unsupported channel: {channel!r}")
     if manifest.get("board") != MANIFEST_BOARD:
         raise OtaReleaseError("OTA manifest board must be aim61")
-    if manifest.get("usb_speed") != MANIFEST_USB_SPEED:
-        raise OtaReleaseError("OTA manifest usb_speed must be fs")
+    usb_speed = _validate_usb_speed(manifest.get("usb_speed"))
     raw_version = manifest.get("version")
     version = _validate_version(raw_version)
     if raw_version != version:
@@ -200,7 +204,7 @@ def signature_payload(manifest: dict[str, Any], info: OtaImageInfo) -> bytes:
     canonical = b"".join(
         (
             SIGNATURE_CANONICAL_MAGIC,
-            bytes((MANIFEST_BOARD_ID, MANIFEST_USB_SPEED_ID)),
+            bytes((MANIFEST_BOARD_ID, MANIFEST_USB_SPEED_IDS[usb_speed])),
             bytes(_version_triplet(version)),
             struct.pack("<I", info.body_size),
             bytes.fromhex(info.body_sha256),
@@ -457,6 +461,7 @@ def build_manifest(
     channel: str,
     version: str,
     url: str,
+    usb_speed: str = "fs",
     private_key: Path | None = None,
     key_id: str | None = None,
     openssl: str | None = None,
@@ -471,11 +476,12 @@ def build_manifest(
             f"header={info.software_version!r}, requested={version!r}"
         )
     url = _validate_url(url)
+    usb_speed = _validate_usb_speed(usb_speed)
     manifest: dict[str, Any] = {
         "schema": MANIFEST_SCHEMA,
         "channel": channel,
         "board": MANIFEST_BOARD,
-        "usb_speed": MANIFEST_USB_SPEED,
+        "usb_speed": usb_speed,
         "version": version,
         "size": info.size,
         "sha256": info.sha256,
@@ -636,6 +642,7 @@ def _parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--channel", choices=CHANNELS, required=True)
     generate_parser.add_argument("--version", required=True)
     generate_parser.add_argument("--url", required=True)
+    generate_parser.add_argument("--usb-speed", choices=tuple(MANIFEST_USB_SPEED_IDS), required=True)
     generate_parser.add_argument("--private-key", type=Path)
     generate_parser.add_argument("--key-id")
     generate_parser.add_argument("--openssl")
@@ -688,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
                 channel=args.channel,
                 version=args.version,
                 url=args.url,
+                usb_speed=args.usb_speed,
                 private_key=args.private_key,
                 key_id=args.key_id,
                 openssl=args.openssl,
