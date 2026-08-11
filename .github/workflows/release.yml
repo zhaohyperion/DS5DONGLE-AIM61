@@ -209,4 +209,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+        run: |
+          mapfile -d '' assets < <(find dist -maxdepth 1 -type f -print0)
+          if (( ${#assets[@]} == 0 )); then
+            echo "::error::No release files were produced" >&2
+            exit 1
+          fi
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
