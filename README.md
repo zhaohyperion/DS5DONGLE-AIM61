@@ -124,6 +124,13 @@ build_windows.bat build     rem 增量构建
 build_windows.bat clean     rem 清理构建目录
 ```
 
+需要采集详细但低扰动的诊断计数时，可临时构建日志级别 3；正式发布仍建议默认级别 2：
+
+```bat
+set DS5_LOG_LEVEL=3
+build_windows.bat rebuild
+```
+
 macOS / Linux：
 
 ```bash
@@ -162,6 +169,30 @@ firmware/aim61/partition.bin
 
 OTA 只更新应用分区。第一次安装必须通过 UART ISP 完整写入 Boot2、分区表和应用固件。
 
+#### 使用 Windows 一键刷写器
+
+1. 从 [Releases](https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest) 下载 `DS5Dongle-Flasher-Windows.exe`。
+2. Ai-M61 用板载 Type-C 连接电脑；如果没有 COM 口，可在刷写器内安装经过 SHA-256 和数字签名校验的 WCH CH340/CH341 官方驱动。
+3. 按住 **BOOT**，短按 **RESET**（也可按住 BOOT 重新插线），然后松开 BOOT。
+4. 打开刷写器，选择 `Ai-M61-32S-Kit`、`Full-Speed` 和对应 COM 口。
+5. 选择在线 Release，或加载本地完整固件 ZIP/目录；确认目标板型和 USB 速度后开始刷写。
+6. 成功后按 RESET 正常启动。若 460800 波特率失败，可在界面中改用 115200 重试。
+
+刷写器会先验证包结构、文件名、尺寸和 SHA-256，再调用内置并校验过的 Bouffalo `BLFlashCommand`。不要给 Ai-M61 刷入 LCTech/M0S 包，也不要把 OTA `.bin.ota` 当作完整线刷包。
+
+在本仓库发布第一个包含完整固件资产的 GitHub Release 之前，在线列表会为空；此时请按下文生成本地 ZIP，不要回退到旧仓库下载源。
+
+常用 CLI 检查命令：
+
+```powershell
+.\DS5Dongle-Flasher-Windows.exe --list
+.\DS5Dongle-Flasher-Windows.exe --list-releases --board aim61 --usb-speed fs
+.\DS5Dongle-Flasher-Windows.exe --verify-release --release v3.5.0 --board aim61 --usb-speed fs
+.\DS5Dongle-Flasher-Windows.exe --release v3.5.0 --board aim61 --usb-speed fs --port COM5 --dry-run
+```
+
+#### 从本地构建生成完整包
+
 生成供刷写器使用的本地完整包：
 
 ```powershell
@@ -173,15 +204,7 @@ python tools/package_firmware.py `
   --output-dir dist
 ```
 
-Ai-M61 进入 UART ISP：
-
-1. 使用板载 Type-C 连接电脑。
-2. 按住 **BOOT**。
-3. 按一下 RESET，或在按住 BOOT 时重新插线。
-4. 松开 BOOT，在刷写器中选择 CH340 对应的 COM 口。
-5. 选择生成的 `DS5Dongle-aim61-fs-vlocal.zip` 并开始刷写。
-
-刷写器源码与构建说明见 [`tools/ds5dongle-flasher/`](tools/ds5dongle-flasher/) 和 [`docs/FLASHER.md`](docs/FLASHER.md)。
+刷写器源码、完整 GUI/CLI 参数、包格式及自行构建方法见 [`tools/ds5dongle-flasher/`](tools/ds5dongle-flasher/) 和 [`docs/FLASHER.md`](docs/FLASHER.md)。
 
 ### 4. 配对手柄
 
@@ -226,6 +249,23 @@ Web 功能包括：
 - 电量、RSSI、USB/蓝牙/音频运行期诊断
 - Ai-M61 Full-Speed 签名 OTA
 
+### 在线 OTA 使用条件
+
+- 目前只支持 **Ai-M61-32S-Kit + USB Full-Speed + RAW `.bin.ota`**；High-Speed 和其他板型必须线刷。
+- 设备必须先完整线刷本项目的 OTA 分区表、Boot2 和带相同发布公钥的基础固件。
+- 原生 USB 的 D+/D-/GND 飞线必须稳定；升级期间不要断电、拔线或关闭页面。
+- 网页默认从本仓库 latest Release 读取 `DS5Dongle-aim61-fs-stable.ota.json`；也可手动填写其他受信任清单 URL。
+
+用户升级流程：
+
+1. 在 HTTPS 页面中点击连接设备，并选择当前 DS5Dongle。
+2. 打开 OTA 页，读取设备版本和能力；目标必须显示 `Ai-M61 · FS · RAW`。
+3. 加载在线稳定版清单，等待网页完成清单、目标、容器哈希、固件体哈希和 P-256 签名校验。
+4. 勾选升级确认后开始传输。固件写入非活动槽，升级期间会暂停实时蓝牙/音频业务。
+5. 设备验证完成后重启；重新连接并确认新版本。试运行未确认或启动失败时，由 Boot2 回滚到旧槽。
+
+在线稳定版不会因为“网页能下载文件”就自动可信。维护者必须在仓库配置 `OTA_P256_PRIVATE_KEY_B64` Secret，以及 `OTA_P256_PUBLIC_KEY_SEC1_B64`、`OTA_P256_KEY_ID` Repository variables；网页部署还必须注入相同信任根的 `NEXT_PUBLIC_OTA_P256_PUBLIC_KEY` 和 `NEXT_PUBLIC_OTA_KEY_ID`。普通本地构建没有生产密钥，会按 fail-closed 原则拒绝稳定版 OTA。
+
 生产 OTA 使用 fail-closed 信任模型：
 
 - 网页和设备端分别验证 P-256 ECDSA 签名。
@@ -234,7 +274,7 @@ Web 功能包括：
 - 新固件必须通过试运行确认，否则 Boot2 回滚。
 - 普通本地构建不包含默认发布密钥，因此不会意外接受生产 OTA。
 
-完整协议和发布流程见 [`docs/OTA.md`](docs/OTA.md)。生产私钥不得写入源码、网页环境变量、构建日志或 GitHub 仓库。
+完整协议、密钥生成、发布命令、断电测试和回滚门槛见 [`docs/OTA.md`](docs/OTA.md)。生产私钥不得写入源码、网页公开环境变量、构建日志或 GitHub 仓库。
 
 ## 性能设计
 
@@ -286,7 +326,7 @@ cargo test --manifest-path tools/ds5dongle-flasher/Cargo.toml
 
 ```text
 src/                         BL616/BL618 固件
-lib/opus/                    Opus 1.5.2 上游源码
+lib/opus/                    Opus 1.5.2 固件所需源码子集
 firmware/                    板型刷写配置与本地输出目录
 tools/ds5dongle-flasher/     Windows GUI/CLI 刷写器
 tools/ota_*.py               OTA 协议、签名和发布工具
@@ -296,14 +336,45 @@ docs/                        OTA、诊断和刷写器详细文档
 .github/workflows/           构建与发布自动化
 ```
 
-## 来源与致谢
+## 来源、演进与致谢
 
-- [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle)：Raspberry Pi Pico 2W 原始实现和核心协议参考
-- [sqlCRT/bouffalo_sdk](https://github.com/sqlCRT/bouffalo_sdk)：BL616/BL618 SDK 与本项目所需适配
-- [CherryUSB](https://github.com/cherry-embedded/CherryUSB)：USB Device Stack
-- [xiph/opus](https://github.com/xiph/opus)：Opus 音频编解码器
+本项目不是从零开始的独立实现。为避免把“历史参考”“直接代码来源”和“当前外部依赖”混为一谈，完整沿革如下。
 
-本移植将 BTstack/TinyUSB 架构迁移到 Bouffalo SDK Bluetooth Stack 与 CherryUSB，并针对 E907、Ai-M61 PSRAM、实时音频和 USB HID 调度进行了适配。
+### 项目沿革与贡献
+
+| 来源 / 贡献者 | 与本项目的关系 |
+|---|---|
+| [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) | 最初的 Raspberry Pi Pico 2W 实现；提供 DualSense 蓝牙 HID 到 USB 的核心架构、协议处理和产品方向。上游为 MIT 许可。 |
+| [ccc007ccc/DS5Dongle](https://github.com/ccc007ccc/DS5Dongle) | 本仓库直接继承的 BL616/BL618/Ai-M61 开发主线，包含板卡移植、实时音频、E907 优化、刷写器与大量稳定性工程；原提交历史已完整保留。该历史版本为 MIT 许可，Copyright (c) 2026 awalol and contributors / ccc007ccc。 |
+| [sqlCRT/ds5dongle-bl618-opensource](https://github.com/sqlCRT/ds5dongle-bl618-opensource) | BL618 开源发布、三板型支持和后续功能基线；当前代码在此类 BL618 实现上继续整合 OTA、诊断、Web 配置和工程化改进。上游项目采用 GPL-3.0。 |
+| [sqlCRT/bouffalo_sdk](https://github.com/sqlCRT/bouffalo_sdk) | 当前构建所需的 Bouffalo SDK 分支，基于 BouffaloSDK v2.3.28，补充了 DS5Dongle 所需的 Bluetooth HID `net_buf`、USB Audio 与刷写工具适配；本仓库固定使用提交 `cf6adf74b374a0e485defa9c89610f3e7ffcc3ec`。 |
+| [zhaohyperion/DS5DONGLE-AIM61](https://github.com/zhaohyperion/DS5DONGLE-AIM61) | 当前维护仓库：以 Ai-M61 为默认目标，承接固件、Windows 刷写器、签名 A/B OTA、WebHID 配置、诊断与发布流程。 |
+
+当前 Opus 基线是官方 [xiph/opus 1.5.2](https://github.com/xiph/opus/tree/v1.5.2)，不是第三方 Opus fork。E907 的 CLZ、Q15/Q16 DSP 乘法、2 的幂除法和 D4 音频快速路径来自本项目旧版 Opus 1.2.1 [M61 优化补丁组](https://github.com/zhaohyperion/DS5DONGLE-AIM61/tree/0968b719a38b5bfea951c8e87f3250ecac4e8fa8/m61/dualsense_hidp_probe/patches)，由 `ccc007ccc` 在真实 E907 热点分析和位精确测试基础上开发，之后适配并重新验证到 1.5.2。
+
+### 固件及协议栈依赖
+
+| 项目 | 用途 | 许可 / 备注 |
+|---|---|---|
+| [BouffaloSDK](https://github.com/bouffalolab/bouffalo_sdk) | BL616/BL618 HAL、启动、Flash、Bluetooth 与构建系统 | Apache-2.0；实际构建使用上表 `sqlCRT` 分支 |
+| [Zephyr Project](https://github.com/zephyrproject-rtos/zephyr) | Bouffalo Bluetooth Host 中采用的 API 与代码基础 | Apache-2.0，经 SDK 引入 |
+| [CherryUSB](https://github.com/cherry-embedded/CherryUSB) | USB HID/UAC1 Device Stack；SDK 固定版本为 v1.5.3 | Apache-2.0，经 SDK 引入 |
+| [FreeRTOS Kernel](https://github.com/FreeRTOS/FreeRTOS-Kernel) | 固件任务、队列、同步和定时 | MIT，经 SDK 引入；`src/FreeRTOSConfig.h` 保留原版权声明 |
+| [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) | OTA SHA-256 与 ECDSA P-256 设备端验签 | Apache-2.0 或 GPL-2.0-or-later 双许可，本项目按 Apache-2.0 使用，经 SDK 引入 |
+| [littlefs](https://github.com/littlefs-project/littlefs) | 配置与配对数据持久化，SDK 通过 EasyFlash 兼容接口暴露 | BSD-3-Clause，经 SDK 引入 |
+| [xiph/opus](https://github.com/xiph/opus) | DualSense 双向语音音频编解码，固定点模式 | BSD-3-Clause；仓库只保留固件编译所需的 1.5.2 源码、头文件和许可证 |
+
+[BTstack](https://github.com/bluekitchen/btstack) 与 [TinyUSB](https://github.com/hathach/tinyusb) 属于 `awalol/DS5Dongle` 的历史架构来源；当前 BL618 固件没有链接它们。Linux 内核 [`hid-playstation.c`](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-playstation.c) 仅用于 DualSense 报告布局和偏移交叉验证，仓库未复制 Linux 内核代码。
+
+原始 `awalol/DS5Dongle` 还致谢了 [rafaelvaloto/Pico_W-Dualsense](https://github.com/rafaelvaloto/Pico_W-Dualsense)（项目灵感）、[egormanga/SAxense](https://github.com/egormanga/SAxense)（蓝牙触觉概念验证）、[Controllers Wiki 的 DualSense 报告结构资料](https://controllers.fandom.com/wiki/Sony_DualSense) 与 [Paliverse/DualSenseX](https://github.com/Paliverse/DualSenseX)（扬声器报告包参考）。这些间接历史参考一并保留致谢，但不是当前仓库的直接构建依赖。
+
+### 工具、网页与开发协助
+
+- Windows 刷写器由 Rust 构建，直接依赖 `anyhow`、`base64`、`eframe/egui`、`reqwest/rustls`、`rfd`、`serde`、`sha2`、`windows-sys` 和 `zip` 等项目；精确版本与完整传递依赖见 [`Cargo.toml`](tools/ds5dongle-flasher/Cargo.toml) 和 [`Cargo.lock`](tools/ds5dongle-flasher/Cargo.lock)。刷写后端来自 Bouffalo Lab `BLFlashCommand`；可选串口驱动由 [WCH](https://www.wch-ic.com/) 提供，驱动不会提交进仓库。
+- Web 配置器使用 [React](https://github.com/facebook/react)、[Vinext](https://github.com/cloudflare/vinext)、[Vite](https://github.com/vitejs/vite)、[Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) 和 Cloudflare 工具链；精确版本见 [`package.json`](web/package.json) 与 [`package-lock.json`](web/package-lock.json)。
+- BL618 移植阶段使用 Cursor 与 Claude Opus 4.6 辅助开发；当前代码审计、OTA/刷写流程和文档整理使用 OpenAI Codex 辅助。所有合入结果仍由仓库维护者负责审查、测试与发布。
+
+感谢上述作者、维护者和社区贡献者。更严格的版权归属、许可证范围及“仅参考而未包含代码”的界线见 [`NOTICE`](NOTICE)；Git 提交历史是个人代码贡献的最终记录。
 
 ## 许可证
 

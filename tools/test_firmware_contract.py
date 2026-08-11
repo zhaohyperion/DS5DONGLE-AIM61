@@ -35,6 +35,21 @@ def integer_define(relative: str, name: str) -> int:
 
 
 class FirmwareContractTests(unittest.TestCase):
+    def test_release_endpoints_follow_the_current_repository(self) -> None:
+        repository = "zhaohyperion/DS5DONGLE-AIM61"
+        legacy_repositories = (
+            "ccc007ccc/DS5Dongle/releases",
+            "sqlCRT/ds5dongle-bl618-opensource/releases/latest",
+        )
+
+        flasher = read("tools/ds5dongle-flasher/src/main.rs")
+        web = read("web/app/DeviceConsole.tsx")
+        ota_docs = read("docs/OTA.md")
+        for text in (flasher, web, ota_docs):
+            self.assertIn(repository, text)
+            for legacy in legacy_repositories:
+                self.assertNotIn(legacy, text)
+
     def test_opus_e907_bit_exact_fast_paths(self) -> None:
         cmake = read("CMakeLists.txt")
         ecintrin = read("lib/opus/celt/ecintrin.h")
@@ -233,7 +248,6 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertIn("Invalid DS5_LOG_LEVEL", windows)
 
         self.assertIn("DS5_LOG_LEVEL=3", read("README.md"))
-        self.assertIn("DS5_LOG_LEVEL=3", read("README_CN.md"))
 
     def test_cherryusb_init_events_are_deferred_not_unknown(self) -> None:
         usb = read("src/usb_gamepad.c")

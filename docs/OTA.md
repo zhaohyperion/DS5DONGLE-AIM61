@@ -2,6 +2,17 @@
 
 本项目的网页 OTA 只更新 **Ai-M61-32S-Kit / USB Full-Speed** 的应用固件。第一次部署仍必须通过串口完整刷写受支持的 `boot2`、`partition.bin` 和带 OTA 功能的应用；完成这次基线刷写后，网页才可以更新单个 RAW 应用镜像。
 
+## 用户快速升级
+
+1. 使用 Chrome 或 Edge 打开部署在 HTTPS/localhost 的 `web/` 页面。
+2. 通过原生 USB 飞线连接 DS5Dongle，点击“连接设备”。板载 CH340 Type-C 只负责供电、串口日志和线刷，不能替代原生 USB 数据线。
+3. 在 OTA 页面确认设备报告 `aim61`、`fs`、RAW OTA、A/B 分区、强制签名和已配置发布公钥。
+4. 加载默认在线稳定版，网页会先验证清单、目标、版本、完整容器 SHA-256、RAW body SHA-256 和 P-256 签名。
+5. 确认后开始升级。不要断电、拔线、关闭页面或让电脑休眠。
+6. 设备写入非活动槽并重启；重新连接后确认版本。新固件未通过健康确认时，Boot2 应回滚旧槽。
+
+默认稳定版清单来自当前仓库 latest Release。没有生产公钥、签名资产或正确 OTA 基线的设备必须拒绝升级；这种情况下请使用 Windows 刷写器执行完整 UART 恢复，而不是绕过校验。
+
 ## 绝对不能通过网页写入的内容
 
 - `boot2_bl616_*.bin`
@@ -23,7 +34,7 @@ Release 工作流只接受 `v?major.minor.patch` 标签：每部分为 0..254，
 网页可通过 GitHub 的 latest 别名读取清单：
 
 ```text
-https://github.com/sqlCRT/ds5dongle-bl618-opensource/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json
+https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json
 ```
 
 清单 schema 1 的字段集合是固定的，不允许缺失或附加字段：

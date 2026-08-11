@@ -25,7 +25,8 @@ use std::os::windows::process::CommandExt;
 
 const PRODUCT_NAME: &str = "DS5Dongle BL616/BL618 Flasher";
 const FLASHER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const RELEASES_API: &str = "https://api.github.com/repos/ccc007ccc/DS5Dongle/releases?per_page=30";
+const RELEASES_API: &str =
+    "https://api.github.com/repos/zhaohyperion/DS5DONGLE-AIM61/releases?per_page=30";
 const WCH_DRIVER_URL: &str = "https://www.wch-ic.com/download/file?id=65";
 const WCH_SIGNER_FRAGMENT: &str = "Nanjing Qinheng Microelectronics Co., Ltd.";
 const KNOWN_WCH_DRIVER_SHA256: &str =

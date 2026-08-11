@@ -21,6 +21,6 @@ WebHID 需要 Chrome 或 Edge，并且页面必须运行在 HTTPS 或 `localhost
 
 网页校验 manifest 严格字段、目标、版本、完整容器 size/SHA-256、RAW body size/SHA-256 和 low-S ECDSA P-256 签名；设备使用同一信任根再次验签。生产私钥不得进入本目录、网页构建产物或仓库。
 
-`public/og.png` 是为本项目生成的 AI 社交分享图，仅用于 Open Graph/Twitter 预览。
+`public/og-v2.png` 是本项目的 Open Graph/Twitter 社交分享图。
 
 项目保留 Sites 的 `sites()` Vite 插件和 `.openai/hosting.json`，但本次实现不执行部署。

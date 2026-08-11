@@ -18,6 +18,8 @@ test("device studio integrates legacy configuration without replacing secure OTA
   assert.match(consoleSource, /普通 \/ 全速/);
   assert.match(consoleSource, /高速/);
   assert.match(consoleSource, /className="firmware-profile"[\s\S]*?disabled/);
+  assert.match(consoleSource, /zhaohyperion\/DS5DONGLE-AIM61/);
+  assert.doesNotMatch(consoleSource, /sqlCRT\/ds5dongle-bl618-opensource\/releases\/latest/);
   assert.match(hidSource, /new LegacyHidClient\(this\.device\)/);
   assert.match(hidSource, /transferOta/);
   assert.match(hidSource, /REPORT_OTA_CONTROL/);

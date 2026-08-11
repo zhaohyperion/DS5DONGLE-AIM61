@@ -54,10 +54,7 @@ interface FirmwareCandidate {
 }
 
 const DEFAULT_MANIFEST_URL =
-  "https://github.com/sqlCRT/ds5dongle-bl618-opensource/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json";
-
-const HIGH_SPEED_MANIFEST_URL =
-  "https://github.com/sqlCRT/ds5dongle-bl618-opensource/releases/latest/download/DS5Dongle-aim61-hs-stable.ota.json";
+  "https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json";
 
 const ERROR_NAMES = [
   "OK",
@@ -505,7 +502,7 @@ export function DeviceConsole() {
                   type="button"
                   disabled
                   aria-pressed="false"
-                  title={`${tr("当前 M61 构建未发布高速签名清单", "No signed high-speed M61 release is published")} · ${HIGH_SPEED_MANIFEST_URL}`}
+                  title={tr("当前 M61 构建未发布高速签名清单", "No signed high-speed M61 release is published")}
                 >
                   <span>USB HS · 480 Mb/s</span>
                   <strong>{tr("高速", "High-Speed")}</strong>
@@ -603,9 +600,9 @@ export function DeviceConsole() {
       </aside>
 
       <footer>
-        <span>DS5Dongle / sqlCRT</span>
+        <span>DS5DONGLE-AIM61 / zhaohyperion</span>
         <span>{tr("配置数据不经过云端", "Configuration never passes through the cloud")}</span>
-        <a href="https://github.com/sqlCRT/ds5dongle-bl618-opensource" target="_blank" rel="noreferrer">GitHub ↗</a>
+        <a href="https://github.com/zhaohyperion/DS5DONGLE-AIM61" target="_blank" rel="noreferrer">GitHub ↗</a>
       </footer>
     </main>
   );
