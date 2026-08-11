@@ -36,6 +36,8 @@ test("device studio integrates legacy configuration without replacing secure OTA
   assert.match(panelsSource, /ControllerButtonLabel/);
   assert.match(stylesSource, /\.controller-button-icon\.is-square/);
   assert.match(stylesSource, /\.visually-hidden/);
+  assert.match(stylesSource, /grid-template-columns: minmax\(260px, \.9fr\) minmax\(0, 2\.4fr\) auto/);
+  assert.match(stylesSource, /\.device-identity > div \{ min-width: 0; overflow: hidden; \}/);
 });
 
 test("help center ships FAQ, changelog, and PWA controls", async () => {

@@ -64,14 +64,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 
 .browser-warning { display: flex; gap: 10px 22px; flex-wrap: wrap; align-items: center; background: rgba(242,166,90,.09); border: 1px solid rgba(242,166,90,.3); color: #ffd2a4; padding: 13px 16px; font-size: 12px; margin-bottom: 18px; }
 .browser-warning span { color: #c6a37e; }
-.device-card { position: relative; display: grid; grid-template-columns: minmax(220px, .8fr) minmax(600px, 2.4fr) auto; align-items: center; gap: 24px; padding: 22px 24px; background: linear-gradient(120deg, rgba(23,34,48,.94), rgba(14,22,32,.91)); border: 1px solid var(--line); box-shadow: 0 22px 80px rgba(0,0,0,.22); }
+.device-card { position: relative; display: grid; grid-template-columns: minmax(260px, .9fr) minmax(0, 2.4fr) auto; align-items: center; gap: 24px; padding: 22px 24px; background: linear-gradient(120deg, rgba(23,34,48,.94), rgba(14,22,32,.91)); border: 1px solid var(--line); box-shadow: 0 22px 80px rgba(0,0,0,.22); }
 .device-card::before { content: ""; position: absolute; width: 5px; height: 5px; top: -1px; left: -1px; border-top: 1px solid var(--cyan); border-left: 1px solid var(--cyan); }
-.device-identity { display: flex; align-items: center; gap: 15px; min-width: 0; }
+.device-identity { display: flex; align-items: center; gap: 15px; min-width: 0; overflow: hidden; }
+.device-identity > div { min-width: 0; overflow: hidden; }
 .device-icon { flex: 0 0 auto; width: 48px; height: 48px; border: 1px solid rgba(93,226,215,.24); display: grid; place-items: center; }
 .device-icon span { width: 25px; height: 14px; border: 2px solid var(--cyan); border-radius: 7px 7px 10px 10px; position: relative; opacity: .86; }
 .device-icon span::before, .device-icon span::after { content: ""; position: absolute; width: 3px; height: 3px; background: var(--cyan); border-radius: 50%; top: 4px; }
 .device-icon span::before { left: 5px; } .device-icon span::after { right: 5px; }
-.device-identity h2 { margin: 5px 0 0; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.device-identity h2 { margin: 5px 0 0; font-size: 14px; line-height: 1.35; display: -webkit-box; overflow: hidden; text-overflow: ellipsis; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .device-metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-left: 1px solid var(--line); }
 .metric { padding: 2px 12px; border-right: 1px solid var(--line); min-width: 0; }
 .metric span { display: block; color: var(--subtle); font-size: 10px; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .08em; }
