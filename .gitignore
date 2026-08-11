@@ -1,4 +1,6 @@
 build/
+!web/build/
+!web/build/sites-vite-plugin.cjs
 target/
 dist/
 .deps/
