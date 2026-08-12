@@ -4,9 +4,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* WebHID runtime diagnostics use one vendor Feature report that is outside
+/* Runtime diagnostics use one vendor Feature report that is outside
  * the DualSense and existing dongle configuration/OTA report ranges.  The
- * HID report ID is supplied separately by WebHID and is not part of the
+ * HID report ID is handled separately by the HID layer and is not part of the
  * 63-byte payload described below. */
 #define RUNTIME_DIAG_REPORT_ID          0xFDu
 #define RUNTIME_DIAG_REPORT_SIZE        63u
@@ -15,7 +15,7 @@
 #define RUNTIME_DIAG_HEADER_SIZE        16u
 #define RUNTIME_DIAG_DATA_OFFSET        16u
 #define RUNTIME_DIAG_DATA_MAX           43u
-#define RUNTIME_DIAG_PAGE_COUNT         6u
+#define RUNTIME_DIAG_PAGE_COUNT         7u
 #define RUNTIME_DIAG_SELECT_PAGE        0x01u
 #define RUNTIME_DIAG_SELECT_SIZE        3u
 #define RUNTIME_DIAG_PUBLISH_INTERVAL_MS 1000u
@@ -30,6 +30,7 @@ enum runtime_diag_page {
     RUNTIME_DIAG_PAGE_AUDIO_TIMING = 3,
     RUNTIME_DIAG_PAGE_AUDIO_PIPELINE = 4,
     RUNTIME_DIAG_PAGE_OTA_MEMORY = 5,
+    RUNTIME_DIAG_PAGE_BRIDGE_LATENCY = 6,
 };
 
 /* Prepare valid page-zero-selected reports before USB enumeration starts. */

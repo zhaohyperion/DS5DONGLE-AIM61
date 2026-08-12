@@ -4,10 +4,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* WebHID transport ---------------------------------------------------------
+/* Vendor-HID transport -----------------------------------------------------
  *
  * Both reports contain exactly 63 payload bytes.  The HID report ID is not
- * part of these layouts (WebHID supplies it separately).
+ * part of these payload layouts (the HID layer handles it separately).
  *
  * DATA (Output report 0xFA):
  *   0..1   "OT"
@@ -206,7 +206,7 @@ void ota_update_set_maintenance_hook(ota_maintenance_hook_t hook);
  * Boot2's retry marker and stopping the trial watchdog. */
 void ota_update_notify_runtime_healthy(void);
 
-/* Exposed for protocol tests and the matching web implementation. */
+/* Exposed for protocol tests and future native host implementations. */
 uint32_t ota_update_crc32(const uint8_t *data, uint32_t len);
 
 #endif /* OTA_UPDATE_H */

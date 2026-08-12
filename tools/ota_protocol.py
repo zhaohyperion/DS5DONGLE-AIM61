@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference encoder/decoder for the DS5Dongle WebHID OTA transport."""
+"""Reference encoder/decoder for the DS5Dongle USB HID OTA transport."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -116,7 +116,7 @@ def _encode(report_id: int, opcode: int, session: int, argument: int, data: byte
 
 
 def encode_data(session: int, offset: int, data: bytes) -> bytes:
-    """Encode the 63-byte payload passed to WebHID sendReport(0xFA, ...)."""
+    """Encode the 63-byte payload carried by Output Report 0xFA."""
     if not data:
         raise OtaProtocolError("DATA frame must carry at least one byte")
     return _encode(OTA_DATA_REPORT_ID, OTA_DATA_TYPE, session, offset, data)

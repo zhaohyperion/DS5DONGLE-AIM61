@@ -3,10 +3,13 @@
     windows_subsystem = "windows"
 )]
 
+mod device_test;
+mod diagnostics;
+
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
@@ -17,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
@@ -204,6 +207,7 @@ struct Options {
     assume_yes: bool,
     list: bool,
     device_info: bool,
+    diagnostics: bool,
     list_releases: bool,
     assets_info: bool,
     install_driver: bool,
@@ -221,6 +225,27 @@ struct Ch340Device {
     error_code: u32,
     status: String,
     port: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SerialDiagnosticRecord<'a> {
+    name: &'a str,
+    port: Option<&'a str>,
+    target_ch340: bool,
+    usable: bool,
+    pnp_error_code: u32,
+    status: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FlasherDiagnosticBundle<'a> {
+    schema: &'static str,
+    created_at_unix_ms: u64,
+    flasher_version: &'static str,
+    serial_devices: Vec<SerialDiagnosticRecord<'a>>,
+    runtime_devices: &'a [diagnostics::DeviceDiagnostic],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,6 +320,16 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if options.diagnostics {
+        let serial_devices = probe_ch340_devices()?;
+        let runtime_devices = diagnostics::probe_runtime_diagnostics()?;
+        println!(
+            "{}",
+            diagnostic_bundle_json(&serial_devices, &runtime_devices)?
+        );
+        return Ok(());
+    }
+
     if options.install_driver {
         install_ch340_driver(options.assume_yes)?;
         return Ok(());
@@ -344,7 +379,9 @@ fn run() -> Result<()> {
         loop {
             let usable: Vec<&Ch340Device> = devices
                 .iter()
-                .filter(|device| device.error_code == 0 && device.port.is_some())
+                .filter(|device| {
+                    is_ch340_device(device) && device.error_code == 0 && device.port.is_some()
+                })
                 .collect();
 
             if !usable.is_empty() {
@@ -454,6 +491,7 @@ fn print_help() {
            --baud RATE       460800 (default) or 115200\n  \
            --list            List detected M61 CH340 devices\n  \
            --device-info     Read running DS5DONGLE-AIM61 firmware information over USB HID\n  \
+           --diagnostics     Capture CH340 status and the native 0xFD runtime diagnostic snapshot\n  \
            --list-releases   List complete firmware Releases\n  \
            --release TAG     Select a Release without the menu\n  \
            --verify-release  Download and verify a Release without flashing\n  \
@@ -513,6 +551,7 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options> {
             "--yes" => options.assume_yes = true,
             "--list" => options.list = true,
             "--device-info" => options.device_info = true,
+            "--diagnostics" => options.diagnostics = true,
             "--list-releases" => options.list_releases = true,
             "--release" => {
                 options.release = Some(
@@ -1104,15 +1143,52 @@ fn print_devices(devices: &[Ch340Device]) {
     }
     for (index, device) in devices.iter().enumerate() {
         println!(
-            "{}. {} | port={} | PnP={} ({}) | {}",
+            "{}. {} | port={} | target={} | PnP={} ({}) | {}",
             index + 1,
             device.name,
             device.port.as_deref().unwrap_or("unavailable"),
+            if is_ch340_device(device) {
+                "CH340"
+            } else {
+                "ignored"
+            },
             device.status,
             device.error_code,
             device.instance_id
         );
     }
+}
+
+fn is_ch340_device(device: &Ch340Device) -> bool {
+    device
+        .instance_id
+        .to_ascii_uppercase()
+        .contains("VID_1A86&PID_7523")
+}
+
+fn diagnostic_bundle_json(
+    serial_devices: &[Ch340Device],
+    runtime_devices: &[diagnostics::DeviceDiagnostic],
+) -> Result<String> {
+    let serial_devices = serial_devices
+        .iter()
+        .map(|device| SerialDiagnosticRecord {
+            name: &device.name,
+            port: device.port.as_deref(),
+            target_ch340: is_ch340_device(device),
+            usable: is_ch340_device(device) && device.error_code == 0 && device.port.is_some(),
+            pnp_error_code: device.error_code,
+            status: &device.status,
+        })
+        .collect();
+    serde_json::to_string_pretty(&FlasherDiagnosticBundle {
+        schema: "ds5dongle-flasher-diagnostics/v1",
+        created_at_unix_ms: diagnostics::now_unix_ms(),
+        flasher_version: FLASHER_VERSION,
+        serial_devices,
+        runtime_devices,
+    })
+    .context("unable to serialize diagnostic bundle")
 }
 
 fn decode_firmware_version_report(report: &[u8]) -> Option<String> {
@@ -1527,6 +1603,8 @@ enum GuiEvent {
     Releases(std::result::Result<Vec<FlashRelease>, String>),
     Devices(std::result::Result<Vec<Ch340Device>, String>),
     FirmwareDevices(std::result::Result<Vec<FirmwareDeviceInfo>, String>),
+    Diagnostics(std::result::Result<Vec<diagnostics::DeviceDiagnostic>, String>),
+    AudioTestDone(std::result::Result<(), String>),
     Log(String),
     DriverDone(std::result::Result<(), String>),
     FlashDone {
@@ -1541,6 +1619,13 @@ enum GuiEvent {
 struct RetryState {
     runtime: PathBuf,
     port: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppTab {
+    TestCenter,
+    Flasher,
+    DeviceDebug,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1621,6 +1706,25 @@ struct FlasherApp {
     releases: Vec<FlashRelease>,
     devices: Vec<Ch340Device>,
     firmware_devices: Vec<FirmwareDeviceInfo>,
+    runtime_diagnostics: Vec<diagnostics::DeviceDiagnostic>,
+    device_test_session: Option<device_test::TestSession>,
+    device_test_input: device_test::InputState,
+    device_test_output: device_test::OutputState,
+    device_test_status: String,
+    device_test_audio_busy: bool,
+    device_test_connected: bool,
+    device_debug_metrics: device_test::DebugMetrics,
+    device_debug_duration_secs: u32,
+    device_debug_stress_enabled: bool,
+    device_debug_stress_rate_hz: u32,
+    device_debug_started: Option<Instant>,
+    device_debug_complete: bool,
+    device_debug_baseline: Option<diagnostics::DiagnosticSnapshot>,
+    device_debug_final: Option<diagnostics::DiagnosticSnapshot>,
+    device_debug_runtime_samples: Vec<diagnostics::DiagnosticSnapshot>,
+    device_debug_next_snapshot: Option<Instant>,
+    device_debug_alert_snapshot_max_ms: f32,
+    device_debug_last_alert_snapshot: Option<Instant>,
     selected_release: usize,
     firmware_mode: FirmwareMode,
     local_firmware: Option<FirmwareSet>,
@@ -1629,11 +1733,15 @@ struct FlasherApp {
     loading_releases: bool,
     loading_devices: bool,
     loading_firmware_devices: bool,
+    loading_diagnostics: bool,
+    diagnostics_error: Option<String>,
     busy: Option<String>,
     status: String,
     log: String,
     show_isp_dialog: bool,
     show_driver_dialog: bool,
+    show_diagnostics_window: bool,
+    current_tab: AppTab,
     retry: Option<RetryState>,
     language: Language,
 }
@@ -1641,7 +1749,7 @@ struct FlasherApp {
 impl FlasherApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+        configure_visual_style(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
         let language = system_language();
         let mut app = Self {
@@ -1650,6 +1758,27 @@ impl FlasherApp {
             releases: Vec::new(),
             devices: Vec::new(),
             firmware_devices: Vec::new(),
+            runtime_diagnostics: Vec::new(),
+            device_test_session: None,
+            device_test_input: device_test::InputState::default(),
+            device_test_output: device_test::OutputState::default(),
+            device_test_status: language
+                .tr("尚未连接测试设备", "Test device is not connected")
+                .to_owned(),
+            device_test_audio_busy: false,
+            device_test_connected: false,
+            device_debug_metrics: device_test::DebugMetrics::default(),
+            device_debug_duration_secs: 900,
+            device_debug_stress_enabled: true,
+            device_debug_stress_rate_hz: 20,
+            device_debug_started: None,
+            device_debug_complete: false,
+            device_debug_baseline: None,
+            device_debug_final: None,
+            device_debug_runtime_samples: Vec::new(),
+            device_debug_next_snapshot: None,
+            device_debug_alert_snapshot_max_ms: 0.0,
+            device_debug_last_alert_snapshot: None,
             selected_release: 0,
             firmware_mode: FirmwareMode::Online,
             local_firmware: None,
@@ -1658,14 +1787,19 @@ impl FlasherApp {
             loading_releases: false,
             loading_devices: false,
             loading_firmware_devices: false,
+            loading_diagnostics: false,
+            diagnostics_error: None,
             busy: None,
             status: language.tr("正在初始化...", "Initializing...").to_owned(),
             log: String::new(),
             show_isp_dialog: false,
             show_driver_dialog: false,
+            show_diagnostics_window: false,
+            current_tab: AppTab::TestCenter,
             retry: None,
             language,
         };
+        app.open_device_test();
         app.refresh_releases();
         app.refresh_devices();
         app.refresh_firmware_devices();
@@ -1728,21 +1862,242 @@ impl FlasherApp {
         });
     }
 
+    fn start_diagnostics(&mut self) {
+        if self.loading_diagnostics || self.busy.is_some() {
+            return;
+        }
+        self.loading_diagnostics = true;
+        self.diagnostics_error = None;
+        self.show_diagnostics_window = true;
+        self.status = self
+            .language
+            .tr(
+                "正在运行串口环境检查并读取 0xFD 设备快照...",
+                "Checking the serial environment and capturing the 0xFD device snapshot...",
+            )
+            .to_owned();
+        self.refresh_devices();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result =
+                diagnostics::probe_runtime_diagnostics().map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::Diagnostics(result));
+        });
+    }
+
+    fn open_device_test(&mut self) {
+        self.ensure_device_session();
+        self.current_tab = AppTab::TestCenter;
+    }
+
+    fn ensure_device_session(&mut self) {
+        if self.device_test_session.is_none() {
+            self.device_test_connected = false;
+            self.device_test_session = Some(device_test::TestSession::start());
+            self.device_test_status = self
+                .language
+                .tr(
+                    "正在连接 DS5 游戏控制器接口...",
+                    "Connecting to the DS5 gamepad interface...",
+                )
+                .to_owned();
+        }
+    }
+
+    fn process_device_test_events(&mut self) {
+        let events = self
+            .device_test_session
+            .as_ref()
+            .map(|session| session.events.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                device_test::TestEvent::Connected(name) => {
+                    self.device_test_connected = true;
+                    self.device_test_status = match self.language {
+                        Language::ZhCn => format!("已连接：{name}；正在实时读取输入"),
+                        Language::En => format!("Connected: {name}; reading live input"),
+                    };
+                }
+                device_test::TestEvent::Input(input) => self.device_test_input = input,
+                device_test::TestEvent::Metrics(metrics) => {
+                    self.device_debug_metrics = metrics;
+                }
+                device_test::TestEvent::OutputSent => {
+                    self.device_test_status = self
+                        .language
+                        .tr("测试输出已发送", "Test output sent")
+                        .to_owned();
+                }
+                device_test::TestEvent::Error(error) => {
+                    self.device_test_connected = false;
+                    self.device_test_status = match self.language {
+                        Language::ZhCn => format!("测试设备错误：{error}"),
+                        Language::En => format!("Test device error: {error}"),
+                    };
+                    self.append_log(self.device_test_status.clone());
+                    self.device_test_session = None;
+                    self.device_debug_started = None;
+                    self.device_debug_complete = false;
+                    self.device_debug_next_snapshot = None;
+                    self.device_debug_last_alert_snapshot = None;
+                }
+                device_test::TestEvent::Stopped => {
+                    self.device_test_connected = false;
+                    self.device_test_status = self
+                        .language
+                        .tr("测试设备已断开", "Test device disconnected")
+                        .to_owned();
+                }
+            }
+        }
+    }
+
+    fn start_audio_test(&mut self, channel: device_test::AudioChannel) {
+        if self.device_test_audio_busy {
+            return;
+        }
+        self.device_test_audio_busy = true;
+        self.device_test_status = self
+            .language
+            .tr("正在播放 2 秒测试音...", "Playing a 2-second test tone...")
+            .to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = device_test::play_test_tone(channel).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::AudioTestDone(result));
+        });
+    }
+
+    fn start_microphone_test(&mut self) {
+        if self.device_test_audio_busy {
+            return;
+        }
+        self.device_test_audio_busy = true;
+        self.device_test_status = self
+            .language
+            .tr(
+                "正在录制麦克风 5 秒，随后自动回放...",
+                "Recording the microphone for 5 seconds, then playing it back...",
+            )
+            .to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result =
+                device_test::record_and_play_microphone(5).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::AudioTestDone(result));
+        });
+    }
+
+    fn start_debug_benchmark(&mut self) {
+        self.ensure_device_session();
+        let Some(session) = &self.device_test_session else {
+            return;
+        };
+        if session.reset_metrics().is_ok() && session.set_metrics_active(true).is_ok() {
+            let _ = session.set_stress_active(
+                self.device_debug_stress_enabled,
+                self.device_debug_stress_rate_hz,
+            );
+            self.device_debug_metrics = device_test::DebugMetrics::default();
+            self.device_debug_started = Some(Instant::now());
+            self.device_debug_complete = false;
+            self.device_debug_baseline = None;
+            self.device_debug_final = None;
+            self.device_debug_runtime_samples.clear();
+            self.device_debug_next_snapshot = Some(Instant::now() + Duration::from_secs(5));
+            self.device_debug_alert_snapshot_max_ms = 0.0;
+            self.device_debug_last_alert_snapshot = None;
+            self.capture_debug_snapshot();
+        }
+    }
+
+    fn stop_debug_benchmark(&mut self, complete: bool) {
+        if let Some(session) = &self.device_test_session {
+            let _ = session.set_metrics_active(false);
+            let _ = session.set_stress_active(false, self.device_debug_stress_rate_hz);
+        }
+        self.device_debug_started = None;
+        self.device_debug_next_snapshot = None;
+        self.device_debug_last_alert_snapshot = None;
+        self.device_debug_complete = complete && self.device_debug_metrics.sample_count > 0;
+        if complete {
+            self.capture_debug_snapshot();
+        }
+    }
+
+    fn capture_debug_snapshot(&mut self) {
+        if self.loading_diagnostics {
+            return;
+        }
+        self.loading_diagnostics = true;
+        self.diagnostics_error = None;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result =
+                diagnostics::probe_runtime_diagnostics().map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::Diagnostics(result));
+        });
+    }
+
+    fn export_debug_report(&mut self) {
+        let filename = format!("DS5Dongle-performance-{}.json", diagnostics::now_unix_ms());
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(
+                self.language
+                    .tr("保存设备性能报告", "Save device performance report"),
+            )
+            .add_filter("JSON", &["json"])
+            .set_file_name(&filename)
+            .save_file()
+        else {
+            return;
+        };
+        let report = serde_json::json!({
+            "schema": "ds5dongle-performance/v1",
+            "createdAtUnixMs": diagnostics::now_unix_ms(),
+            "flasherVersion": FLASHER_VERSION,
+            "measurementScope": "Windows HID report arrival intervals; not absolute controller-to-display latency",
+            "configuredDurationSeconds": self.device_debug_duration_secs,
+            "stressOutputsEnabled": self.device_debug_stress_enabled,
+            "stressOutputRateHz": self.device_debug_stress_rate_hz,
+            "stressDutyCycle": "15 seconds active / 5 seconds fully released",
+            "runtimeSnapshotIntervalSeconds": 5,
+            "hidMetrics": &self.device_debug_metrics,
+            "runtimeBaseline": &self.device_debug_baseline,
+            "runtimeSamples": &self.device_debug_runtime_samples,
+            "runtimeFinal": &self.device_debug_final,
+            "runtimeDiagnostics": &self.runtime_diagnostics,
+        });
+        match serde_json::to_vec_pretty(&report)
+            .context("unable to serialize performance report")
+            .and_then(|bytes| fs::write(&path, bytes).context("unable to write performance report"))
+        {
+            Ok(()) => {
+                self.status = match self.language {
+                    Language::ZhCn => format!("性能报告已保存：{}", path.display()),
+                    Language::En => format!("Performance report saved: {}", path.display()),
+                };
+            }
+            Err(error) => {
+                self.status = match self.language {
+                    Language::ZhCn => format!("性能报告保存失败：{error:#}"),
+                    Language::En => format!("Failed to save performance report: {error:#}"),
+                };
+            }
+        }
+    }
+
     fn usable_ports(&self) -> Vec<String> {
         self.devices
             .iter()
-            .filter(|device| device.error_code == 0)
+            .filter(|device| is_ch340_device(device) && device.error_code == 0)
             .filter_map(|device| device.port.clone())
             .collect()
     }
 
     fn has_ch340(&self) -> bool {
-        self.devices.iter().any(|device| {
-            device
-                .instance_id
-                .to_ascii_uppercase()
-                .contains("VID_1A86&PID_7523")
-        })
+        self.devices.iter().any(is_ch340_device)
     }
 
     fn selected_release(&self) -> Option<FlashRelease> {
@@ -2181,6 +2536,14 @@ impl FlasherApp {
                             Language::ZhCn => format!("CH340 已就绪：{port}"),
                             Language::En => format!("CH340 is ready: {port}"),
                         };
+                    } else if self.has_ch340() {
+                        self.status = self
+                            .language
+                            .tr(
+                                "检测到 CH340，但驱动/COM 口不可用。",
+                                "CH340 was detected, but its driver/COM port is unavailable.",
+                            )
+                            .to_owned();
                     } else if self.devices.is_empty() {
                         self.status = self
                             .language
@@ -2193,8 +2556,8 @@ impl FlasherApp {
                         self.status = self
                             .language
                             .tr(
-                                "检测到 CH340，但驱动/COM 口不可用。",
-                                "CH340 was detected, but its driver/COM port is unavailable.",
+                                "只检测到普通串口（例如 COM1），已忽略；请连接 M61 的 CH340 USB。",
+                                "Only non-target serial ports (such as COM1) were found and ignored; connect the M61 CH340 USB port.",
                             )
                             .to_owned();
                     }
@@ -2248,6 +2611,100 @@ impl FlasherApp {
                             format!("Failed to read device firmware information: {error}")
                         }
                     });
+                }
+                GuiEvent::Diagnostics(Ok(reports)) => {
+                    self.loading_diagnostics = false;
+                    self.diagnostics_error = None;
+                    self.runtime_diagnostics = reports;
+                    if let Some(snapshot) = self
+                        .runtime_diagnostics
+                        .iter()
+                        .find_map(|report| report.snapshot.clone())
+                    {
+                        if self.device_debug_started.is_some()
+                            && self.device_debug_baseline.is_none()
+                        {
+                            self.device_debug_baseline = Some(snapshot);
+                        } else if self.device_debug_started.is_some() {
+                            self.device_debug_runtime_samples.push(snapshot);
+                        } else if self.device_debug_complete {
+                            self.device_debug_final = Some(snapshot);
+                        }
+                    }
+                    let captured = self
+                        .runtime_diagnostics
+                        .iter()
+                        .filter(|report| report.snapshot.is_some())
+                        .count();
+                    if captured > 0 {
+                        self.status = match self.language {
+                            Language::ZhCn => format!("一键诊断完成：已读取 {captured} 台设备。"),
+                            Language::En => {
+                                format!("Diagnostics completed for {captured} device(s).")
+                            }
+                        };
+                        self.append_log(match self.language {
+                            Language::ZhCn => format!(
+                                "0xFD 运行态诊断完成：{captured} 份 CRC32 分页快照校验通过。"
+                            ),
+                            Language::En => format!(
+                                "0xFD runtime diagnostics completed: {captured} CRC32-protected paged snapshot(s) validated."
+                            ),
+                        });
+                    } else if self.runtime_diagnostics.is_empty() {
+                        self.status = self
+                            .language
+                            .tr(
+                                "未检测到运行中的 DS5DONGLE-AIM61。串口环境结果仍可查看。",
+                                "No running DS5DONGLE-AIM61 was detected. Serial diagnostics are still available.",
+                            )
+                            .to_owned();
+                    } else {
+                        self.status = self
+                            .language
+                            .tr(
+                                "检测到 USB 设备，但无法读取 0xFD 诊断；请查看诊断详情。",
+                                "A USB device was found, but its 0xFD diagnostics could not be read. See the diagnostic details.",
+                            )
+                            .to_owned();
+                    }
+                }
+                GuiEvent::Diagnostics(Err(error)) => {
+                    self.loading_diagnostics = false;
+                    self.runtime_diagnostics.clear();
+                    self.diagnostics_error = Some(error.clone());
+                    self.status = self
+                        .language
+                        .tr(
+                            "一键诊断失败，请查看详情。",
+                            "Diagnostics failed. See details.",
+                        )
+                        .to_owned();
+                    self.append_log(match self.language {
+                        Language::ZhCn => format!("一键诊断错误：{error}"),
+                        Language::En => format!("Diagnostics error: {error}"),
+                    });
+                }
+                GuiEvent::AudioTestDone(result) => {
+                    self.device_test_audio_busy = false;
+                    match result {
+                        Ok(()) => {
+                            self.device_test_status = self
+                                .language
+                                .tr(
+                                    "音频测试已完成，请根据听感确认结果",
+                                    "Audio test completed; confirm the result by listening",
+                                )
+                                .to_owned();
+                        }
+                        Err(error) => {
+                            self.device_test_status = match self.language {
+                                Language::ZhCn => format!("音频测试失败：{error}"),
+                                Language::En => format!("Audio test failed: {error}"),
+                            };
+                            self.append_log(self.device_test_status.clone());
+                        }
+                    }
                 }
                 GuiEvent::Log(line) => self.append_log(line),
                 GuiEvent::DriverDone(Ok(())) => {
@@ -2305,12 +2762,14 @@ impl FlasherApp {
         if self.loading_devices {
             (
                 self.language.tr("正在检测...", "Detecting..."),
-                eframe::egui::Color32::YELLOW,
+                COLOR_WARNING,
             )
         } else if self.selected_port.is_some() {
+            (self.language.tr("驱动正常", "Ready"), COLOR_SUCCESS)
+        } else if self.has_ch340() {
             (
-                self.language.tr("驱动正常", "Ready"),
-                eframe::egui::Color32::LIGHT_GREEN,
+                self.language.tr("驱动异常", "Driver required"),
+                eframe::egui::Color32::LIGHT_RED,
             )
         } else if self.devices.is_empty() {
             (
@@ -2319,8 +2778,9 @@ impl FlasherApp {
             )
         } else {
             (
-                self.language.tr("驱动异常", "Driver required"),
-                eframe::egui::Color32::LIGHT_RED,
+                self.language
+                    .tr("普通串口已忽略", "Non-target port ignored"),
+                COLOR_WARNING,
             )
         }
     }
@@ -2352,11 +2812,445 @@ impl FlasherApp {
             .collect::<Vec<_>>()
             .join("; ")
     }
+
+    fn diagnostic_status_text(&self) -> String {
+        if self.loading_diagnostics {
+            return self
+                .language
+                .tr(
+                    "正在读取 0xFD 分页快照...",
+                    "Reading the paged 0xFD snapshot...",
+                )
+                .to_owned();
+        }
+        if self
+            .runtime_diagnostics
+            .iter()
+            .any(|report| report.snapshot.is_some())
+        {
+            return self
+                .language
+                .tr("诊断快照已就绪", "Diagnostic snapshot ready")
+                .to_owned();
+        }
+        if self.diagnostics_error.is_some() {
+            return self
+                .language
+                .tr("诊断读取失败", "Diagnostic capture failed")
+                .to_owned();
+        }
+        self.language.tr("尚未运行", "Not run yet").to_owned()
+    }
+
+    fn diagnostic_summary_text(&self) -> String {
+        let mut lines = Vec::new();
+        let ports = self.usable_ports();
+        if !ports.is_empty() {
+            lines.push(match self.language {
+                Language::ZhCn => format!("CH340：{}（可刷写）", ports.join(", ")),
+                Language::En => format!("CH340: {} (ready for flashing)", ports.join(", ")),
+            });
+        } else if self.has_ch340() {
+            lines.push(
+                self.language
+                    .tr(
+                        "CH340：已检测到，但驱动或 COM 口不可用",
+                        "CH340: detected, but the driver or COM port is unavailable",
+                    )
+                    .to_owned(),
+            );
+        } else if self.devices.is_empty() {
+            lines.push(
+                self.language
+                    .tr(
+                        "CH340：未检测到；检查数据线、UART USB 接口和驱动",
+                        "CH340: not detected; check the data cable, UART USB port, and driver",
+                    )
+                    .to_owned(),
+            );
+        } else {
+            let ignored = self
+                .devices
+                .iter()
+                .filter_map(|device| device.port.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(match self.language {
+                Language::ZhCn => format!("串口：仅检测到 {ignored}，不是 CH340，已禁止用于刷写"),
+                Language::En => format!(
+                    "Serial: only {ignored} was detected; it is not CH340 and is blocked for flashing"
+                ),
+            });
+        }
+
+        if let Some(error) = &self.diagnostics_error {
+            lines.push(match self.language {
+                Language::ZhCn => format!("USB HID 诊断错误：{error}"),
+                Language::En => format!("USB HID diagnostic error: {error}"),
+            });
+        } else if self.runtime_diagnostics.is_empty() {
+            lines.push(
+                self.language
+                    .tr(
+                        "USB HID：未检测到运行中的 DS5DONGLE-AIM61",
+                        "USB HID: no running DS5DONGLE-AIM61 was detected",
+                    )
+                    .to_owned(),
+            );
+        } else {
+            for report in &self.runtime_diagnostics {
+                if let Some(snapshot) = &report.snapshot {
+                    lines.push(match self.language {
+                        Language::ZhCn => format!(
+                            "USB HID：{}，固件 {}，快照 #{}，运行 {}，空闲堆 {}，RSSI {}，压力/丢失 {}，麦克风欠载 {}，OTA {}/{}",
+                            report.product_name,
+                            report.firmware_version.as_deref().unwrap_or("未知"),
+                            snapshot.snapshot_seq,
+                            format_duration(snapshot.uptime_ms),
+                            format_bytes(snapshot.heap_free_bytes),
+                            snapshot.bt_rssi_dbm.map_or_else(|| "—".to_owned(), |value| format!("{value} dBm")),
+                            snapshot.loss_pressure,
+                            snapshot.mic_underruns,
+                            snapshot.ota_state,
+                            snapshot.ota_error,
+                        ),
+                        Language::En => format!(
+                            "USB HID: {}, firmware {}, snapshot #{}, uptime {}, free heap {}, RSSI {}, loss/pressure {}, mic underruns {}, OTA {}/{}",
+                            report.product_name,
+                            report.firmware_version.as_deref().unwrap_or("unknown"),
+                            snapshot.snapshot_seq,
+                            format_duration(snapshot.uptime_ms),
+                            format_bytes(snapshot.heap_free_bytes),
+                            snapshot.bt_rssi_dbm.map_or_else(|| "—".to_owned(), |value| format!("{value} dBm")),
+                            snapshot.loss_pressure,
+                            snapshot.mic_underruns,
+                            snapshot.ota_state,
+                            snapshot.ota_error,
+                        ),
+                    });
+                } else {
+                    lines.push(match self.language {
+                        Language::ZhCn => format!(
+                            "USB HID：{} 已连接，但 0xFD 不可用：{}",
+                            report.product_name,
+                            report.error.as_deref().unwrap_or("未知错误")
+                        ),
+                        Language::En => format!(
+                            "USB HID: {} is connected, but 0xFD is unavailable: {}",
+                            report.product_name,
+                            report.error.as_deref().unwrap_or("unknown error")
+                        ),
+                    });
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn export_diagnostics(&mut self) {
+        let filename = format!("DS5Dongle-diagnostics-{}.json", diagnostics::now_unix_ms());
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(
+                self.language
+                    .tr("保存 DS5Dongle 诊断包", "Save DS5Dongle diagnostic bundle"),
+            )
+            .add_filter("JSON", &["json"])
+            .set_file_name(&filename)
+            .save_file()
+        else {
+            return;
+        };
+        match diagnostic_bundle_json(&self.devices, &self.runtime_diagnostics)
+            .and_then(|json| fs::write(&path, json).context("unable to write diagnostic bundle"))
+        {
+            Ok(()) => {
+                self.status = match self.language {
+                    Language::ZhCn => format!("诊断包已保存：{}", path.display()),
+                    Language::En => format!("Diagnostic bundle saved: {}", path.display()),
+                };
+                self.append_log(&self.status.clone());
+            }
+            Err(error) => {
+                self.status = match self.language {
+                    Language::ZhCn => format!("保存诊断包失败：{error:#}"),
+                    Language::En => format!("Failed to save diagnostic bundle: {error:#}"),
+                };
+                self.append_log(&self.status.clone());
+            }
+        }
+    }
+}
+
+impl Drop for FlasherApp {
+    fn drop(&mut self) {
+        if let Some(session) = self.device_test_session.take() {
+            let _ = session.stop_all();
+            // Give the HID worker one scheduling slice to deliver the neutral
+            // frame before the process tears down its Windows handles.
+            thread::sleep(Duration::from_millis(35));
+            session.shutdown();
+        }
+    }
+}
+
+fn format_bytes(bytes: u32) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+fn format_duration(milliseconds: u32) -> String {
+    let seconds = milliseconds / 1000;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn dpad_name(value: u8, language: Language) -> &'static str {
+    match value {
+        0 => language.tr("上", "Up"),
+        1 => language.tr("右上", "Up-right"),
+        2 => language.tr("右", "Right"),
+        3 => language.tr("右下", "Down-right"),
+        4 => language.tr("下", "Down"),
+        5 => language.tr("左下", "Down-left"),
+        6 => language.tr("左", "Left"),
+        7 => language.tr("左上", "Up-left"),
+        _ => language.tr("未按", "Released"),
+    }
+}
+
+fn input_progress(ui: &mut eframe::egui::Ui, label: &str, value: u8) {
+    ui.label(label);
+    ui.add(
+        eframe::egui::ProgressBar::new(value as f32 / 255.0)
+            .desired_width(150.0)
+            .text(value.to_string()),
+    );
+}
+
+fn input_button(ui: &mut eframe::egui::Ui, label: &str, pressed: bool) {
+    let (fill, stroke, color) = if pressed {
+        (COLOR_SUCCESS_SOFT, COLOR_SUCCESS, COLOR_TEXT_PRIMARY)
+    } else {
+        (COLOR_SURFACE_RAISED, COLOR_BORDER, COLOR_TEXT_MUTED)
+    };
+    eframe::egui::Frame::new()
+        .fill(fill)
+        .stroke(eframe::egui::Stroke::new(1.0_f32, stroke))
+        .corner_radius(7.0)
+        .inner_margin(eframe::egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.label(eframe::egui::RichText::new(label).color(color).strong());
+        });
+}
+
+const COLOR_APP_BG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(12, 18, 30);
+const COLOR_HEADER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(15, 24, 39);
+const COLOR_SURFACE: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(22, 32, 49);
+const COLOR_SURFACE_RAISED: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(29, 42, 63);
+const COLOR_BORDER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(58, 76, 101);
+const COLOR_TEXT_PRIMARY: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(239, 246, 255);
+const COLOR_TEXT_MUTED: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(174, 190, 212);
+const COLOR_ACCENT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(45, 180, 220);
+const COLOR_ACCENT_HOVER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(61, 205, 241);
+const COLOR_ACCENT_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(20, 69, 88);
+const COLOR_SUCCESS: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(74, 222, 128);
+const COLOR_SUCCESS_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(23, 78, 57);
+const COLOR_WARNING: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(251, 191, 36);
+const COLOR_WARNING_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(78, 55, 18);
+const COLOR_ERROR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 112, 112);
+const COLOR_ERROR_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(83, 31, 38);
+
+#[derive(Clone, Copy)]
+enum NoticeTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+fn configure_visual_style(ctx: &eframe::egui::Context) {
+    let mut visuals = eframe::egui::Visuals::dark();
+    visuals.override_text_color = Some(COLOR_TEXT_PRIMARY);
+    visuals.panel_fill = COLOR_APP_BG;
+    visuals.window_fill = COLOR_SURFACE;
+    visuals.extreme_bg_color = eframe::egui::Color32::from_rgb(8, 13, 23);
+    visuals.faint_bg_color = COLOR_SURFACE_RAISED;
+    visuals.warn_fg_color = COLOR_WARNING;
+    visuals.error_fg_color = COLOR_ERROR;
+    visuals.hyperlink_color = COLOR_ACCENT_HOVER;
+    visuals.selection.bg_fill = COLOR_ACCENT_SOFT;
+    visuals.selection.stroke = eframe::egui::Stroke::new(1.5_f32, COLOR_ACCENT_HOVER);
+    visuals.widgets.noninteractive.bg_fill = COLOR_SURFACE;
+    visuals.widgets.noninteractive.weak_bg_fill = COLOR_SURFACE;
+    visuals.widgets.noninteractive.bg_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_BORDER);
+    visuals.widgets.inactive.bg_fill = COLOR_SURFACE_RAISED;
+    visuals.widgets.inactive.weak_bg_fill = COLOR_SURFACE_RAISED;
+    visuals.widgets.inactive.bg_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_BORDER);
+    visuals.widgets.inactive.fg_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_TEXT_PRIMARY);
+    visuals.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(39, 60, 83);
+    visuals.widgets.hovered.weak_bg_fill = eframe::egui::Color32::from_rgb(39, 60, 83);
+    visuals.widgets.hovered.bg_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_ACCENT_HOVER);
+    visuals.widgets.active.bg_fill = COLOR_ACCENT_SOFT;
+    visuals.widgets.active.weak_bg_fill = COLOR_ACCENT_SOFT;
+    visuals.widgets.active.bg_stroke = eframe::egui::Stroke::new(1.5_f32, COLOR_ACCENT);
+    visuals.window_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_BORDER);
+    ctx.set_visuals(visuals);
+    ctx.style_mut(|style| {
+        style.spacing.item_spacing = [10.0, 9.0].into();
+        style.spacing.button_padding = [12.0, 7.0].into();
+        style.spacing.interact_size.y = 34.0;
+    });
+}
+
+fn surface_frame() -> eframe::egui::Frame {
+    eframe::egui::Frame::new()
+        .fill(COLOR_SURFACE)
+        .stroke(eframe::egui::Stroke::new(1.0_f32, COLOR_BORDER))
+        .corner_radius(12.0)
+        .inner_margin(16)
+}
+
+fn notice(ui: &mut eframe::egui::Ui, tone: NoticeTone, title: &str, body: &str) {
+    let (icon, color, fill) = match tone {
+        NoticeTone::Info => ("●", COLOR_ACCENT_HOVER, COLOR_ACCENT_SOFT),
+        NoticeTone::Success => ("✓", COLOR_SUCCESS, COLOR_SUCCESS_SOFT),
+        NoticeTone::Warning => ("!", COLOR_WARNING, COLOR_WARNING_SOFT),
+        NoticeTone::Error => ("×", COLOR_ERROR, COLOR_ERROR_SOFT),
+    };
+    eframe::egui::Frame::new()
+        .fill(fill)
+        .stroke(eframe::egui::Stroke::new(1.0_f32, color))
+        .corner_radius(9.0)
+        .inner_margin(eframe::egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    eframe::egui::RichText::new(icon)
+                        .color(color)
+                        .size(18.0)
+                        .strong(),
+                );
+                ui.vertical(|ui| {
+                    ui.label(eframe::egui::RichText::new(title).color(color).strong());
+                    if !body.is_empty() {
+                        ui.label(eframe::egui::RichText::new(body).color(COLOR_TEXT_PRIMARY));
+                    }
+                });
+            });
+        });
+}
+
+fn primary_button(text: &str) -> eframe::egui::Button<'_> {
+    eframe::egui::Button::new(
+        eframe::egui::RichText::new(text)
+            .color(eframe::egui::Color32::WHITE)
+            .strong(),
+    )
+    .fill(COLOR_ACCENT_SOFT)
+    .stroke(eframe::egui::Stroke::new(1.0_f32, COLOR_ACCENT))
+}
+
+fn metric_card(
+    ui: &mut eframe::egui::Ui,
+    label: &str,
+    value: impl Into<String>,
+    detail: &str,
+    color: eframe::egui::Color32,
+) {
+    eframe::egui::Frame::new()
+        .fill(COLOR_SURFACE_RAISED)
+        .stroke(eframe::egui::Stroke::new(1.0_f32, COLOR_BORDER))
+        .corner_radius(9.0)
+        .inner_margin(12)
+        .show(ui, |ui| {
+            ui.set_min_width(185.0);
+            ui.label(eframe::egui::RichText::new(label).color(COLOR_TEXT_MUTED));
+            ui.label(
+                eframe::egui::RichText::new(value.into())
+                    .color(color)
+                    .size(22.0)
+                    .strong()
+                    .monospace(),
+            );
+            ui.label(
+                eframe::egui::RichText::new(detail)
+                    .color(COLOR_TEXT_MUTED)
+                    .small(),
+            );
+        });
+}
+
+fn status_tone(status: &str) -> NoticeTone {
+    let lower = status.to_ascii_lowercase();
+    if status.contains("失败")
+        || status.contains("错误")
+        || lower.contains("failed")
+        || lower.contains("error")
+    {
+        NoticeTone::Error
+    } else if status.contains("未检测")
+        || status.contains("未连接")
+        || status.contains("忽略")
+        || status.contains("不可")
+        || lower.contains("not detected")
+        || lower.contains("not connected")
+        || lower.contains("ignored")
+        || lower.contains("unavailable")
+    {
+        NoticeTone::Warning
+    } else if status.contains("完成")
+        || status.contains("成功")
+        || status.contains("已连接")
+        || lower.contains("completed")
+        || lower.contains("success")
+        || lower.contains("connected")
+    {
+        NoticeTone::Success
+    } else {
+        NoticeTone::Info
+    }
 }
 
 impl eframe::App for FlasherApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         self.process_events();
+        self.process_device_test_events();
+        let debug_now = Instant::now();
+        let new_severe_gap = self.device_debug_metrics.maximum_interval_ms >= 20.0
+            && (self.device_debug_alert_snapshot_max_ms < 20.0
+                || self.device_debug_metrics.maximum_interval_ms
+                    >= self.device_debug_alert_snapshot_max_ms + 5.0);
+        let alert_cooldown_ready = self
+            .device_debug_last_alert_snapshot
+            .is_none_or(|last| debug_now.duration_since(last) >= Duration::from_secs(5));
+        if self.device_debug_started.is_some()
+            && new_severe_gap
+            && alert_cooldown_ready
+            && !self.loading_diagnostics
+        {
+            self.device_debug_alert_snapshot_max_ms = self.device_debug_metrics.maximum_interval_ms;
+            self.device_debug_last_alert_snapshot = Some(debug_now);
+            self.device_debug_next_snapshot = Some(debug_now + Duration::from_secs(5));
+            self.capture_debug_snapshot();
+        } else if self.device_debug_started.is_some()
+            && self
+                .device_debug_next_snapshot
+                .is_some_and(|deadline| debug_now >= deadline)
+            && !self.loading_diagnostics
+        {
+            self.device_debug_next_snapshot = Some(debug_now + Duration::from_secs(5));
+            self.capture_debug_snapshot();
+        }
+        if self.device_debug_started.is_some_and(|started| {
+            started.elapsed() >= Duration::from_secs(self.device_debug_duration_secs as u64)
+        }) {
+            self.stop_debug_benchmark(true);
+        }
         let busy = self.busy.is_some();
         let language = self.language;
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Title(format!(
@@ -2373,52 +3267,164 @@ impl eframe::App for FlasherApp {
                 .to_owned();
         }
 
-        eframe::egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.heading(language.tr(
-                    "DS5DONGLE-AIM61 刷写器",
-                    "DS5DONGLE-AIM61 Flasher",
-                ));
-                ui.separator();
-                ui.label(language.tr("语言", "Language"));
-                eframe::egui::ComboBox::from_id_salt("language_combo")
-                    .selected_text(self.language.display_name())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.language,
-                            Language::ZhCn,
-                            Language::ZhCn.display_name(),
+        eframe::egui::TopBottomPanel::top("header")
+            .frame(
+                eframe::egui::Frame::new()
+                    .fill(COLOR_HEADER)
+                    .inner_margin(eframe::egui::Margin::symmetric(20, 14)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            eframe::egui::RichText::new("DS5DONGLE · AIM61")
+                                .size(22.0)
+                                .color(COLOR_TEXT_PRIMARY)
+                                .strong(),
                         );
-                        ui.selectable_value(
-                            &mut self.language,
-                            Language::En,
-                            Language::En.display_name(),
+                        ui.label(
+                            eframe::egui::RichText::new(language.tr(
+                                "手柄功能测试、运行诊断与安全固件刷写",
+                                "Controller tests, runtime diagnostics and safe firmware flashing",
+                            ))
+                            .color(COLOR_TEXT_MUTED),
                         );
                     });
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| {
+                            eframe::egui::ComboBox::from_id_salt("language_combo")
+                                .selected_text(self.language.display_name())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.language,
+                                        Language::ZhCn,
+                                        Language::ZhCn.display_name(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.language,
+                                        Language::En,
+                                        Language::En.display_name(),
+                                    );
+                                });
+                            ui.label(
+                                eframe::egui::RichText::new(format!("v{FLASHER_VERSION}"))
+                                    .color(COLOR_ACCENT_HOVER)
+                                    .monospace(),
+                            );
+                        },
+                    );
+                });
             });
-            ui.label(language.tr(
-                "读取当前设备固件信息，选择在线 Release 或本地固件，并安全刷写 Ai-M61",
-                "Read the connected firmware information and safely flash Ai-M61 from an online Release or local package",
-            ));
-            ui.add_space(8.0);
-        });
 
-        eframe::egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.small(language.tr(
-                "固件不内置于 EXE；在线固件仅来自 zhaohyperion/DS5DONGLE-AIM61，也可选择本地 ZIP/目录。",
-                "Firmware is not embedded. Online packages come only from zhaohyperion/DS5DONGLE-AIM61; local ZIPs/directories are also supported.",
-            ));
-            ui.add_space(4.0);
-        });
+        let previous_tab = self.current_tab;
+        eframe::egui::TopBottomPanel::top("main_tabs")
+            .frame(
+                eframe::egui::Frame::new()
+                    .fill(COLOR_HEADER)
+                    .inner_margin(eframe::egui::Margin::symmetric(20, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (tab, icon, label) in [
+                        (
+                            AppTab::TestCenter,
+                            "◉",
+                            language.tr("测试中心", "Test center"),
+                        ),
+                        (
+                            AppTab::Flasher,
+                            "⇧",
+                            language.tr("固件刷写", "Firmware flasher"),
+                        ),
+                        (
+                            AppTab::DeviceDebug,
+                            "⌁",
+                            language.tr("设备调试", "Device debug"),
+                        ),
+                    ] {
+                        let selected = self.current_tab == tab;
+                        let button = eframe::egui::Button::new(
+                            eframe::egui::RichText::new(format!("{icon}  {label}"))
+                                .color(if selected {
+                                    COLOR_TEXT_PRIMARY
+                                } else {
+                                    COLOR_TEXT_MUTED
+                                })
+                                .strong(),
+                        )
+                        .fill(if selected {
+                            COLOR_ACCENT_SOFT
+                        } else {
+                            COLOR_HEADER
+                        })
+                        .stroke(eframe::egui::Stroke::new(
+                            if selected { 1.5_f32 } else { 1.0_f32 },
+                            if selected { COLOR_ACCENT } else { COLOR_BORDER },
+                        ))
+                        .min_size([160.0, 40.0].into());
+                        if ui.add(button).clicked() {
+                            self.current_tab = tab;
+                        }
+                    }
+                });
+            });
+        if previous_tab != self.current_tab && self.current_tab == AppTab::TestCenter {
+            self.open_device_test();
+        } else if previous_tab != self.current_tab && self.current_tab == AppTab::DeviceDebug {
+            self.ensure_device_session();
+        }
+
+        eframe::egui::TopBottomPanel::bottom("footer")
+            .frame(
+                eframe::egui::Frame::new()
+                    .fill(COLOR_HEADER)
+                    .inner_margin(eframe::egui::Margin::symmetric(20, 7)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(eframe::egui::RichText::new("●").color(COLOR_SUCCESS));
+                    ui.label(
+                        eframe::egui::RichText::new(language.tr(
+                            "本机运行 · 诊断数据不会上传",
+                            "Runs locally · diagnostic data is never uploaded",
+                        ))
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                    );
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                eframe::egui::RichText::new("zhaohyperion/DS5DONGLE-AIM61")
+                                    .color(COLOR_TEXT_MUTED)
+                                    .small()
+                                    .monospace(),
+                            );
+                        },
+                    );
+                });
+            });
 
         if self.language != language {
             self.relocalize_status();
             ctx.request_repaint();
         }
 
-        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+        if self.current_tab == AppTab::Flasher {
+            eframe::egui::CentralPanel::default()
+                .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
+                .show(ctx, |ui| {
+            ui.heading(language.tr("固件刷写", "Firmware flasher"));
+            ui.label(
+                eframe::egui::RichText::new(language.tr(
+                    "选择经过验证的固件与目标串口，刷写前会再次确认 ISP 模式。",
+                    "Choose verified firmware and the target port. ISP mode is confirmed before flashing.",
+                ))
+                .color(COLOR_TEXT_MUTED),
+            );
+            ui.add_space(10.0);
+            surface_frame().show(ui, |ui| {
             eframe::egui::Grid::new("settings_grid")
                 .num_columns(2)
                 .spacing([18.0, 12.0])
@@ -2559,6 +3565,38 @@ impl eframe::App for FlasherApp {
                     });
                     ui.end_row();
 
+                    ui.label(language.tr("一键诊断", "Diagnostics"));
+                    ui.horizontal(|ui| {
+                        if self.loading_diagnostics {
+                            ui.spinner();
+                        }
+                        ui.label(self.diagnostic_status_text());
+                        if ui
+                            .add_enabled(
+                                !busy && !self.loading_diagnostics,
+                                eframe::egui::Button::new(
+                                    language.tr("运行一键诊断", "Run diagnostics"),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.start_diagnostics();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.loading_diagnostics
+                                    && (!self.runtime_diagnostics.is_empty()
+                                        || !self.devices.is_empty()
+                                        || self.diagnostics_error.is_some()),
+                                eframe::egui::Button::new(language.tr("查看详情", "Details")),
+                            )
+                            .clicked()
+                        {
+                            self.show_diagnostics_window = true;
+                        }
+                    });
+                    ui.end_row();
+
                     ui.label(language.tr("串口设备状态", "Serial device status"));
                     ui.horizontal(|ui| {
                         let (text, color) = self.device_status_text();
@@ -2624,6 +3662,7 @@ impl eframe::App for FlasherApp {
                     });
                     ui.end_row();
                 });
+            });
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -2639,8 +3678,9 @@ impl eframe::App for FlasherApp {
                             .strong()
                             .color(eframe::egui::Color32::WHITE),
                         )
-                        .fill(eframe::egui::Color32::from_rgb(36, 112, 178))
-                        .min_size([250.0, 38.0].into()),
+                        .fill(COLOR_ACCENT_SOFT)
+                        .stroke(eframe::egui::Stroke::new(1.5_f32, COLOR_ACCENT))
+                        .min_size([260.0, 42.0].into()),
                     )
                     .clicked()
                 {
@@ -2652,28 +3692,1060 @@ impl eframe::App for FlasherApp {
                 }
             });
 
-            ui.add_space(8.0);
-            ui.label(&self.status);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(language.tr("操作日志", "Log"));
-                if ui.button(language.tr("复制全部", "Copy all")).clicked() {
-                    ui.ctx().copy_text(self.log.clone());
-                }
+            ui.add_space(10.0);
+            notice(
+                ui,
+                status_tone(&self.status),
+                language.tr("当前状态", "Current status"),
+                &self.status,
+            );
+            ui.add_space(12.0);
+            surface_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(language.tr("操作日志", "Activity log"));
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| {
+                            if ui.button(language.tr("复制全部", "Copy all")).clicked() {
+                                ui.ctx().copy_text(self.log.clone());
+                            }
+                        },
+                    );
+                });
+                ui.separator();
+                eframe::egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            eframe::egui::Label::new(
+                                eframe::egui::RichText::new(&self.log)
+                                    .color(COLOR_TEXT_MUTED)
+                                    .monospace(),
+                            )
+                            .selectable(true)
+                            .wrap(),
+                        );
+                    });
             });
-            eframe::egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(170.0)
-                .show(ui, |ui| {
+            });
+        }
+
+        if self.current_tab == AppTab::TestCenter {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            let mut apply_output = false;
+            let mut stop_output = false;
+            let mut reconnect = false;
+            let mut tone = None;
+            let mut mic_test = false;
+            let input = self.device_test_input.clone();
+            eframe::egui::CentralPanel::default()
+                .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
+                .show(ctx, |ui| {
+                ui.heading(language.tr(
+                    "DS5 手柄功能测试中心",
+                    "DS5 controller test center",
+                ));
+                ui.label(
+                    eframe::egui::RichText::new(language.tr(
+                        "实时验证 DualSense 的输入、输出、传感器和 USB 音频链路。",
+                        "Validate DualSense input, output, sensors and USB audio in real time.",
+                    ))
+                    .color(COLOR_TEXT_MUTED),
+                );
+                ui.add_space(8.0);
+                let connected = self.device_test_connected;
+                let worker_active = self.device_test_session.is_some();
+                notice(
+                    ui,
+                    if connected {
+                        NoticeTone::Success
+                    } else if worker_active {
+                        NoticeTone::Info
+                    } else {
+                        status_tone(&self.device_test_status)
+                    },
+                    if connected {
+                        language.tr("设备已连接", "Device connected")
+                    } else if worker_active {
+                        language.tr("正在连接设备", "Connecting device")
+                    } else {
+                        language.tr("设备未连接", "Device not connected")
+                    },
+                    &self.device_test_status,
+                );
+                if !worker_active
+                    && ui
+                        .add(primary_button(language.tr("重新连接", "Reconnect")))
+                        .clicked()
+                {
+                    reconnect = true;
+                }
+                ui.add_space(8.0);
+                notice(
+                    ui,
+                    NoticeTone::Warning,
+                    language.tr("避免设备冲突", "Avoid device conflicts"),
+                    language.tr(
+                        "请关闭 Steam、DS4Windows 和浏览器手柄测试页。关闭程序时会自动复位所有输出。",
+                        "Close Steam, DS4Windows and other controller tools. All outputs reset automatically when the app closes.",
+                    ),
+                );
+                ui.add_space(12.0);
+
+                eframe::egui::ScrollArea::vertical().show(ui, |ui| {
+                    surface_frame().show(ui, |ui| {
+                    ui.heading(language.tr("实时输入", "Live input"));
+                    ui.horizontal_wrapped(|ui| {
+                        input_button(ui, "□ Square", input.square);
+                        input_button(ui, "× Cross", input.cross);
+                        input_button(ui, "○ Circle", input.circle);
+                        input_button(ui, "△ Triangle", input.triangle);
+                        input_button(ui, "L1", input.l1);
+                        input_button(ui, "R1", input.r1);
+                        input_button(ui, "L2", input.l2_button);
+                        input_button(ui, "R2", input.r2_button);
+                        input_button(ui, "L3", input.l3);
+                        input_button(ui, "R3", input.r3);
+                        input_button(ui, "Create", input.create);
+                        input_button(ui, "Options", input.options);
+                        input_button(ui, "PS", input.ps);
+                        input_button(ui, "Touch", input.touchpad_click);
+                        input_button(ui, "Mute", input.mute);
+                        ui.separator();
+                        ui.label(format!("D-pad: {}", dpad_name(input.dpad, language)));
+                    });
+                    ui.add_space(6.0);
+                    eframe::egui::Grid::new("device_test_axes")
+                        .num_columns(4)
+                        .spacing([12.0, 5.0])
+                        .show(ui, |ui| {
+                            input_progress(ui, "LX", input.lx);
+                            input_progress(ui, "LY", input.ly);
+                            ui.end_row();
+                            input_progress(ui, "RX", input.rx);
+                            input_progress(ui, "RY", input.ry);
+                            ui.end_row();
+                            input_progress(ui, "L2", input.l2);
+                            input_progress(ui, "R2", input.r2);
+                            ui.end_row();
+                        });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.group(|ui| {
+                            ui.strong(language.tr("六轴传感器", "Motion sensors"));
+                            eframe::egui::Grid::new("device_test_motion").show(ui, |ui| {
+                                ui.label("Gyro X/Y/Z");
+                                ui.monospace(format!(
+                                    "{} / {} / {}",
+                                    input.gyro_x, input.gyro_y, input.gyro_z
+                                ));
+                                ui.end_row();
+                                ui.label("Accel X/Y/Z");
+                                ui.monospace(format!(
+                                    "{} / {} / {}",
+                                    input.accel_x, input.accel_y, input.accel_z
+                                ));
+                                ui.end_row();
+                            });
+                        });
+                        ui.group(|ui| {
+                            ui.strong(language.tr("触摸板", "Touchpad"));
+                            for (index, touch) in input.touch.iter().enumerate() {
+                                ui.label(if touch.active {
+                                    format!("#{} ID {}: {}, {}", index + 1, touch.id, touch.x, touch.y)
+                                } else {
+                                    format!("#{}: {}", index + 1, language.tr("未触摸", "inactive"))
+                                });
+                            }
+                        });
+                        ui.group(|ui| {
+                            ui.strong(language.tr("状态", "Status"));
+                            ui.label(match input.battery_percent {
+                                Some(value) => format!("{}: {value}%", language.tr("电量", "Battery")),
+                                None => language.tr("电量：未知", "Battery: unknown").to_owned(),
+                            });
+                            ui.label(format!("{}: {}", language.tr("报告数", "Reports"), input.report_count));
+                            ui.label(format!(
+                                "{}: {:.1} Hz",
+                                language.tr("输入报告频率", "Input report rate"),
+                                input.report_rate_hz
+                            ));
+                        });
+                    });
+                    });
+
+                    ui.add_space(12.0);
+                    surface_frame().show(ui, |ui| {
+                    ui.heading(language.tr("输出功能", "Output functions"));
+                    ui.columns(2, |columns| {
+                        columns[0].group(|ui| {
+                            ui.strong(language.tr("震动与灯效", "Rumble and lights"));
+                            ui.add(
+                                eframe::egui::Slider::new(
+                                    &mut self.device_test_output.rumble_left,
+                                    0..=200,
+                                )
+                                .text(language.tr("左侧低频", "Left / low frequency")),
+                            );
+                            ui.add(
+                                eframe::egui::Slider::new(
+                                    &mut self.device_test_output.rumble_right,
+                                    0..=200,
+                                )
+                                .text(language.tr("右侧高频", "Right / high frequency")),
+                            );
+                            ui.checkbox(
+                                &mut self.device_test_output.lightbar_enabled,
+                                language.tr("启用灯条", "Enable lightbar"),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label("R/G/B");
+                                for value in &mut self.device_test_output.lightbar_rgb {
+                                    ui.add(eframe::egui::DragValue::new(value).range(0..=255));
+                                }
+                            });
+                            ui.add(
+                                eframe::egui::Slider::new(
+                                    &mut self.device_test_output.player_leds,
+                                    0..=31,
+                                )
+                                .text(language.tr("玩家灯位图", "Player LED mask")),
+                            );
+                            ui.add(
+                                eframe::egui::Slider::new(
+                                    &mut self.device_test_output.mute_led,
+                                    0..=2,
+                                )
+                                .text(language.tr("静音灯 0/1/2", "Mute LED 0/1/2")),
+                            );
+                        });
+                        columns[1].group(|ui| {
+                            ui.strong(language.tr("自适应扳机", "Adaptive triggers"));
+                            for (id, label, value) in [
+                                ("left_trigger_preset", "L2", &mut self.device_test_output.left_trigger),
+                                ("right_trigger_preset", "R2", &mut self.device_test_output.right_trigger),
+                            ] {
+                                ui.horizontal(|ui| {
+                                    ui.label(label);
+                                    eframe::egui::ComboBox::from_id_salt(id)
+                                        .selected_text(match *value {
+                                            device_test::TriggerPreset::Off => language.tr("关闭", "Off"),
+                                            device_test::TriggerPreset::Resistance => language.tr("阻力", "Resistance"),
+                                            device_test::TriggerPreset::Pulse => language.tr("脉冲", "Pulse"),
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(value, device_test::TriggerPreset::Off, language.tr("关闭", "Off"));
+                                            ui.selectable_value(value, device_test::TriggerPreset::Resistance, language.tr("阻力", "Resistance"));
+                                            ui.selectable_value(value, device_test::TriggerPreset::Pulse, language.tr("脉冲", "Pulse"));
+                                        });
+                                });
+                            }
+                            notice(
+                                ui,
+                                NoticeTone::Warning,
+                                language.tr("扳机安全提示", "Trigger safety"),
+                                language.tr(
+                                    "测试预设使用受限强度；测试后请点击“全部停止并复位”。",
+                                    "Presets use limited force. Click Stop all and reset after testing.",
+                                ),
+                            );
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.add(primary_button(language.tr("应用输出测试", "Apply output test"))).clicked() {
+                            apply_output = true;
+                        }
+                        if ui.add(
+                            eframe::egui::Button::new(
+                                eframe::egui::RichText::new(language.tr(
+                                    "全部停止并复位",
+                                    "Stop all and reset",
+                                ))
+                                .color(COLOR_ERROR)
+                                .strong(),
+                            )
+                            .fill(COLOR_ERROR_SOFT)
+                            .stroke(eframe::egui::Stroke::new(1.0_f32, COLOR_ERROR)),
+                        ).clicked() {
+                            stop_output = true;
+                        }
+                    });
+                    });
+
+                    ui.add_space(12.0);
+                    surface_frame().show(ui, |ui| {
+                    ui.heading(language.tr("USB 音频", "USB audio"));
+                    notice(
+                        ui,
+                        NoticeTone::Info,
+                        language.tr("Windows 音频设备", "Windows audio device"),
+                        language.tr(
+                            "先把 DualSense Wireless Controller 设为默认输出和输入。测试音为 2 秒，麦克风录制 5 秒后自动回放并删除临时文件。",
+                            "Set DualSense Wireless Controller as the default output and input first. Tones last 2 seconds; microphone audio records for 5 seconds, plays back, then deletes the temporary file.",
+                        ),
+                    );
+                    ui.horizontal(|ui| {
+                        if self.device_test_audio_busy {
+                            ui.spinner();
+                        }
+                        if ui.add_enabled(!self.device_test_audio_busy, eframe::egui::Button::new(language.tr("左声道", "Left tone"))).clicked() {
+                            tone = Some(device_test::AudioChannel::Left);
+                        }
+                        if ui.add_enabled(!self.device_test_audio_busy, eframe::egui::Button::new(language.tr("右声道", "Right tone"))).clicked() {
+                            tone = Some(device_test::AudioChannel::Right);
+                        }
+                        if ui.add_enabled(!self.device_test_audio_busy, eframe::egui::Button::new(language.tr("双声道", "Stereo tone"))).clicked() {
+                            tone = Some(device_test::AudioChannel::Both);
+                        }
+                        if ui.add_enabled(!self.device_test_audio_busy, eframe::egui::Button::new(language.tr("录音 5 秒并回放", "Record 5s and play back"))).clicked() {
+                            mic_test = true;
+                        }
+                    });
+                    });
+                });
+            });
+
+            if reconnect {
+                self.device_test_connected = false;
+                self.device_test_session = Some(device_test::TestSession::start());
+            }
+            if apply_output {
+                if let Some(session) = &self.device_test_session {
+                    if let Err(error) = session.set_output(self.device_test_output.clone()) {
+                        self.device_test_status = format!("{error:#}");
+                    }
+                }
+            }
+            if stop_output {
+                self.device_test_output = device_test::OutputState::default();
+                if let Some(session) = &self.device_test_session {
+                    let _ = session.stop_all();
+                }
+            }
+            if let Some(channel) = tone {
+                self.start_audio_test(channel);
+            }
+            if mic_test {
+                self.start_microphone_test();
+            }
+        }
+
+        if self.current_tab == AppTab::DeviceDebug {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            let mut start_benchmark = false;
+            let mut stop_benchmark = false;
+            let mut capture_snapshot = false;
+            let mut export_report = false;
+            let metrics = self.device_debug_metrics.clone();
+            let running = self.device_debug_started.is_some();
+            let extreme_duration_blocked = self.device_debug_stress_enabled
+                && self.device_debug_stress_rate_hz == 50
+                && self.device_debug_duration_secs > 900;
+            let elapsed_secs = self
+                .device_debug_started
+                .map_or(metrics.elapsed_ms as f32 / 1000.0, |started| {
+                    started.elapsed().as_secs_f32()
+                });
+
+            eframe::egui::CentralPanel::default()
+                .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
+                .show(ctx, |ui| {
+                    ui.heading(language.tr("设备调试与性能分析", "Device debug and performance"));
+                    ui.label(
+                        eframe::egui::RichText::new(language.tr(
+                            "同时测量 M61 内部蓝牙输入到 USB 完成的转发延迟，以及 Windows 收到 HID 报告的频率、间隔分布与抖动。",
+                            "Measure the M61 Bluetooth-input-to-USB-completion bridge latency together with Windows HID arrival rate, interval distribution and jitter.",
+                        ))
+                        .color(COLOR_TEXT_MUTED),
+                    );
+                    ui.add_space(10.0);
+                    notice(
+                        ui,
+                        NoticeTone::Info,
+                        language.tr("测量边界", "Measurement scope"),
+                        language.tr(
+                            "这里测得的是 USB HID 报告到达 Windows 的调度间隔，不是从按下按键到屏幕显示的绝对端到端延迟。",
+                            "These values are Windows USB HID arrival intervals, not absolute button-to-display end-to-end latency.",
+                        ),
+                    );
+                    ui.add_space(12.0);
+
+                    surface_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(language.tr("自动压力测试", "Automated stress test"));
+                            ui.separator();
+                            ui.label(language.tr("时长", "Duration"));
+                            for seconds in [300_u32, 900, 1800, 3600] {
+                                ui.add_enabled_ui(!running, |ui| {
+                                    ui.radio_value(
+                                        &mut self.device_debug_duration_secs,
+                                        seconds,
+                                        format!(
+                                            "{} {}",
+                                            seconds / 60,
+                                            language.tr("分钟", "min")
+                                        ),
+                                    );
+                                });
+                            }
+                            if !running {
+                                if ui
+                                    .add_enabled(
+                                        self.device_test_connected && !extreme_duration_blocked,
+                                        primary_button(language.tr("开始压力测试", "Start stress test")),
+                                    )
+                                    .clicked()
+                                {
+                                    start_benchmark = true;
+                                }
+                            } else if ui
+                                .add(
+                                    eframe::egui::Button::new(language.tr("提前停止", "Stop early"))
+                                        .fill(COLOR_WARNING_SOFT)
+                                        .stroke(eframe::egui::Stroke::new(1.0_f32, COLOR_WARNING)),
+                                )
+                                .clicked()
+                            {
+                                stop_benchmark = true;
+                            }
+                        });
+                        ui.add_enabled_ui(!running, |ui| {
+                            ui.checkbox(
+                                &mut self.device_debug_stress_enabled,
+                                language.tr(
+                                    "启用输出负载（循环灯效、限强度震动和自适应扳机）",
+                                    "Enable output load (cycling lights, limited rumble and adaptive triggers)",
+                                ),
+                            );
+                        });
+                        ui.add_enabled_ui(!running && self.device_debug_stress_enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(language.tr("输出频率", "Output rate"));
+                                ui.radio_value(
+                                    &mut self.device_debug_stress_rate_hz,
+                                    20,
+                                    language.tr("20 Hz 推荐", "20 Hz recommended"),
+                                );
+                                ui.radio_value(
+                                    &mut self.device_debug_stress_rate_hz,
+                                    50,
+                                    language.tr("50 Hz 极限", "50 Hz extreme"),
+                                );
+                            });
+                        });
+                        ui.label(
+                            eframe::egui::RichText::new(language.tr(
+                                "执行器按 15 秒工作、5 秒完全释放循环；每 5 秒自动采集 M61 快照，出现新的 ≥20 ms 停顿时追加采集。",
+                                "Actuators cycle through 15 seconds active and 5 seconds fully released; M61 snapshots run every 5 seconds and additionally on new ≥20 ms stalls.",
+                            ))
+                            .color(COLOR_TEXT_MUTED)
+                            .small(),
+                        );
+                        if self.device_debug_stress_enabled {
+                            notice(
+                                ui,
+                                if self.device_debug_stress_rate_hz == 50 {
+                                    NoticeTone::Warning
+                                } else {
+                                    NoticeTone::Info
+                                },
+                                language.tr("硬件负载提示", "Hardware load notice"),
+                                language.tr(
+                                    "长测会增加手柄耗电、马达温升和扳机机械负担。20 Hz 适合常规稳定性测试；50 Hz 仅建议短时极限链路测试，并保持手柄通风。",
+                                    "Long runs increase battery drain, motor temperature and trigger mechanical duty. Use 20 Hz for normal stability testing; reserve 50 Hz for shorter extreme transport tests and keep the controller ventilated.",
+                                ),
+                            );
+                            if extreme_duration_blocked {
+                                notice(
+                                    ui,
+                                    NoticeTone::Error,
+                                    language.tr(
+                                        "极限模式时长过长",
+                                        "Extreme mode duration is too long",
+                                    ),
+                                    language.tr(
+                                        "由于设备没有执行器温度反馈，50 Hz 模式最多允许选择 15 分钟；30–60 分钟请使用 20 Hz。",
+                                        "Because actuator temperature is unavailable, 50 Hz is limited to 15 minutes; use 20 Hz for 30–60 minute runs.",
+                                    ),
+                                );
+                            }
+                        }
+                        if running {
+                            let progress =
+                                (elapsed_secs / self.device_debug_duration_secs as f32).clamp(0.0, 1.0);
+                            ui.add(
+                                eframe::egui::ProgressBar::new(progress)
+                                    .animate(true)
+                                    .text(format!(
+                                        "{} / {}",
+                                        format_duration((elapsed_secs * 1000.0) as u32),
+                                        format_duration(
+                                            self.device_debug_duration_secs.saturating_mul(1000)
+                                        )
+                                    )),
+                            );
+                        }
+                    });
+
+                    ui.add_space(12.0);
+                    eframe::egui::ScrollArea::vertical().show(ui, |ui| {
+                        let enough_samples = metrics.sample_count >= 100;
+                        let average = metrics.average_interval_ms.max(0.001);
+                        let latest_runtime = self.device_debug_final.as_ref().or_else(|| {
+                            self.device_debug_runtime_samples.last().or_else(|| {
+                                self.runtime_diagnostics
+                                    .iter()
+                                    .find_map(|report| report.snapshot.as_ref())
+                            })
+                        });
+                        let (firmware_fault, firmware_warning) = self
+                            .device_debug_baseline
+                            .as_ref()
+                            .zip(latest_runtime)
+                            .map_or((false, false), |(before, after)| {
+                                let loss_delta = after
+                                    .loss_pressure
+                                    .wrapping_sub(before.loss_pressure);
+                                let mic_delta = after
+                                    .mic_underruns
+                                    .wrapping_sub(before.mic_underruns)
+                                    + after.mic_overruns.wrapping_sub(before.mic_overruns);
+                                let heap_drop = before
+                                    .heap_free_bytes
+                                    .saturating_sub(after.heap_free_bytes);
+                                (loss_delta > 0 || mic_delta > 0, heap_drop > 8 * 1024)
+                            });
+                        let severe = enough_samples
+                            && (metrics.report_rate_hz < 100.0
+                                || metrics.maximum_interval_ms > 50.0
+                                || metrics.gaps_over_10ms * 200 > metrics.sample_count
+                                || firmware_fault);
+                        let warning = enough_samples
+                            && !severe
+                            && (metrics.p99_interval_ms > average * 2.5
+                                || metrics.jitter_stddev_ms > average * 0.75
+                                || metrics.gaps_over_10ms > 0
+                                || firmware_warning);
+                        let (tone, result_title, result_body) = if !enough_samples {
+                            (
+                                NoticeTone::Info,
+                                language.tr("等待有效样本", "Waiting for samples"),
+                                language.tr(
+                                    "连接设备后启动自动压力测试，建议至少运行 15 分钟。",
+                                    "Connect the device and start the automated stress test; at least 15 minutes is recommended.",
+                                ),
+                            )
+                        } else if severe {
+                            (
+                                NoticeTone::Error,
+                                language.tr("发现明显性能异常", "Significant performance issue detected"),
+                                language.tr(
+                                    "报告频率过低、存在超过 50 ms 的停顿、长间隔占比过高，或固件丢失/麦克风错误计数增加。请检查后续快照、USB 和蓝牙环境。",
+                                    "Report rate is too low, a stall exceeded 50 ms, long gaps are excessive, or firmware loss/microphone error counters increased. Inspect the snapshots and USB/Bluetooth conditions.",
+                                ),
+                            )
+                        } else if warning {
+                            (
+                                NoticeTone::Warning,
+                                language.tr("存在调度抖动", "Scheduling jitter detected"),
+                                language.tr(
+                                    "平均吞吐正常，但尾部间隔、抖动或空闲堆变化偏高。建议运行 30 至 60 分钟压力测试并检查周期快照。",
+                                    "Average throughput is normal, but tail intervals, jitter, or free-heap change is elevated. Run a 30- to 60-minute stress test and inspect periodic snapshots.",
+                                ),
+                            )
+                        } else {
+                            (
+                                NoticeTone::Success,
+                                language.tr("HID 调度表现稳定", "HID scheduling is stable"),
+                                language.tr(
+                                    "当前样本中未发现明显的长停顿或异常抖动。",
+                                    "No material long stalls or abnormal jitter were found in this sample.",
+                                ),
+                            )
+                        };
+                        notice(ui, tone, result_title, result_body);
+                        ui.add_space(12.0);
+
+                        surface_frame().show(ui, |ui| {
+                            ui.strong(language.tr("HID 延迟与抖动", "HID interval and jitter"));
+                            ui.add_space(6.0);
+                            ui.horizontal_wrapped(|ui| {
+                                metric_card(
+                                    ui,
+                                    language.tr("报告频率", "Report rate"),
+                                    format!("{:.1} Hz", metrics.report_rate_hz),
+                                    language.tr("Windows 实测", "Measured by Windows"),
+                                    COLOR_ACCENT_HOVER,
+                                );
+                                metric_card(
+                                    ui,
+                                    language.tr("平均间隔", "Average interval"),
+                                    format!("{:.3} ms", metrics.average_interval_ms),
+                                    language.tr("越低越快", "Lower is faster"),
+                                    COLOR_TEXT_PRIMARY,
+                                );
+                                metric_card(
+                                    ui,
+                                    "P95 / P99",
+                                    format!(
+                                        "{:.3} / {:.3} ms",
+                                        metrics.p95_interval_ms, metrics.p99_interval_ms
+                                    ),
+                                    language.tr("尾部调度间隔", "Tail scheduling interval"),
+                                    if warning || severe { COLOR_WARNING } else { COLOR_SUCCESS },
+                                );
+                                metric_card(
+                                    ui,
+                                    language.tr("最大间隔", "Maximum interval"),
+                                    format!("{:.3} ms", metrics.maximum_interval_ms),
+                                    language.tr("最长一次停顿", "Longest observed stall"),
+                                    if metrics.maximum_interval_ms > 20.0 {
+                                        COLOR_ERROR
+                                    } else {
+                                        COLOR_TEXT_PRIMARY
+                                    },
+                                );
+                                metric_card(
+                                    ui,
+                                    language.tr("标准差抖动", "Jitter stddev"),
+                                    format!("{:.3} ms", metrics.jitter_stddev_ms),
+                                    language.tr("间隔离散程度", "Interval dispersion"),
+                                    if warning || severe { COLOR_WARNING } else { COLOR_SUCCESS },
+                                );
+                                metric_card(
+                                    ui,
+                                    language.tr("长间隔次数", "Long gaps"),
+                                    format!(
+                                        ">5 ms: {}  ·  >10 ms: {}",
+                                        metrics.gaps_over_5ms, metrics.gaps_over_10ms
+                                    ),
+                                    format!("{} {}", metrics.sample_count, language.tr("个样本", "samples")).as_str(),
+                                    if metrics.gaps_over_10ms > 0 { COLOR_WARNING } else { COLOR_SUCCESS },
+                                );
+                                metric_card(
+                                    ui,
+                                    language.tr("压力输出报告", "Stress output reports"),
+                                    metrics.stress_output_reports.to_string(),
+                                    format!(
+                                        "{} Hz · {}",
+                                        self.device_debug_stress_rate_hz,
+                                        language.tr(
+                                            "15 秒负载 / 5 秒释放",
+                                            "15 s load / 5 s release"
+                                        )
+                                    )
+                                    .as_str(),
+                                    if self.device_debug_stress_enabled {
+                                        COLOR_ACCENT_HOVER
+                                    } else {
+                                        COLOR_TEXT_MUTED
+                                    },
+                                );
+                            });
+                        });
+
+                        ui.add_space(12.0);
+                        surface_frame().show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(language.tr("固件运行快照", "Firmware runtime snapshot"));
+                                if running {
+                                    ui.label(format!(
+                                        "{}: {}",
+                                        language.tr("周期样本", "Periodic samples"),
+                                        self.device_debug_runtime_samples.len()
+                                    ));
+                                }
+                                if self.loading_diagnostics {
+                                    ui.spinner();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.loading_diagnostics,
+                                        eframe::egui::Button::new(language.tr(
+                                            "立即采集 0xFD",
+                                            "Capture 0xFD now",
+                                        )),
+                                    )
+                                    .clicked()
+                                {
+                                    capture_snapshot = true;
+                                }
+                            });
+                            if let Some(snapshot) = self
+                                .runtime_diagnostics
+                                .iter()
+                                .find_map(|report| report.snapshot.as_ref())
+                            {
+                                eframe::egui::Grid::new("debug_runtime_snapshot")
+                                    .num_columns(4)
+                                    .spacing([20.0, 8.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        ui.label("USB complete");
+                                        ui.monospace(snapshot.usb_in_completed.to_string());
+                                        ui.label("BT input");
+                                        ui.monospace(snapshot.bt_input_reports.to_string());
+                                        ui.end_row();
+                                        ui.label("BT output");
+                                        ui.monospace(snapshot.bt_output_completed.to_string());
+                                        ui.label("RSSI");
+                                        ui.monospace(snapshot.bt_rssi_dbm.map_or_else(
+                                            || "—".to_owned(),
+                                            |value| format!("{value} dBm"),
+                                        ));
+                                        ui.end_row();
+                                        ui.label(language.tr("空闲堆", "Free heap"));
+                                        ui.monospace(format_bytes(snapshot.heap_free_bytes));
+                                        ui.label(language.tr("丢失压力", "Loss pressure"));
+                                        ui.monospace(snapshot.loss_pressure.to_string());
+                                        ui.end_row();
+                                        ui.label("Mic underrun / overrun");
+                                        ui.monospace(format!(
+                                            "{} / {}",
+                                            snapshot.mic_underruns, snapshot.mic_overruns
+                                        ));
+                                        ui.label("Audio pairs");
+                                        ui.monospace(snapshot.bt_audio_pairs_submitted.to_string());
+                                        ui.end_row();
+                                    });
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.strong(language.tr(
+                                    "M61 内部转发延迟",
+                                    "M61 internal bridge latency",
+                                ));
+                                ui.label(
+                                    eframe::egui::RichText::new(language.tr(
+                                        "蓝牙 HID 输入回调进入 M61 → USB IN 提交 → USB 传输完成；统计最近一个固件诊断窗口。",
+                                        "Bluetooth HID callback enters M61 → USB IN submitted → USB transfer completed; values cover the latest firmware diagnostic window.",
+                                    ))
+                                    .color(COLOR_TEXT_MUTED),
+                                );
+                                if let Some(samples) = snapshot.bridge_latency_samples {
+                                    if samples == 0 {
+                                        notice(
+                                            ui,
+                                            NoticeTone::Info,
+                                            language.tr("等待手柄输入", "Waiting for controller input"),
+                                            language.tr(
+                                                "当前诊断窗口没有完成的转发样本。保持手柄连接并操作按键或摇杆后重新采集。",
+                                                "No completed bridge samples were recorded in this window. Keep the controller connected, use a button or stick, then capture again.",
+                                            ),
+                                        );
+                                    } else {
+                                        ui.horizontal_wrapped(|ui| {
+                                            metric_card(
+                                                ui,
+                                                language.tr("窗口样本", "Window samples"),
+                                                samples.to_string(),
+                                                language.tr("约 1 秒窗口", "Approximately 1-second window"),
+                                                COLOR_ACCENT_HOVER,
+                                            );
+                                            metric_card(
+                                                ui,
+                                                language.tr("接收 → USB 提交", "Receive → USB submit"),
+                                                format!(
+                                                    "{} / {} µs",
+                                                    snapshot.bridge_rx_to_submit_avg_us.unwrap_or(0),
+                                                    snapshot.bridge_rx_to_submit_max_us.unwrap_or(0)
+                                                ),
+                                                language.tr("平均 / 最大", "Average / maximum"),
+                                                COLOR_TEXT_PRIMARY,
+                                            );
+                                            metric_card(
+                                                ui,
+                                                language.tr("USB 提交 → 完成", "USB submit → complete"),
+                                                format!(
+                                                    "{} / {} µs",
+                                                    snapshot.bridge_usb_transfer_avg_us.unwrap_or(0),
+                                                    snapshot.bridge_usb_transfer_max_us.unwrap_or(0)
+                                                ),
+                                                language.tr("平均 / 最大", "Average / maximum"),
+                                                COLOR_TEXT_PRIMARY,
+                                            );
+                                            metric_card(
+                                                ui,
+                                                language.tr("M61 内部总延迟", "Total inside M61"),
+                                                format!(
+                                                    "{} / {} µs",
+                                                    snapshot.bridge_total_avg_us.unwrap_or(0),
+                                                    snapshot.bridge_total_max_us.unwrap_or(0)
+                                                ),
+                                                language.tr("平均 / 最大", "Average / maximum"),
+                                                COLOR_SUCCESS,
+                                            );
+                                            metric_card(
+                                                ui,
+                                                language.tr("内部尾延迟", "Internal tail latency"),
+                                                format!(
+                                                    "≤{} / ≤{} µs",
+                                                    snapshot.bridge_total_p95_us.unwrap_or(0),
+                                                    snapshot.bridge_total_p99_us.unwrap_or(0)
+                                                ),
+                                                "P95 / P99",
+                                                COLOR_SUCCESS,
+                                            );
+                                        });
+                                        if snapshot.bridge_timing_flags.unwrap_or(0) != 0 {
+                                            notice(
+                                                ui,
+                                                NoticeTone::Warning,
+                                                language.tr("计时值已饱和", "Timing value saturated"),
+                                                language.tr(
+                                                    "至少一个内部延迟超过 65535 µs；请结合最大停顿、丢失压力和 USB 状态排查。",
+                                                    "At least one internal latency exceeded 65535 µs; inspect maximum stalls, loss pressure and USB state.",
+                                                ),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    notice(
+                                        ui,
+                                        NoticeTone::Warning,
+                                        language.tr("当前固件不支持内部计时", "Firmware does not expose internal timing"),
+                                        language.tr(
+                                            "旧版六页诊断仍可读取，但需要刷入带第 7 页桥接延迟数据的新版固件才能显示该项。",
+                                            "The legacy six-page snapshot remains readable, but firmware with the seventh bridge-latency page is required for this section.",
+                                        ),
+                                    );
+                                }
+                            } else if let Some(error) = &self.diagnostics_error {
+                                notice(
+                                    ui,
+                                    NoticeTone::Error,
+                                    language.tr("快照采集失败", "Snapshot capture failed"),
+                                    error,
+                                );
+                            } else {
+                                ui.label(
+                                    eframe::egui::RichText::new(language.tr(
+                                        "尚未采集运行快照。基准测试开始与结束时会自动采集。",
+                                        "No runtime snapshot yet. Benchmarks capture one at start and finish.",
+                                    ))
+                                    .color(COLOR_TEXT_MUTED),
+                                );
+                            }
+
+                            if let (Some(before), Some(after)) =
+                                (&self.device_debug_baseline, &self.device_debug_final)
+                            {
+                                let duration_ms = after.monotonic_ms.wrapping_sub(before.monotonic_ms);
+                                if duration_ms > 0 {
+                                    let seconds = duration_ms as f64 / 1000.0;
+                                    ui.separator();
+                                    ui.strong(language.tr("基准区间吞吐", "Benchmark interval throughput"));
+                                    ui.label(format!(
+                                        "USB {:.1}/s  ·  BT input {:.1}/s  ·  BT output {:.1}/s  ·  loss Δ{}  ·  mic error Δ{}",
+                                        after.usb_in_completed.wrapping_sub(before.usb_in_completed) as f64 / seconds,
+                                        after.bt_input_reports.wrapping_sub(before.bt_input_reports) as f64 / seconds,
+                                        after.bt_output_completed.wrapping_sub(before.bt_output_completed) as f64 / seconds,
+                                        after.loss_pressure.wrapping_sub(before.loss_pressure),
+                                        after.mic_underruns.wrapping_sub(before.mic_underruns)
+                                            + after.mic_overruns.wrapping_sub(before.mic_overruns),
+                                    ));
+                                }
+                            }
+                        });
+
+                        ui.add_space(12.0);
+                        if ui
+                            .add_enabled(
+                                metrics.sample_count > 0,
+                                primary_button(language.tr(
+                                    "导出性能 JSON",
+                                    "Export performance JSON",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            export_report = true;
+                        }
+                    });
+                });
+
+            if start_benchmark {
+                self.start_debug_benchmark();
+            }
+            if stop_benchmark {
+                self.stop_debug_benchmark(true);
+            }
+            if capture_snapshot {
+                self.capture_debug_snapshot();
+            }
+            if export_report {
+                self.export_debug_report();
+            }
+        }
+
+        if self.show_diagnostics_window {
+            let summary = self.diagnostic_summary_text();
+            let mut rerun = false;
+            let mut export = false;
+            let mut close = false;
+            eframe::egui::Window::new(language.tr(
+                "DS5Dongle 一键诊断",
+                "DS5Dongle diagnostics",
+            ))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([760.0, 560.0])
+            .anchor(eframe::egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(language.tr(
+                    "同时检查 Windows 串口环境，并读取 0xFD/CRC32 七页运行态快照（兼容旧六页固件）。诊断数据仅保存在本机。",
+                    "Checks the Windows serial environment and captures the seven-page 0xFD/CRC32 runtime snapshot, with legacy six-page compatibility. Diagnostic data stays local.",
+                ));
+                ui.add_space(6.0);
+                if self.loading_diagnostics {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(language.tr("正在诊断...", "Running diagnostics..."));
+                    });
+                }
+                ui.group(|ui| {
+                    ui.strong(language.tr("诊断结论", "Diagnostic summary"));
                     ui.add(
                         eframe::egui::Label::new(
-                            eframe::egui::RichText::new(&self.log).monospace(),
+                            eframe::egui::RichText::new(&summary).monospace(),
                         )
                         .selectable(true)
                         .wrap(),
                     );
                 });
-        });
+
+                eframe::egui::ScrollArea::vertical()
+                    .max_height(350.0)
+                    .show(ui, |ui| {
+                        for (index, report) in self.runtime_diagnostics.iter().enumerate() {
+                            ui.add_space(8.0);
+                            ui.strong(format!(
+                                "{} · {:04X}:{:04X} · {}",
+                                report.product_name,
+                                report.vendor_id,
+                                report.product_id,
+                                report.firmware_version.as_deref().unwrap_or(language.tr(
+                                    "固件版本未知",
+                                    "firmware unknown"
+                                ))
+                            ));
+                            if let Some(snapshot) = &report.snapshot {
+                                eframe::egui::Grid::new(format!("diagnostic_metrics_{index}"))
+                                    .num_columns(4)
+                                    .spacing([18.0, 6.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        ui.label(language.tr("快照", "Snapshot"));
+                                        ui.monospace(format!("#{}", snapshot.snapshot_seq));
+                                        ui.label(language.tr("运行时间", "Uptime"));
+                                        ui.monospace(format_duration(snapshot.uptime_ms));
+                                        ui.end_row();
+                                        ui.label(language.tr("空闲堆", "Free heap"));
+                                        ui.monospace(format!(
+                                            "{} / {}",
+                                            format_bytes(snapshot.heap_free_bytes),
+                                            format_bytes(snapshot.heap_min_free_bytes)
+                                        ));
+                                        ui.label("RSSI");
+                                        ui.monospace(snapshot.bt_rssi_dbm.map_or_else(
+                                            || "—".to_owned(),
+                                            |value| format!("{value} dBm"),
+                                        ));
+                                        ui.end_row();
+                                        ui.label(language.tr("USB 完成", "USB complete"));
+                                        ui.monospace(snapshot.usb_in_completed.to_string());
+                                        ui.label(language.tr("蓝牙输入", "BT input"));
+                                        ui.monospace(snapshot.bt_input_reports.to_string());
+                                        ui.end_row();
+                                        ui.label(language.tr("丢失/压力", "Loss/pressure"));
+                                        ui.colored_label(
+                                            if snapshot.loss_pressure == 0 {
+                                                COLOR_SUCCESS
+                                            } else {
+                                                COLOR_WARNING
+                                            },
+                                            snapshot.loss_pressure.to_string(),
+                                        );
+                                        ui.label(language.tr("麦克风欠载", "Mic underrun"));
+                                        ui.colored_label(
+                                            if snapshot.mic_underruns == 0 {
+                                                COLOR_SUCCESS
+                                            } else {
+                                                COLOR_WARNING
+                                            },
+                                            snapshot.mic_underruns.to_string(),
+                                        );
+                                        ui.end_row();
+                                        ui.label("OTA");
+                                        ui.monospace(format!(
+                                            "{} / {}",
+                                            snapshot.ota_state, snapshot.ota_error
+                                        ));
+                                        ui.label(language.tr("电量", "Battery"));
+                                        ui.monospace(snapshot.battery_percent.map_or_else(
+                                            || "—".to_owned(),
+                                            |value| format!("{value}%"),
+                                        ));
+                                        ui.end_row();
+                                    });
+                            } else if let Some(error) = &report.error {
+                                notice(
+                                    ui,
+                                    NoticeTone::Error,
+                                    language.tr("0xFD 诊断读取失败", "0xFD diagnostic capture failed"),
+                                    error,
+                                );
+                            }
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !busy && !self.loading_diagnostics,
+                            eframe::egui::Button::new(language.tr("重新诊断", "Run again")),
+                        )
+                        .clicked()
+                    {
+                        rerun = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.loading_diagnostics
+                                && (!self.runtime_diagnostics.is_empty()
+                                    || !self.devices.is_empty()),
+                            eframe::egui::Button::new(
+                                language.tr("保存 JSON 诊断包", "Save JSON bundle"),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        export = true;
+                    }
+                    if ui
+                        .button(language.tr("复制摘要", "Copy summary"))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(summary.clone());
+                    }
+                    if ui.button(language.tr("关闭", "Close")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if rerun {
+                self.start_diagnostics();
+            }
+            if export {
+                self.export_diagnostics();
+            }
+            if close {
+                self.show_diagnostics_window = false;
+            }
+        }
 
         if self.show_isp_dialog {
             eframe::egui::Window::new(language.tr("进入 UART ISP", "Enter download mode"))
@@ -2691,10 +4763,12 @@ impl eframe::App for FlasherApp {
                     );
                     ui.label(language.tr("3. 松开 BOOT", "3. Release BOOT"));
                     ui.add_space(8.0);
-                    ui.colored_label(
-                        eframe::egui::Color32::RED,
+                    notice(
+                        ui,
+                        NoticeTone::Error,
+                        language.tr("刷写期间请勿断电", "Do not interrupt flashing"),
                         language.tr(
-                            "刷写开始后不要拔线、不要按 Reset。",
+                            "刷写开始后不要拔线，也不要按 Reset。",
                             "Do not disconnect the cable or press Reset after flashing starts.",
                         ),
                     );
@@ -2867,8 +4941,8 @@ fn run_gui() -> Result<()> {
     verify_embedded_tool()?;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 760.0])
-            .with_min_inner_size([820.0, 680.0]),
+            .with_inner_size([1120.0, 840.0])
+            .with_min_inner_size([900.0, 700.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -2938,6 +5012,42 @@ mod tests {
         assert_eq!(parsed[0].name, "USB-SERIAL CH340 (COM5)");
         assert_eq!(parsed[0].port.as_deref(), Some("COM5"));
         assert_eq!(parsed[0].error_code, 0);
+    }
+
+    #[test]
+    fn rejects_non_ch340_ports_from_flash_candidates() {
+        let built_in = Ch340Device {
+            name: "Communications Port (COM1)".into(),
+            instance_id: "ACPI\\PNP0501\\0".into(),
+            error_code: 0,
+            status: "OK".into(),
+            port: Some("COM1".into()),
+        };
+        let ch340 = Ch340Device {
+            name: "USB-SERIAL CH340 (COM8)".into(),
+            instance_id: "USB\\VID_1A86&PID_7523\\ABC".into(),
+            error_code: 0,
+            status: "OK".into(),
+            port: Some("COM8".into()),
+        };
+        assert!(!is_ch340_device(&built_in));
+        assert!(is_ch340_device(&ch340));
+    }
+
+    #[test]
+    fn diagnostic_bundle_marks_ignored_ports_without_exporting_pnp_identifiers() {
+        let built_in = Ch340Device {
+            name: "Communications Port (COM1)".into(),
+            instance_id: "ACPI\\PNP0501\\SENSITIVE".into(),
+            error_code: 0,
+            status: "OK".into(),
+            port: Some("COM1".into()),
+        };
+        let json = diagnostic_bundle_json(&[built_in], &[]).unwrap();
+        assert!(json.contains("\"targetCh340\": false"));
+        assert!(json.contains("\"usable\": false"));
+        assert!(!json.contains("PNP0501"));
+        assert!(!json.contains("SENSITIVE"));
     }
 
     #[test]

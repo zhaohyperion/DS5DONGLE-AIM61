@@ -43,9 +43,8 @@ class FirmwareContractTests(unittest.TestCase):
         )
 
         flasher = read("tools/ds5dongle-flasher/src/main.rs")
-        web = read("web/app/DeviceConsole.tsx")
         ota_docs = read("docs/OTA.md")
-        for text in (flasher, web, ota_docs):
+        for text in (flasher, ota_docs):
             self.assertIn(repository, text)
             for legacy in legacy_repositories:
                 self.assertNotIn(legacy, text)
@@ -83,7 +82,7 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_PROTOCOL_VERSION"), 1)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_HEADER_SIZE"), 16)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_DATA_MAX"), 43)
-        self.assertEqual(integer_define(header, "RUNTIME_DIAG_PAGE_COUNT"), 6)
+        self.assertEqual(integer_define(header, "RUNTIME_DIAG_PAGE_COUNT"), 7)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_SELECT_PAGE"), 1)
 
         ota_header = "src/ota_update.h"
@@ -221,6 +220,7 @@ class FirmwareContractTests(unittest.TestCase):
             "CRC-32/IEEE",
             "Page 0: identity and health",
             "Page 5: OTA and memory",
+            "Page 6: M61 bridge latency",
             "[0x01, 0x01, page]",
             "priority 1",
             "4 KiB",
@@ -538,7 +538,7 @@ class FirmwareContractTests(unittest.TestCase):
         )
 
         # A STATUS probe must not clear a pending asynchronous error before
-        # the browser's following GET_REPORT can observe it.
+        # the host's following GET_REPORT can observe it.
         status = ota[ota.index("static void process_status") :
                      ota.index("static void process_control")]
         self.assertNotIn("ota_ctx.error = OTA_ERROR_OK", status)

@@ -36,6 +36,21 @@ struct usb_gamepad_runtime_stats {
     uint32_t start_errors;
 };
 
+/* One diagnostic-publish window of controller-to-PC bridge timing.  The USB
+ * hot path records only sums/maxima and a compact total-latency histogram;
+ * the low-priority diagnostic task snapshots and resets the window. */
+struct usb_gamepad_latency_stats {
+    uint32_t samples;
+    uint32_t rx_to_submit_avg_us;
+    uint32_t rx_to_submit_max_us;
+    uint32_t usb_transfer_avg_us;
+    uint32_t usb_transfer_max_us;
+    uint32_t total_avg_us;
+    uint32_t total_p95_us;
+    uint32_t total_p99_us;
+    uint32_t total_max_us;
+};
+
 /* Low-rate task-context view of USB lifecycle state.  No register reads or
  * formatting occur while the USB callback state is sampled. */
 struct usb_gamepad_link_status {
@@ -53,7 +68,8 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb);
  * commit atomically publishes it and owns the endpoint kick.  This lets the
  * caller perform a connection-epoch check in the same critical section as
  * commit without masking the 63-byte staging copy. */
-int usb_gamepad_stage_raw_input(const uint8_t *payload, uint8_t *slot);
+int usb_gamepad_stage_raw_input(const uint8_t *payload, uint64_t received_us,
+                                uint8_t *slot);
 int usb_gamepad_commit_raw_input(uint8_t slot);
 
 /* Convenience wrapper for producers that do not need an external epoch check.
@@ -66,6 +82,7 @@ bool usb_gamepad_kbd_ready_at(uint64_t now_us);
 
 /* Task-context snapshot used by the low-rate diagnostics path. */
 void usb_gamepad_get_runtime_stats(struct usb_gamepad_runtime_stats *out);
+void usb_gamepad_get_latency_stats(struct usb_gamepad_latency_stats *out);
 void usb_gamepad_get_link_status(struct usb_gamepad_link_status *out);
 
 void usb_gamepad_set_suspend_hooks(void (*on_suspend)(void),
@@ -76,7 +93,7 @@ void usb_gamepad_set_polling_rate(uint8_t mode);
 
 void usb_gamepad_set_dse_mode(bool dse);
 
-/* Stop DS5/keyboard traffic while preserving WebHID OTA reports. */
+/* Stop DS5/keyboard traffic while preserving vendor-HID OTA reports. */
 void usb_gamepad_set_maintenance_mode(bool active);
 
 void usb_gamepad_process_deferred(void);

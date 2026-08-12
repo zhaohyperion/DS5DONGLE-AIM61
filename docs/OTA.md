@@ -1,26 +1,21 @@
-# M61 网页 OTA 发布与传输规范
+# M61 签名 A/B OTA 发布与设备传输规范
 
-本项目的网页 OTA 更新 **Ai-M61-32S-Kit / USB Full-Speed 或 High-Speed** 应用固件。设备只能执行同速升级（FS→FS、HS→HS），不能通过 OTA 改变 USB 档位。第一次部署仍必须通过串口完整刷写受支持的 `boot2`、`partition.bin` 和带 OTA 功能的应用；完成这次基线刷写后，网页才可以更新单个 RAW 应用镜像。
+本协议用于更新 **Ai-M61-32S-Kit / USB Full-Speed 或 High-Speed** 应用固件。设备只能执行同速升级（FS→FS、HS→HS），不能通过 OTA 改变 USB 档位。第一次部署仍必须通过串口完整刷写受支持的 `boot2`、`partition.bin` 和带 OTA 功能的应用；完成基线刷写后，受信任的原生主机工具才可以更新单个 RAW 应用镜像。
 
-## 用户快速升级
+## 当前客户端状态
 
-1. 使用 Chrome 或 Edge 打开部署在 HTTPS/localhost 的 `web/` 页面。
-2. 通过原生 USB 飞线连接 DS5Dongle，点击“连接设备”。板载 CH340 Type-C 只负责供电、串口日志和线刷，不能替代原生 USB 数据线。
-3. 在 OTA 页面确认设备报告 `aim61`、当前 `fs`/`hs` 档位、RAW OTA、A/B 分区、强制签名和已配置发布公钥。
-4. 加载默认在线稳定版，网页会先验证清单、目标、版本、完整容器 SHA-256、RAW body SHA-256 和 P-256 签名。
-5. 确认后开始升级。不要断电、拔线、关闭页面或让电脑休眠。
-6. 设备写入非活动槽并重启；重新连接后确认版本。新固件未通过健康确认时，Boot2 应回滚旧槽。
+独立配置网页及其 OTA 客户端已经从仓库移除，后续由 Windows 原生工具接管。本文件继续定义固件端协议、签名清单和发布约束，不代表当前刷写器已经开放应用级 OTA。现阶段用户升级和恢复请使用刷写器的 UART 完整刷写；任何未来原生 OTA 客户端都必须完整实现本文的校验和 fail-closed 约束。
 
 默认稳定版清单来自当前仓库 latest Release。没有生产公钥、签名资产或正确 OTA 基线的设备必须拒绝升级；这种情况下请使用 Windows 刷写器执行完整 UART 恢复，而不是绕过校验。
 
-## 绝对不能通过网页写入的内容
+## 绝对不能通过应用级 OTA 写入的内容
 
 - `boot2_bl616_*.bin`
 - `partition.bin`（包括两份分区表）
 - 完整线刷 ZIP 或其中的任意地址配置
 - 与当前设备不同的 FS/HS 镜像、其他开发板镜像或超过 M61 备用 FW 槽的镜像
 
-网页只接受后缀为 `.bin.ota` 的 Bouffalo RAW OTA 容器。容器由 512 字节 `BL60X_OTA` 头和应用 body 组成；M61 备用 FW 槽最多容纳 `0x168000`（1,474,560）字节的 RAW body。
+主机更新器只允许发送后缀为 `.bin.ota` 的 Bouffalo RAW OTA 容器。容器由 512 字节 `BL60X_OTA` 头和应用 body 组成；M61 备用 FW 槽最多容纳 `0x168000`（1,474,560）字节的 RAW body。
 
 ## 发布清单
 
@@ -33,7 +28,7 @@
 
 Release 工作流只接受 `v?major.minor.patch` 标签：每部分为 0..254，且去掉可选 `v` 后的规范版本字符串最长 8 个 ASCII 字符。Bouffalo SDK 的 `ver_software[16]` 必须容纳 `EVENT_V<version>` 和终止 NUL；因此 `254.5.0` 可用，而 `254.254.254` 必须在构建前拒绝。工作流把同一个规范版本同时注入 `FIRMWARE_VERSION` 与 `PROJECT_SDK_VERSION`，SDK 生成的 OTA 头必须精确等于 `EVENT_Vmajor.minor.patch`，并与 manifest `version` 一致；发布工具在生成和验证阶段都会检查这条版本链。非 Release CI 构建使用 `3.5.1`。
 
-网页可通过 GitHub 的 latest 别名读取清单：
+未来原生更新器可通过 GitHub 的 latest 别名读取清单：
 
 ```text
 https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json
@@ -63,13 +58,13 @@ https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dong
 }
 ```
 
-`version` 在清单中规范化为不带 `v` 的 `major.minor.patch`，每部分必须为 0..254，整体最多 8 个字符。只有 `dev` 清单可以把 `signature` 设为 `null`，且生成、验证和网页端都必须显式开启开发模式；`beta` 和 `stable` 必须签名。工具、网页和设备都必须 fail closed，不能在公钥缺失、`key_id` 不匹配或签名失败时继续更新。
+`version` 在清单中规范化为不带 `v` 的 `major.minor.patch`，每部分必须为 0..254，整体最多 8 个字符。只有 `dev` 清单可以把 `signature` 设为 `null`，且生成和验证工具都必须显式开启开发模式；`beta` 和 `stable` 必须签名。发布工具、主机更新器和设备都必须 fail closed，不能在公钥缺失、`key_id` 不匹配或签名失败时继续更新。
 
-仓库默认固件和网页 UI 都不接受未签名升级。只有隔离测试固件显式设置构建环境变量 `DS5_OTA_ALLOW_UNSIGNED_DEV=1`，并且调用网页协议层时显式传入 `allowUnsignedDev`，才可配合 `--allow-unsigned-dev` 清单；该组合会打印不安全警告，绝不能作为串口基线或发布资产。
+仓库默认固件不接受未签名升级。只有隔离测试固件显式设置构建环境变量 `DS5_OTA_ALLOW_UNSIGNED_DEV=1`，且主机更新器明确启用开发模式，才可配合 `--allow-unsigned-dev` 清单；该组合必须显示不安全警告，绝不能作为串口基线或发布资产。
 
 ### 签名字节
 
-签名不是对 JSON 排版结果签名，而是先对下列恰好 57 字节的 canonical 做 SHA-256，再用 ECDSA secp256r1（P-256）签名。这样网页和 BL618 固件无需实现相同的 JSON canonicalization：
+签名不是对 JSON 排版结果签名，而是先对下列恰好 57 字节的 canonical 做 SHA-256，再用 ECDSA secp256r1（P-256）签名。这样主机更新器和 BL618 固件无需实现相同的 JSON canonicalization：
 
 ```text
 ASCII "DS5DONGLE-OTA-V1"（恰好 16 字节，无 NUL）
@@ -82,7 +77,7 @@ body_sha256:32 raw bytes
 
 字段顺序固定，无换行、无 NUL、无终止换行。签名在 manifest 中编码为固定 64 字节 `r || s`，其中 r、s 各为 32 字节大端整数，并使用 low-S 形式。`size`/`sha256` 用于浏览器校验整个下载文件，设备实际执行所需的 board、speed、版本、body 长度和 body SHA 则由签名绑定；设备还必须核对 RAW 外头与这些签名元数据一致。
 
-网页可使用部署变量注入 65 字节 SEC1 uncompressed P-256 公钥（`04 || X || Y`，Base64）和允许的 `key_id`；固件中也必须固化同一个生产公钥。仓库不提供、也不伪造生产密钥。PEM 公钥的部署形态如下，尖括号内容必须替换为真实公钥编码：
+发布系统和原生更新器使用 65 字节 SEC1 uncompressed P-256 公钥（`04 || X || Y`，Base64）及允许的 `key_id`；固件中也必须固化同一个生产公钥。仓库不提供、也不伪造生产密钥。PEM 公钥形态如下，尖括号内容必须替换为真实公钥编码：
 
 ```pem
 -----BEGIN PUBLIC KEY-----
@@ -97,7 +92,7 @@ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ota-p256-pri
 openssl pkey -in ota-p256-private.pem -pubout -out ota-p256-public.pem
 ```
 
-将 PEM 公钥严格验证并导出为固件/网页使用的 65 字节 SEC1 `04||X||Y`（工具会解析 SPKI 的 `id-ecPublicKey` 与 `prime256v1` OID，不会盲目截取文件尾部）：
+将 PEM 公钥严格验证并导出为固件、发布系统和原生更新器使用的 65 字节 SEC1 `04||X||Y`（工具会解析 SPKI 的 `id-ecPublicKey` 与 `prime256v1` OID，不会盲目截取文件尾部）：
 
 ```powershell
 python tools\ota_release.py export-public-key `
@@ -105,12 +100,11 @@ python tools\ota_release.py export-public-key `
   --output ota-p256-public-65b.bin
 ```
 
-`ota-p256-public-65b.bin` 必须 Base64 后作为同一份信任根提供给网页和固件；私钥不能执行这一部署步骤，更不能复制到源码树或网页资产中。GitHub 仓库需要配置：
+`ota-p256-public-65b.bin` 必须 Base64 后作为同一份信任根提供给原生更新器和固件；私钥不能执行这一部署步骤，更不能复制到源码树或客户端资产中。GitHub 仓库需要配置：
 
 - 加密 Secret `OTA_P256_PRIVATE_KEY_B64`：发布私钥 PEM 的 Base64，仅发布任务可读。
 - Repository variable `OTA_P256_PUBLIC_KEY_SEC1_B64`：上述 65 字节 `04||X||Y` 文件的 Base64。Release 固件矩阵会严格解码、检查长度与 `0x04` 前缀，再通过 `DS5_OTA_PUBLIC_KEY_FILE` 注入；缺失时 Release 构建直接失败。
 - Repository variable `OTA_P256_KEY_ID`：1..64 个 `[0-9A-Za-z._-]` 字符的公钥标识。
-- 网页部署变量 `NEXT_PUBLIC_OTA_P256_PUBLIC_KEY` 与 `NEXT_PUBLIC_OTA_KEY_ID`：分别使用相同的 SEC1 Base64 与相同 `key_id`。
 
 在 PowerShell 中生成两项 Base64 配置值时不要经文本编码转换：
 
@@ -119,7 +113,7 @@ python tools\ota_release.py export-public-key `
 [Convert]::ToBase64String([IO.File]::ReadAllBytes("ota-p256-public-65b.bin"))
 ```
 
-发布任务还会从私钥重新导出 SEC1 公钥，并与 `OTA_P256_PUBLIC_KEY_SEC1_B64` 做逐字节比较后才签清单；因此“固件内公钥、网页公钥、清单 `key_id`、签名私钥”不能静默错配。runner 只在临时目录中使用私钥，发布资产不包含它。普通 PR/push 构建不要求生产变量，生成的固件保持 `KEY_CONFIGURED=0` 并对签名 OTA fail closed，不能拿来作为可 OTA 的正式基线。
+发布任务还会从私钥重新导出 SEC1 公钥，并与 `OTA_P256_PUBLIC_KEY_SEC1_B64` 做逐字节比较后才签清单；因此“固件内公钥、原生更新器公钥、清单 `key_id`、签名私钥”不能静默错配。runner 只在临时目录中使用私钥，发布资产不包含它。普通 PR/push 构建不要求生产变量，生成的固件保持 `KEY_CONFIGURED=0` 并对签名 OTA fail closed，不能拿来作为可 OTA 的正式基线。
 
 ## 发布工具
 
@@ -164,16 +158,16 @@ python tools\ota_release.py verify `
   --public-key ota-p256-public.pem --expected-key-id release-2026
 ```
 
-High-Speed 使用完全相同的流程：把文件名中的 `fs` 改为 `hs`，并把 `generate` 命令的 `--usb-speed fs` 改为 `--usb-speed hs`。`usb_speed` 会进入57字节签名 canonical，不能在签名后修改；网页还会把清单档位与设备 `STATUS.usb_speed` 比较，设备端 `BEGIN` 再做一次同速校验。
+High-Speed 使用完全相同的流程：把文件名中的 `fs` 改为 `hs`，并把 `generate` 命令的 `--usb-speed fs` 改为 `--usb-speed hs`。`usb_speed` 会进入57字节签名 canonical，不能在签名后修改；主机更新器必须把清单档位与设备 `STATUS.usb_speed` 比较，设备端 `BEGIN` 再做一次同速校验。
 
 签名和验证调用 OpenSSL 的 ECDSA P-256 实现，并要求 OpenSSL 3.5 或更新版本的 provider 支持 RFC 6979 deterministic nonce（`nonce-type:1`）；相同镜像、版本、URL、密钥和 `key_id` 会生成逐字节相同的清单。工具负责 DER 与固定 64 字节 raw `r||s` 的严格转换；找不到或版本过旧的 OpenSSL 时工具直接失败，也可以通过 `--openssl <路径>` 指定可执行文件。Release 发布任务固定使用带 OpenSSL 3.5+ 的 Windows Runner，不能改回仍只有 OpenSSL 3.0 的 `ubuntu-24.04`。
 
-## WebHID 帧协议 v1
+## USB HID 帧协议 v1
 
-WebHID API 的 report ID 与 63 字节 payload 分开传递：
+协议层的 report ID 与 63 字节 payload 分开描述；具体原生 HID API 是否要求在缓冲区前缀 report ID，由主机平台决定：
 
-- `0xFA` 是 Output DATA report，网页使用 `sendReport(0xFA, payload)`。
-- `0xFC` 是 Feature CONTROL/STATUS report，网页使用 `sendFeatureReport` 和 `receiveFeatureReport`。
+- `0xFA` 是 Output DATA report，用于传输 OTA 数据帧。
+- `0xFC` 是 Feature CONTROL/STATUS report，用于控制请求和状态快照。
 
 两种 payload 都是固定 63 字节：
 
@@ -201,9 +195,9 @@ DATA type 固定为 `0x10`。CONTROL opcode 是 `BEGIN=0x01`、`AUTH=0x02`、`CO
 | 6..9 | 4 | RAW body size，uint32 LE |
 | 10..41 | 32 | RAW body SHA-256 |
 
-`AUTH` 只传固定 64 字节 P-256 raw `r||s`：第一帧 argument=`0`、len=`46`，第二帧 argument=`46`、len=`18`。设备用 BEGIN 元数据自行重建 57 字节 canonical，核对 RAW 头后使用固化的生产公钥验签；网页不能用自报 `key_id` 改变设备信任根。
+`AUTH` 只传固定 64 字节 P-256 raw `r||s`：第一帧 argument=`0`、len=`46`，第二帧 argument=`46`、len=`18`。设备用 BEGIN 元数据自行重建 57 字节 canonical，核对 RAW 头后使用固化的生产公钥验签；主机更新器不能用自报 `key_id` 改变设备信任根。
 
-网页使用 `receiveFeatureReport(0xFC)` 直接读取设备已发布的状态快照，不需要在每次轮询前再发送 `STATUS`，否则会无意义地占用控制队列。空闲快照的 session=`0`，可用于能力查询；传输期间快照带当前 session。设备返回 `ACK=0x80` 或 `ERROR=0xFF`，argument 是设备已接受的连续传输 offset，data length 固定为 44。`STATUS=0x05` 无 data 的控制帧仅保留作显式诊断/兼容请求，不是正常轮询的前置步骤：
+主机更新器直接读取 `0xFC` Feature Report 的设备状态快照，不需要在每次轮询前再发送 `STATUS`，否则会无意义地占用控制队列。空闲快照的 session=`0`，可用于能力查询；传输期间快照带当前 session。设备返回 `ACK=0x80` 或 `ERROR=0xFF`，argument 是设备已接受的连续传输 offset，data length 固定为 44。`STATUS=0x05` 无 data 的控制帧仅保留作显式诊断/兼容请求，不是正常轮询的前置步骤：
 
 | STATUS data 偏移 | 长度 | 含义 |
 |---|---:|---|
@@ -220,9 +214,9 @@ DATA type 固定为 `0x10`。CONTROL opcode 是 `BEGIN=0x01`、`AUTH=0x02`、`CO
 
 `capability bits` 当前定义为：bit0 A/B 槽、bit1 SHA-256、bit3 trial boot、bit4 maintenance、bit5 RAW OTA、bit6 帧 CRC32、bit7 延迟重启、bit8 强制签名、bit9 已配置发布公钥。bit2 `LIVE_RESUME` 保留但当前必须为 0；v1 的 DATA offset 只用于当前 session 内的顺序/落盘确认，不承诺页面重载、USB 断线或跨 session 续传。
 
-错误码 0..19 依次为：OK、BAD_MAGIC、BAD_VERSION、BAD_OPCODE、BAD_STATE、BAD_SESSION、BAD_OFFSET、BAD_LENGTH、BAD_CRC、BAD_TARGET、TOO_LARGE、QUEUE_FULL、FLASH、HASH、HEADER、INTERNAL、AUTH_REQUIRED、AUTH_FAILED、KEY_MISSING、TIMEOUT。正在进行的 session 连续 60 秒无活动时，设备以 `TIMEOUT=19` 中止并退出维护态；网页必须重新查询状态并用新 session 从 `BEGIN` 开始，不能沿用旧 offset。
+错误码 0..19 依次为：OK、BAD_MAGIC、BAD_VERSION、BAD_OPCODE、BAD_STATE、BAD_SESSION、BAD_OFFSET、BAD_LENGTH、BAD_CRC、BAD_TARGET、TOO_LARGE、QUEUE_FULL、FLASH、HASH、HEADER、INTERNAL、AUTH_REQUIRED、AUTH_FAILED、KEY_MISSING、TIMEOUT。正在进行的 session 连续 60 秒无活动时，设备以 `TIMEOUT=19` 中止并退出维护态；主机更新器必须重新查询状态并用新 session 从 `BEGIN` 开始，不能沿用旧 offset。
 
-协议固定向量（每行均为不含 report ID 的 63 字节 payload）如下；固件、Python 和网页测试必须逐字节一致：
+协议固定向量（每行均为不含 report ID 的 63 字节 payload）如下；固件、Python 和未来原生客户端测试必须逐字节一致：
 
 ```text
 BEGIN  = 4f54010178563412f02b0d002a010001020301f0290d00b0d51c58c8b9c1f458fadf16c7d375630ef51da4df81915893b05c0fa4ed8bc600000000f9c2342b
@@ -250,9 +244,9 @@ ERROR  = 4f5401ff78563412001000002c0611030100100000f02b0d0000821600fb03000001000
 
 - 在擦除前、写入约 1%、25%、50%、99% 和验证后切换前分别断电，旧固件仍能启动。
 - 对 DATA 帧做丢包、重复、乱序和 CRC 错误注入，设备只能确认连续且已写入的 offset。
-- 写入错误 body、错误 header SHA、错误 P-256 key/签名和降级版本，设备必须拒绝切换；错误完整文件 SHA 或 `key_id` 必须先被网页拒绝。
+- 写入错误 body、错误 header SHA、错误 P-256 key/签名和降级版本，设备必须拒绝切换；错误完整文件 SHA 或 `key_id` 必须先被主机更新器拒绝。
 - 新槽启动后主动触发崩溃/看门狗，Boot2 必须回滚旧槽；健康运行后再提交确认，之后不能误回滚。
 - 更新期间断开手柄并暂停 USB/蓝牙音频，确认 Flash 擦写不会破坏 DualSense 实时链路或 USB 控制传输。
-- OTA 不能擦除 PSM/KEY/DATA，蓝牙配对和网页配置在成功升级及回滚后都应保留。
+- OTA 不能擦除 PSM/KEY/DATA，蓝牙配对和设备配置在成功升级及回滚后都应保留。
 
-如果两槽或 Boot2/分区表已经损坏，网页 OTA 不能救援，必须回到串口完整刷写。
+如果两槽或 Boot2/分区表已经损坏，应用级 OTA 不能救援，必须回到串口完整刷写。

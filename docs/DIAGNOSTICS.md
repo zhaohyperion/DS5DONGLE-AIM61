@@ -3,7 +3,7 @@
 The supported diagnostics path is deliberately split into two low-overhead channels:
 
 - the on-board CH340 Type-C port carries boot and event logs at 115200 8-N-1;
-- native USB carries versioned WebHID state and diagnostic snapshots.
+- native USB carries versioned vendor-HID state and diagnostic snapshots.
 
 Do not print every USB, Bluetooth, controller, audio, or OTA packet. At 115200 baud the UART carries roughly 11.5 KB/s, far below the raw DS5 and audio data rate. Packet-by-packet logging changes the timing being measured and can itself create USB deadline misses, Bluetooth backpressure, and audio underruns.
 
@@ -52,17 +52,17 @@ The following paths must never print or hex-dump payloads:
 
 Hot paths only update preallocated counters, timestamps, maxima, and high-water marks. A low-priority task publishes an atomic diagnostic snapshot and performs any periodic logging.
 
-## Web diagnostics
+## Native diagnostics
 
-Native USB and the CH340 Type-C port are independent and can be used at the same time. The web diagnostics view reads structured snapshots at a low rate and can optionally connect to the CH340 through Web Serial. Collection is suspended during OTA transfer and verification. Exported JSON is local-only and redacts identifiers by default.
+Native USB and the CH340 Type-C port are independent and can be used at the same time. The Windows test center and device-debug page read structured USB HID snapshots at a low rate while the CH340 remains available for serial recovery. Collection is suspended during OTA transfer and verification. Exported JSON is local-only and redacts identifiers by default.
 
 For AI-M61, native USB still requires the USB_DM/USB_DP/GND wiring described in the main README. When the board is already powered through its Type-C port, do not connect the cut USB cable's red 5 V conductor.
 
-## WebHID Feature Report `0xFD`
+## Vendor HID Feature Report `0xFD`
 
 Runtime diagnostics use local vendor Feature Report `0xFD`. It is deliberately separate from configuration reports `0xF6`-`0xF9`, remapping `0xFB`, and OTA reports `0xFA`/`0xFC`; it is never forwarded to the controller. Both standard DualSense and DualSense Edge descriptors declare 63 payload bytes for this report.
 
-WebHID supplies the report ID separately. The layouts below therefore describe the 63-byte payload returned by `receiveFeatureReport(0xFD)`. CherryUSB internally prefixes that payload with `0xFD`, so the firmware class callback returns 64 bytes. The prefix is not part of the CRC.
+The layouts below describe the 63-byte payload of Feature Report `0xFD`. CherryUSB internally prefixes that payload with the report ID, so the firmware class callback returns 64 bytes. Native host APIs may expose that prefix differently; it is never part of the CRC.
 
 ### Page selection
 
@@ -70,26 +70,26 @@ Page zero is selected after boot. Select another page with:
 
 ```text
 sendFeatureReport(0xFD, [0x01, 0x01, page])
-                         |     |     +-- page 0..5
+                         |     |     +-- page 0..6
                          |     +-------- protocol version 1
                          +-------------- SELECT_PAGE opcode
 ```
 
 The firmware accepts a payload of at least three bytes because HID stacks may pad the report; trailing bytes are reserved and ignored. An invalid opcode, version, length, or page leaves the previous selection unchanged. SET performs only bounded byte validation and one atomic page store. It does not capture data, compute a CRC, allocate memory, log, or contact Bluetooth.
 
-The selector is device-global, so two browser tabs can race. A reader must validate the returned page index as well as the sequence. GET performs one fixed 63-byte copy from the current published bank.
+The selector is device-global, so two host readers can race. A reader must validate the returned page index as well as the sequence. GET performs one fixed 63-byte copy from the current published bank.
 
 ### Common response header
 
-Each second, the dedicated low-priority `diag` task builds all six pages in an inactive bank and atomically publishes the complete bank. Every page in one snapshot has the same sequence and monotonic time. The task runs at FreeRTOS priority 1 with 1024 RV32 stack words (4 KiB), below LED, microphone, audio, Bluetooth, OTA, USB, and timer work.
+Each second, the dedicated low-priority `diag` task builds all seven pages in an inactive bank and atomically publishes the complete bank. Every page in one snapshot has the same sequence and monotonic time. The task runs at FreeRTOS priority 1 with 1024 RV32 stack words (4 KiB), below LED, microphone, audio, Bluetooth, OTA, USB, and timer work.
 
 | Payload bytes | Type | Meaning |
 | --- | --- | --- |
 | `0..1` | ASCII | Magic `DG` |
 | `2` | `u8` | Protocol version, currently `1` |
 | `3` | `u8` | Header length, `16` |
-| `4` | `u8` | Page index, `0..5` |
-| `5` | `u8` | Page count, `6` |
+| `4` | `u8` | Page index, `0..6` |
+| `5` | `u8` | Page count, `7` |
 | `6` | `u8` | Used page-data bytes, at most `43` |
 | `7` | bitset | Snapshot flags |
 | `8..11` | `u32 LE` | Snapshot sequence |
@@ -128,7 +128,7 @@ All offsets below are relative to payload byte 16, the start of page data.
 | `29` | `u32` | Invalid SELECT count |
 | `33` | `u32` | Publish interval in milliseconds |
 
-Health bits are USB configured, BT connected, Edge controller, speaker active, microphone active, OTA maintenance, PSRAM present, and USB suspended in bits 0 through 7. USB lifecycle bits are configured, suspended, maintenance, Edge descriptor mode, HID IN busy, and keyboard interface registered in bits 0 through 5. Capability bits are paging, CRC32, coherent snapshots, monotonic time, read-only telemetry, and SELECT_PAGE in bits 0 through 5.
+Health bits are USB configured, BT connected, Edge controller, speaker active, microphone active, OTA maintenance, PSRAM present, and USB suspended in bits 0 through 7. USB lifecycle bits are configured, suspended, maintenance, Edge descriptor mode, HID IN busy, and keyboard interface registered in bits 0 through 5. Capability bits are paging, CRC32, coherent snapshots, monotonic time, read-only telemetry, SELECT_PAGE, and bridge-latency timing in bits 0 through 6.
 
 ### Page 1: USB and Bluetooth traffic (`data_len=43`)
 
@@ -225,8 +225,24 @@ Timing values saturate at `65535` microseconds rather than wrapping. Saturation 
 
 Memory/status bit 0 means the internal SDK memory-manager values are valid, bit 1 means PSRAM is present, bit 2 means PSRAM is intentionally excluded from the realtime allocator, and bit 3 means the copied OTA status passed its own CRC and protocol checks. The current free-byte value aggregates the active internal heaps selected by `kfree_size(0)`; the minimum is the lowest of those 1 Hz task-context samples since diagnostics initialization, not an allocator-event minimum. Neither value includes the reserved PSRAM diagnostic buffers. OTA states, errors, status flags, and capabilities retain the values documented in [OTA.md](OTA.md).
 
+### Page 6: M61 bridge latency (`data_len=24`)
+
+| Offset | Type | Meaning |
+| --- | --- | --- |
+| `0` | `u32` | Completed timed input transfers in the most recent diagnostic window |
+| `4,6` | `u16,u16` | Bluetooth HID callback entry to USB IN submission, average and maximum µs |
+| `8,10` | `u16,u16` | USB IN submission to transfer-complete callback, average and maximum µs |
+| `12` | `u16` | Bluetooth callback entry to USB completion, average µs |
+| `14,16` | `u16,u16` | Total bridge-latency P95 and P99 upper bounds in µs |
+| `18` | `u16` | Total bridge-latency maximum in µs |
+| `20` | `u16` | Diagnostic publish/window interval in milliseconds |
+| `22` | bitset | Saturation: bit 0 receive/submit, bit 1 USB transfer, bit 2 total |
+| `23` | `u8` | Bridge-latency schema version, currently `1` |
+
+This page measures only controller input reports that complete a USB IN transfer. The start timestamp is taken at the firmware's Bluetooth HID input callback, after lower radio/L2CAP processing; the endpoint timestamp is the M61 USB transfer-complete callback, before Windows application scheduling. Reports replaced by the depth-one latest-state queues are visible through the traffic/coalescing counters on page 1 but do not become latency samples. P95/P99 are realtime-safe histogram upper bounds, and all microsecond fields saturate at `65535` with the corresponding flag set.
+
 ## Runtime cost and safety
 
-USB, Bluetooth, audio, and OTA hot paths only increment existing aligned counters. They never format pages, calculate diagnostic CRCs, or print periodic diagnostics. Once per second, the priority-1 `diag` task copies the counters, samples heap and link state, formats six pages, computes six CRCs, and publishes one bank index after a RISC-V memory fence. Level-3 aggregate logs also run from this task every ten seconds. The next update writes the other bank.
+USB, Bluetooth, audio, and OTA hot paths only capture monotonic timestamps and update fixed-size aligned counters/histograms. They never format pages, calculate diagnostic CRCs, or print periodic diagnostics. Once per second, the priority-1 `diag` task copies the counters, samples heap and link state, formats seven pages, computes seven CRCs, and publishes one bank index after a RISC-V memory fence. Level-3 aggregate logs also run from this task every ten seconds. The next update writes the other bank.
 
 `runtime_diag_init()` prepares CRC-valid, zero-length sequence-0 pages before task startup. The optional task is allocated last, after bridge, audio, indicator, and OTA workers. If its 4 KiB stack cannot be allocated, boot emits one bounded error and continues the controller bridge; hosts keep receiving those sequence-0 pages instead of triggering work in EP0. `0xFD` remains available during OTA maintenance because its callbacks do not touch flash, hashes, queues, or the controller.

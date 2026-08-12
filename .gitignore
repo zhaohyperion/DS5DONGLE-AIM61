@@ -1,12 +1,8 @@
 build/
-!web/build/
-!web/build/sites-vite-plugin.cjs
 target/
 dist/
 .deps/
 .ota-keys/
-.sites-bin/
-.sites-publish/
 .device-verify/
 bouffalo_sdk_ds5/
 *.o

@@ -90,9 +90,7 @@ All notable changes to DS5Dongle BL618 firmware are documented here.
 
 ### Added
 - 按键映射（Button Remap）功能：支持将手柄任意按键重映射到其他手柄按键（暂不支持键盘映射）
-- 新增 HID Feature Report 0xFB 用于 Web 配置工具读写映射表
-- Web 配置界面新增控制器可视化面板，点击按键可设置映射；支持按实体手柄键直接捕获目标键
-- Web 配置页面改为 Tab 布局（配置 / 按键映射 / 操作说明），新增配对操作说明
+- 新增 HID Feature Report 0xFB 用于主机工具读写映射表
 
 ### Fixed
 - 修复首次连接失败率高：缩短各超时（CONNECTING 15s→8s，DISCONNECTING 5s→1.5s，L2CAP CFG 4s→2s）

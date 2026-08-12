@@ -102,8 +102,8 @@ also comply with the notices shipped by the exact SDK revision they use.
     https://github.com/littlefs-project/littlefs
     BSD-3-Clause
 
-6. Flasher, web application and distribution tooling
------------------------------------------------------
+6. Flasher and distribution tooling
+------------------------------------
 
 The Windows flasher embeds Bouffalo Lab BLFlashCommand and loader support files
 from the pinned SDK revision. It can download the WCH CH340/CH341 driver from
@@ -114,11 +114,6 @@ The flasher's Rust dependencies and exact versions are listed in:
 
   tools/ds5dongle-flasher/Cargo.toml
   tools/ds5dongle-flasher/Cargo.lock
-
-The web application's JavaScript dependencies and exact versions are listed in:
-
-  web/package.json
-  web/package-lock.json
 
 Each dependency remains subject to the copyright and license metadata in its
 own source distribution. Release redistributors should generate and ship the

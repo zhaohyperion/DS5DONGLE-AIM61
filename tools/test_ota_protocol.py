@@ -60,18 +60,8 @@ def header_integer(name: str) -> int:
     return int(match.group(1), 0)
 
 
-def typescript_vector(name: str) -> str:
-    text = (ROOT / "web" / "tests" / "protocol.test.ts").read_text(
-        encoding="utf-8"
-    )
-    match = re.search(rf"const {re.escape(name)}\s*=\s*(.*?);", text, re.DOTALL)
-    if not match:
-        raise AssertionError(f"missing TypeScript OTA vector {name}")
-    return "".join(re.findall(r'"([0-9a-f]+)"', match.group(1)))
-
-
 class OtaProtocolTests(unittest.TestCase):
-    def test_python_web_and_documented_vectors_are_identical(self) -> None:
+    def test_python_and_documented_vectors_are_identical(self) -> None:
         vectors = {
             "BEGIN_VECTOR": ("BEGIN", BEGIN_VECTOR),
             "AUTH0_VECTOR": ("AUTH0", AUTH0_VECTOR),
@@ -80,9 +70,8 @@ class OtaProtocolTests(unittest.TestCase):
             "ERROR_VECTOR": ("ERROR", ERROR_VECTOR),
         }
         documentation = (ROOT / "docs" / "OTA.md").read_text(encoding="utf-8")
-        for typescript_name, (label, expected) in vectors.items():
+        for _name, (label, expected) in vectors.items():
             with self.subTest(vector=label):
-                self.assertEqual(typescript_vector(typescript_name), expected)
                 self.assertRegex(
                     documentation,
                     rf"(?m)^{label}\s*=\s*{re.escape(expected)}$",

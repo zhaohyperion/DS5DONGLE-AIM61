@@ -1281,7 +1281,7 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
     LOG_DBG("[BT-CB] conn_connected EXIT\n");
 }
 
-static volatile int8_t cached_rssi = 1; /* 1 = unknown (positive → web shows "Unknown") */
+static volatile int8_t cached_rssi = 1; /* 1 = unknown; host tools display "Unknown" */
 static volatile bool switch_pending = false;
 
 static void conn_disconnected(struct bt_conn *conn, uint8_t reason)

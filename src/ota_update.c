@@ -971,7 +971,7 @@ static void process_abort(uint32_t session)
     ota_ctx.last_command = OTA_CTRL_ABORT;
     set_maintenance(false);
     publish_status();
-    LOG_INF("[OTA] WebHID transfer aborted\n");
+    LOG_INF("[OTA] USB HID transfer aborted\n");
 }
 
 static void process_status(uint32_t session)
@@ -983,7 +983,7 @@ static void process_status(uint32_t session)
     }
     /* STATUS is observational.  Keep the last error sticky so SET_REPORT
      * followed by GET_REPORT cannot erase a BEGIN/AUTH/DATA failure before
-     * the browser has had a chance to read it.  A successful mutating
+     * the host has had a chance to read it.  A successful mutating
      * command clears the error in its own handler. */
     publish_status();
 }
@@ -1174,7 +1174,7 @@ int ota_update_init(void)
     }
 
     publish_status();
-    LOG_INF("[OTA] WebHID A/B ready: board=%u usb=%u max=%lu key=%s sig=%s\n",
+    LOG_INF("[OTA] USB HID A/B ready: board=%u usb=%u max=%lu key=%s sig=%s\n",
             OTA_CURRENT_BOARD, OTA_CURRENT_USB_SPEED,
             (unsigned long)ota_ctx.max_image_size,
             release_key_ready ? "configured" : "missing",

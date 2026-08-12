@@ -68,6 +68,7 @@ enum diag_capabilities {
     DIAG_CAP_MONOTONIC   = 1u << 3,
     DIAG_CAP_READ_ONLY   = 1u << 4,
     DIAG_CAP_SELECT_PAGE = 1u << 5,
+    DIAG_CAP_BRIDGE_LATENCY = 1u << 6,
 };
 
 static void write_le16(uint8_t *out, uint16_t value)
@@ -164,6 +165,7 @@ void runtime_diag_task_update(uint64_t monotonic_us)
     diag_last_publish_us = monotonic_us;
 
     struct usb_gamepad_runtime_stats usb_stats;
+    struct usb_gamepad_latency_stats latency_stats;
     struct usb_gamepad_link_status link;
     struct bt_hid_tx_stats bt_stats;
     audio_runtime_diag_stats_t audio_stats;
@@ -171,6 +173,7 @@ void runtime_diag_task_update(uint64_t monotonic_us)
     uint8_t ota_status[OTA_REPORT_PAYLOAD_SIZE];
 
     usb_gamepad_get_runtime_stats(&usb_stats);
+    usb_gamepad_get_latency_stats(&latency_stats);
     usb_gamepad_get_link_status(&link);
     bt_hid_host_get_tx_stats(&bt_stats);
     audio_get_runtime_diag_stats(&audio_stats);
@@ -249,7 +252,7 @@ void runtime_diag_task_update(uint64_t monotonic_us)
     data[19] = bt_hid_host_is_switching() ? 1u : 0u;
     data[20] = DIAG_CAP_PAGED | DIAG_CAP_CRC32 | DIAG_CAP_COHERENT |
                DIAG_CAP_MONOTONIC | DIAG_CAP_READ_ONLY |
-               DIAG_CAP_SELECT_PAGE;
+               DIAG_CAP_SELECT_PAGE | DIAG_CAP_BRIDGE_LATENCY;
     write_le32(data + 21, diag_get_requests);
     write_le32(data + 25, diag_select_requests);
     write_le32(data + 29, diag_select_errors);
@@ -413,6 +416,45 @@ void runtime_diag_task_update(uint64_t monotonic_us)
                (ota_valid ? 8u : 0u);
     finish_page(pages[RUNTIME_DIAG_PAGE_OTA_MEMORY],
                 RUNTIME_DIAG_PAGE_OTA_MEMORY, 43, header_flags,
+                sequence, monotonic_ms);
+
+    /* Page 6: controller report received by M61 -> queued/published -> USB IN
+     * completion. Values describe the most recent diagnostic publish window.
+     * Timing fields are microseconds and saturate to u16; byte 22 marks any
+     * saturated family. P95/P99 are upper bounds from the realtime histogram. */
+    data = pages[RUNTIME_DIAG_PAGE_BRIDGE_LATENCY] +
+           RUNTIME_DIAG_DATA_OFFSET;
+    uint8_t bridge_timing_flags = 0;
+    write_le32(data + 0, latency_stats.samples);
+    write_le16(data + 4,
+               saturate_us(latency_stats.rx_to_submit_avg_us,
+                           1u << 0, &bridge_timing_flags));
+    write_le16(data + 6,
+               saturate_us(latency_stats.rx_to_submit_max_us,
+                           1u << 0, &bridge_timing_flags));
+    write_le16(data + 8,
+               saturate_us(latency_stats.usb_transfer_avg_us,
+                           1u << 1, &bridge_timing_flags));
+    write_le16(data + 10,
+               saturate_us(latency_stats.usb_transfer_max_us,
+                           1u << 1, &bridge_timing_flags));
+    write_le16(data + 12,
+               saturate_us(latency_stats.total_avg_us,
+                           1u << 2, &bridge_timing_flags));
+    write_le16(data + 14,
+               saturate_us(latency_stats.total_p95_us,
+                           1u << 2, &bridge_timing_flags));
+    write_le16(data + 16,
+               saturate_us(latency_stats.total_p99_us,
+                           1u << 2, &bridge_timing_flags));
+    write_le16(data + 18,
+               saturate_us(latency_stats.total_max_us,
+                           1u << 2, &bridge_timing_flags));
+    write_le16(data + 20, RUNTIME_DIAG_PUBLISH_INTERVAL_MS);
+    data[22] = bridge_timing_flags;
+    data[23] = 1u; /* bridge latency schema version */
+    finish_page(pages[RUNTIME_DIAG_PAGE_BRIDGE_LATENCY],
+                RUNTIME_DIAG_PAGE_BRIDGE_LATENCY, 24, header_flags,
                 sequence, monotonic_ms);
 
     __asm volatile("fence rw, rw" ::: "memory");

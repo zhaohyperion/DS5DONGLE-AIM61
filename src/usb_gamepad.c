@@ -256,7 +256,7 @@ static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
     0x95, 0x3F,
     0xB1, 0x02,
 
-    /* WebHID A/B OTA data and control/status reports. */
+    /* Vendor-HID A/B OTA data and control/status reports. */
     0x85, OTA_DATA_REPORT_ID,
     0x09, 0x3D,
     0x95, 0x3F,
@@ -656,12 +656,67 @@ static volatile uint8_t pending_index = 0;
 static volatile bool pending_active = false;
 static volatile uint32_t pending_generation = 0;
 static volatile uint32_t queued_generation = 0;
+static uint64_t pending_received_us[2];
+static uint64_t active_received_us;
+static uint64_t active_submit_us;
 
 static volatile uint32_t stat_input_updates = 0;
 static volatile uint32_t stat_input_coalesced = 0;
 static volatile uint32_t stat_transfers_started = 0;
 static volatile uint32_t stat_transfers_completed = 0;
 static volatile uint32_t stat_start_errors = 0;
+
+#define LATENCY_HIST_BUCKETS 16u
+static const uint32_t latency_hist_upper_us[LATENCY_HIST_BUCKETS] = {
+    250u, 500u, 750u, 1000u, 1500u, 2000u, 3000u, 4000u,
+    6000u, 8000u, 12000u, 16000u, 24000u, 32000u, 48000u,
+    UINT32_MAX,
+};
+static volatile uint32_t latency_samples;
+static volatile uint32_t latency_queue_sum_us;
+static volatile uint32_t latency_queue_max_us;
+static volatile uint32_t latency_usb_sum_us;
+static volatile uint32_t latency_usb_max_us;
+static volatile uint32_t latency_total_sum_us;
+static volatile uint32_t latency_total_max_us;
+static volatile uint32_t latency_total_hist[LATENCY_HIST_BUCKETS];
+
+ATTR_TCM_SECTION
+static uint32_t latency_delta_us(uint64_t end_us, uint64_t start_us)
+{
+    uint64_t delta = end_us >= start_us ? end_us - start_us : 0u;
+    return delta > UINT32_MAX ? UINT32_MAX : (uint32_t)delta;
+}
+
+ATTR_TCM_SECTION
+static void latency_record(uint64_t completed_us)
+{
+    if (active_received_us == 0u || active_submit_us == 0u)
+        return;
+    uint32_t queue_us = latency_delta_us(active_submit_us,
+                                         active_received_us);
+    uint32_t usb_us = latency_delta_us(completed_us, active_submit_us);
+    uint32_t total_us = latency_delta_us(completed_us,
+                                         active_received_us);
+    latency_samples++;
+    latency_queue_sum_us += queue_us;
+    latency_usb_sum_us += usb_us;
+    latency_total_sum_us += total_us;
+    if (queue_us > latency_queue_max_us)
+        latency_queue_max_us = queue_us;
+    if (usb_us > latency_usb_max_us)
+        latency_usb_max_us = usb_us;
+    if (total_us > latency_total_max_us)
+        latency_total_max_us = total_us;
+    for (uint32_t i = 0; i < LATENCY_HIST_BUCKETS; i++) {
+        if (total_us <= latency_hist_upper_us[i]) {
+            latency_total_hist[i]++;
+            break;
+        }
+    }
+    active_received_us = 0u;
+    active_submit_us = 0u;
+}
 
 /* Logging is deferred out of the TCM/USB interrupt path. */
 static volatile bool first_usb_send_log_pending = false;
@@ -685,6 +740,8 @@ static void try_send_pending(void)
         return;
     }
 
+    active_received_us = pending_received_us[index];
+    active_submit_us = bflb_mtimer_get_time_us();
     queued_generation = pending_generation;
     stat_transfers_started++;
     if (!first_usb_send_logged) {
@@ -699,6 +756,7 @@ ATTR_TCM_SECTION
 static void hid_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     (void)busid; (void)ep; (void)nbytes;
+    latency_record(bflb_mtimer_get_time_us());
     stat_transfers_completed++;
     ep_in_busy = false;
     try_send_pending();
@@ -749,6 +807,8 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_suspended = false;
         usb_was_configured_before_suspend = false;
         ep_in_busy = false;
+        active_received_us = 0u;
+        active_submit_us = 0u;
         kbd_ep_busy = false;
         kbd_ep_busy_since_us = 0;
         usbd_ep_start_read(busid, USB_GAMEPAD_EP_OUT,
@@ -763,6 +823,8 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_suspended = false;
         usb_was_configured_before_suspend = false;
         ep_in_busy = false;
+        active_received_us = 0u;
+        active_submit_us = 0u;
         kbd_ep_busy = false;
         kbd_ep_busy_since_us = 0;
         first_usb_send_logged = false;
@@ -783,6 +845,8 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_suspended = true;
         usb_configured = false;
         ep_in_busy = false;
+        active_received_us = 0u;
+        active_submit_us = 0u;
         kbd_ep_busy = false;
         kbd_ep_busy_since_us = 0;
         usb_audio_suspend();
@@ -796,6 +860,8 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_suspended = false;
         usb_was_configured_before_suspend = false;
         ep_in_busy = false;
+        active_received_us = 0u;
+        active_submit_us = 0u;
         kbd_ep_busy = false;
         kbd_ep_busy_since_us = 0;
         if (usb_configured) {
@@ -817,6 +883,8 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_suspended = false;
         usb_was_configured_before_suspend = false;
         ep_in_busy = false;
+        active_received_us = 0u;
+        active_submit_us = 0u;
         kbd_ep_busy = false;
         kbd_ep_busy_since_us = 0;
         first_usb_send_logged = false;
@@ -1210,7 +1278,8 @@ void usb_gamepad_set_polling_rate(uint8_t mode)
 }
 
 ATTR_TCM_SECTION
-int usb_gamepad_stage_raw_input(const uint8_t *payload, uint8_t *slot)
+int usb_gamepad_stage_raw_input(const uint8_t *payload, uint64_t received_us,
+                                uint8_t *slot)
 {
     if (!payload || !slot || usb_maintenance_mode)
         return -1;
@@ -1220,6 +1289,7 @@ int usb_gamepad_stage_raw_input(const uint8_t *payload, uint8_t *slot)
      * sole producer's commit operation. */
     uint8_t next = pending_index ^ 1U;
     memcpy(pending_payload[next], payload, DS5_USB_INPUT_PAYLOAD_LEN);
+    pending_received_us[next] = received_us;
     *slot = next;
     return 0;
 }
@@ -1228,8 +1298,11 @@ void usb_gamepad_set_maintenance_mode(bool active)
 {
     taskENTER_CRITICAL();
     usb_maintenance_mode = active;
-    if (active)
+    if (active) {
         pending_active = false;
+        active_received_us = 0u;
+        active_submit_us = 0u;
+    }
     taskEXIT_CRITICAL();
 }
 
@@ -1258,7 +1331,7 @@ ATTR_TCM_SECTION
 int usb_gamepad_send_raw_input(const uint8_t *payload)
 {
     uint8_t slot;
-    int ret = usb_gamepad_stage_raw_input(payload, &slot);
+    int ret = usb_gamepad_stage_raw_input(payload, 0u, &slot);
     if (ret < 0)
         return ret;
     return usb_gamepad_commit_raw_input(slot);
@@ -1337,6 +1410,66 @@ void usb_gamepad_get_runtime_stats(struct usb_gamepad_runtime_stats *out)
     out->transfers_completed = stat_transfers_completed;
     out->start_errors = stat_start_errors;
     taskEXIT_CRITICAL();
+}
+
+static uint32_t latency_percentile(const uint32_t *histogram,
+                                   uint32_t samples, uint32_t numerator)
+{
+    if (samples == 0u)
+        return 0u;
+    uint32_t target = (samples * numerator + 99u) / 100u;
+    uint32_t cumulative = 0u;
+    for (uint32_t i = 0; i < LATENCY_HIST_BUCKETS; i++) {
+        cumulative += histogram[i];
+        if (cumulative >= target)
+            return latency_hist_upper_us[i];
+    }
+    return UINT32_MAX;
+}
+
+void usb_gamepad_get_latency_stats(struct usb_gamepad_latency_stats *out)
+{
+    if (!out)
+        return;
+    uint32_t histogram[LATENCY_HIST_BUCKETS];
+    uint32_t samples;
+    uint32_t queue_sum;
+    uint32_t queue_max;
+    uint32_t usb_sum;
+    uint32_t usb_max;
+    uint32_t total_sum;
+    uint32_t total_max;
+
+    taskENTER_CRITICAL();
+    samples = latency_samples;
+    queue_sum = latency_queue_sum_us;
+    queue_max = latency_queue_max_us;
+    usb_sum = latency_usb_sum_us;
+    usb_max = latency_usb_max_us;
+    total_sum = latency_total_sum_us;
+    total_max = latency_total_max_us;
+    for (uint32_t i = 0; i < LATENCY_HIST_BUCKETS; i++) {
+        histogram[i] = latency_total_hist[i];
+        latency_total_hist[i] = 0u;
+    }
+    latency_samples = 0u;
+    latency_queue_sum_us = 0u;
+    latency_queue_max_us = 0u;
+    latency_usb_sum_us = 0u;
+    latency_usb_max_us = 0u;
+    latency_total_sum_us = 0u;
+    latency_total_max_us = 0u;
+    taskEXIT_CRITICAL();
+
+    out->samples = samples;
+    out->rx_to_submit_avg_us = samples ? queue_sum / samples : 0u;
+    out->rx_to_submit_max_us = queue_max;
+    out->usb_transfer_avg_us = samples ? usb_sum / samples : 0u;
+    out->usb_transfer_max_us = usb_max;
+    out->total_avg_us = samples ? total_sum / samples : 0u;
+    out->total_p95_us = latency_percentile(histogram, samples, 95u);
+    out->total_p99_us = latency_percentile(histogram, samples, 99u);
+    out->total_max_us = total_max;
 }
 
 void usb_gamepad_get_link_status(struct usb_gamepad_link_status *out)
@@ -1671,6 +1804,8 @@ void usb_soft_disconnect(void)
     usb_suspended = false;
     usb_was_configured_before_suspend = false;
     ep_in_busy = false;
+    active_received_us = 0u;
+    active_submit_us = 0u;
     kbd_ep_busy = false;
     kbd_ep_busy_since_us = 0;
     *phy_tst |= 1u;

@@ -57,6 +57,7 @@
 
 typedef struct {
     uint32_t connection_epoch;
+    uint64_t received_us;
     uint8_t report[DS5_BT_INPUT_REPORT_SIZE];
 } input_queue_item_t;
 
@@ -372,10 +373,11 @@ static void on_hid_primer(void)
  * endpoint critical section and cannot race a BT epoch transition. */
 static bool publish_usb_input_for_epoch(const uint8_t *payload,
                                         uint32_t expected_epoch,
-                                        bool expected_connected)
+                                        bool expected_connected,
+                                        uint64_t received_us)
 {
     uint8_t slot;
-    if (usb_gamepad_stage_raw_input(payload, &slot) < 0)
+    if (usb_gamepad_stage_raw_input(payload, received_us, &slot) < 0)
         return false;
 
     bool valid;
@@ -413,6 +415,9 @@ static void on_hid_input(const uint8_t *data, uint16_t len)
 
     if (len >= DS5_BT_INPUT_REPORT_SIZE) {
         input_queue_item_t item;
+        /* Start the bridge timer at the Bluetooth HID input callback entry.
+         * This intentionally includes validation, queueing and USB-task work. */
+        item.received_us = bflb_mtimer_get_time_us();
         bool accept;
         taskENTER_CRITICAL();
         accept = ds5_connected;
@@ -927,7 +932,7 @@ static void bt_task(void *arg)
             GLB_SW_System_Reset();
         }
 
-        /* React to disable_led config toggle in real-time */
+        /* Apply the disable_led config toggle in real time. */
         bool cur_led_disabled = config_led_disabled();
         if (cur_led_disabled != prev_led_disabled) {
             prev_led_disabled = cur_led_disabled;
@@ -1327,7 +1332,7 @@ static void usb_task(void *arg)
             neutral[2] = 0x7F; /* RX center */
             neutral[3] = 0x7F; /* RY center */
             neutral[7] = DS5_DPAD_NONE;
-            publish_usb_input_for_epoch(neutral, neutral_epoch, false);
+            publish_usb_input_for_epoch(neutral, neutral_epoch, false, 0u);
         }
 
         /* One timestamp services watchdog, policy and shortcut handling. */
@@ -1373,7 +1378,8 @@ static void usb_task(void *arg)
             remap_kbd_tick(raw_report + 2);
             remap_apply(raw_report + 2);
             if (publish_usb_input_for_epoch(
-                    raw_report + 2, queued_input.connection_epoch, true)) {
+                    raw_report + 2, queued_input.connection_epoch, true,
+                    queued_input.received_us)) {
                 last_input_us = now_us;
                 usb_fwd_count++;
                 if (usb_fwd_count == 1)
@@ -1561,7 +1567,7 @@ static void ota_maintenance_changed(bool active)
         ota_maintenance_mode = true;
         scan_after_disconnect = false;
 
-        /* Preserve the WebHID control interface while quiescing every
+        /* Preserve the vendor-HID control interface while quiescing every
          * latency-heavy DS5 and UAC data path before flash operations. */
         usb_gamepad_set_maintenance_mode(true);
         usb_audio_set_maintenance(true);
