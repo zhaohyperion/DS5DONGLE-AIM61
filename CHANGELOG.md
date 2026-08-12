@@ -1,6 +1,20 @@
 # Changelog
 
-All notable changes to DS5Dongle BL618 firmware are documented here.
+All notable changes to DS5DONGLE-AIM61 are documented here.
+
+---
+
+## Unreleased
+
+### Added
+- Windows 原生刷写器新增测试中心、设备调试、自动压力测试、七页运行诊断和 M61 内部桥接延迟统计
+
+### Changed
+- 设备测试、诊断和固件管理统一迁移到 Windows 原生工具
+- 公开配置网站已下线，不再提供网页配置、网页诊断或网页 OTA
+
+### Removed
+- 移除仓库中的独立配置网页、前端测试及托管配置
 
 ---
 

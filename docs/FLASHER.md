@@ -2,6 +2,8 @@
 
 `DS5Dongle-Flasher-Windows.exe` 是 DS5DONGLE-AIM61 的单文件 GUI/CLI 刷写器。它可以读取本仓库 GitHub Release，也可以刷写本地完整固件 ZIP 或解包目录。
 
+项目原有的公开配置网站已经下线。设备测试、运行诊断和固件管理均在本机刷写器内完成；诊断 JSON 不会自动上传，当前版本也不通过网页或原生界面执行应用级 OTA。
+
 ## 普通用户：在线选择固件并刷写
 
 1. 从 [DS5DONGLE-AIM61 Releases](https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest) 下载 `DS5Dongle-Flasher-Windows.exe`。

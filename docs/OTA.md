@@ -4,7 +4,7 @@
 
 ## 当前客户端状态
 
-独立配置网页及其 OTA 客户端已经从仓库移除，后续由 Windows 原生工具接管。本文件继续定义固件端协议、签名清单和发布约束，不代表当前刷写器已经开放应用级 OTA。现阶段用户升级和恢复请使用刷写器的 UART 完整刷写；任何未来原生 OTA 客户端都必须完整实现本文的校验和 fail-closed 约束。
+独立配置网页及其 OTA 客户端已经从仓库移除，原公开配置网站也已下线，不再提供网页 OTA。后续仅允许受信任的 Windows 原生工具接管设备更新。本文件继续定义固件端协议、签名清单和发布约束，不代表当前刷写器已经开放应用级 OTA。现阶段用户升级和恢复请使用刷写器的 UART 完整刷写；任何未来原生 OTA 客户端都必须完整实现本文的校验和 fail-closed 约束。
 
 默认稳定版清单来自当前仓库 latest Release。没有生产公钥、签名资产或正确 OTA 基线的设备必须拒绝升级；这种情况下请使用 Windows 刷写器执行完整 UART 恢复，而不是绕过校验。
 
@@ -75,7 +75,7 @@ body_size:u32 little-endian
 body_sha256:32 raw bytes
 ```
 
-字段顺序固定，无换行、无 NUL、无终止换行。签名在 manifest 中编码为固定 64 字节 `r || s`，其中 r、s 各为 32 字节大端整数，并使用 low-S 形式。`size`/`sha256` 用于浏览器校验整个下载文件，设备实际执行所需的 board、speed、版本、body 长度和 body SHA 则由签名绑定；设备还必须核对 RAW 外头与这些签名元数据一致。
+字段顺序固定，无换行、无 NUL、无终止换行。签名在 manifest 中编码为固定 64 字节 `r || s`，其中 r、s 各为 32 字节大端整数，并使用 low-S 形式。`size`/`sha256` 用于原生主机工具校验整个下载文件，设备实际执行所需的 board、speed、版本、body 长度和 body SHA 则由签名绑定；设备还必须核对 RAW 外头与这些签名元数据一致。
 
 发布系统和原生更新器使用 65 字节 SEC1 uncompressed P-256 公钥（`04 || X || Y`，Base64）及允许的 `key_id`；固件中也必须固化同一个生产公钥。仓库不提供、也不伪造生产密钥。PEM 公钥形态如下，尖括号内容必须替换为真实公钥编码：
 
@@ -212,7 +212,7 @@ DATA type 固定为 `0x10`。CONTROL opcode 是 `BEGIN=0x01`、`AUTH=0x02`、`CO
 | 20..27 | 8 | board、speed、format、max data、window、active slot、trial retry、reboot delay |
 | 28..43 | 16 | 当前固件版本，ASCII/NUL padded |
 
-`capability bits` 当前定义为：bit0 A/B 槽、bit1 SHA-256、bit3 trial boot、bit4 maintenance、bit5 RAW OTA、bit6 帧 CRC32、bit7 延迟重启、bit8 强制签名、bit9 已配置发布公钥。bit2 `LIVE_RESUME` 保留但当前必须为 0；v1 的 DATA offset 只用于当前 session 内的顺序/落盘确认，不承诺页面重载、USB 断线或跨 session 续传。
+`capability bits` 当前定义为：bit0 A/B 槽、bit1 SHA-256、bit3 trial boot、bit4 maintenance、bit5 RAW OTA、bit6 帧 CRC32、bit7 延迟重启、bit8 强制签名、bit9 已配置发布公钥。bit2 `LIVE_RESUME` 保留但当前必须为 0；v1 的 DATA offset 只用于当前 session 内的顺序/落盘确认，不承诺客户端重启、USB 断线或跨 session 续传。
 
 错误码 0..19 依次为：OK、BAD_MAGIC、BAD_VERSION、BAD_OPCODE、BAD_STATE、BAD_SESSION、BAD_OFFSET、BAD_LENGTH、BAD_CRC、BAD_TARGET、TOO_LARGE、QUEUE_FULL、FLASH、HASH、HEADER、INTERNAL、AUTH_REQUIRED、AUTH_FAILED、KEY_MISSING、TIMEOUT。正在进行的 session 连续 60 秒无活动时，设备以 `TIMEOUT=19` 中止并退出维护态；主机更新器必须重新查询状态并用新 session 从 `BEGIN` 开始，不能沿用旧 offset。
 
@@ -232,8 +232,8 @@ ERROR  = 4f5401ff78563412001000002c0611030100100000f02b0d0000821600fb03000001000
 2. `BEGIN` 发送总长度、目标、semver、签名 flag、RAW body 长度和 body SHA。
 3. stable 更新用两个 `AUTH` 帧发送 64 字节 P-256 raw `r||s`；设备重建 canonical 并验签成功后才进入接收状态。
 4. 用 `0xFA` 发送最多 46 字节的数据块。offset 是幂等序号；设备只确认连续写入的下一个 offset，重试同一 offset 不得重复推进。
-5. 周期性 GET `ACK/ERROR` 状态快照做背压和当前 session 的落盘进度确认，不为每次轮询额外排队 `STATUS` 命令。浏览器不得假定 USB 发送成功等于 Flash 已落盘；USB 断线、页面重载或 60 秒设备超时后必须用新 session 从 `BEGIN` 重启传输。
-6. `COMMIT` 后设备依次校验 BL60X RAW 头、已签名的 body 长度/body SHA 元数据和 stable P-256 签名；全部通过后才能切换启动分区。整个 `.bin.ota` 的 size/SHA 是浏览器下载完整性检查，不冒充设备侧签名校验。
+5. 周期性 GET `ACK/ERROR` 状态快照做背压和当前 session 的落盘进度确认，不为每次轮询额外排队 `STATUS` 命令。原生主机工具不得假定 USB 发送成功等于 Flash 已落盘；USB 断线、客户端重启或 60 秒设备超时后必须用新 session 从 `BEGIN` 重启传输。
+6. `COMMIT` 后设备依次校验 BL60X RAW 头、已签名的 body 长度/body SHA 元数据和 stable P-256 签名；全部通过后才能切换启动分区。整个 `.bin.ota` 的 size/SHA 是原生主机工具的下载完整性检查，不冒充设备侧签名校验。
 7. 重启并重新连接，读取新版本；新固件健康确认前保留旧槽。
 
 参考编码器与跨语言固定向量位于 `tools/ota_protocol.py` 和 `tools/test_ota_protocol.py`。
