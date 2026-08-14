@@ -1,252 +1,193 @@
-# M61 签名 A/B OTA 发布与设备传输规范
+# M61 签名 A/B OTA 规范（协议 v2）
 
-本协议用于更新 **Ai-M61-32S-Kit / USB Full-Speed 或 High-Speed** 应用固件。设备只能执行同速升级（FS→FS、HS→HS），不能通过 OTA 改变 USB 档位。第一次部署仍必须通过串口完整刷写受支持的 `boot2`、`partition.bin` 和带 OTA 功能的应用；完成基线刷写后，受信任的原生主机工具才可以更新单个 RAW 应用镜像。
+本规范只适用于 **Ai-M61-32S-Kit / BL618 / USB High-Speed** 的 v3.5.2 常用版和诊断版。刷写器 v1.3.1 已实现原生 OTA 客户端，可在“设备调试”页执行 `standard ↔ diagnostic` 双向切换。公开配置网站和网页 OTA 已下线。
 
-## 当前客户端状态
+第一次部署、Boot2/分区表损坏或两槽均不可启动时，必须使用 CH340 UART 完整刷写。OTA 只更新应用 RAW 镜像，绝不能写入 Boot2、分区表、整片 Flash、PSM/KEY/DATA 或其他板卡的镜像。
 
-独立配置网页及其 OTA 客户端已经从仓库移除，原公开配置网站也已下线，不再提供网页 OTA。后续仅允许受信任的 Windows 原生工具接管设备更新。本文件继续定义固件端协议、签名清单和发布约束，不代表当前刷写器已经开放应用级 OTA。现阶段用户升级和恢复请使用刷写器的 UART 完整刷写；任何未来原生 OTA 客户端都必须完整实现本文的校验和 fail-closed 约束。
+## 存储与性能边界
 
-默认稳定版清单来自当前仓库 latest Release。没有生产公钥、签名资产或正确 OTA 基线的设备必须拒绝升级；这种情况下请使用 Windows 刷写器执行完整 UART 恢复，而不是绕过校验。
+A/B 槽位位于板载 SPI Flash，不在 PSRAM。备用 FW 槽允许的 RAW body 最大为 `0x168000`（1,474,560）字节。PSRAM 断电即失且不是可信启动介质，不能保存可启动 OTA 槽。
 
-## 绝对不能通过应用级 OTA 写入的内容
+空闲时 OTA 任务阻塞等待队列，不产生持续 Flash 写入。传输时进入维护态，按 4 KiB SDK slice 写备用槽、计算 SHA-256、验证签名和头部；完成后由 Boot2 试运行/回滚机制接管。配对、映射和设置分区不随配置切换清除。
 
-- `boot2_bl616_*.bin`
-- `partition.bin`（包括两份分区表）
-- 完整线刷 ZIP 或其中的任意地址配置
-- 与当前设备不同的 FS/HS 镜像、其他开发板镜像或超过 M61 备用 FW 槽的镜像
+## Release 资产
 
-主机更新器只允许发送后缀为 `.bin.ota` 的 Bouffalo RAW OTA 容器。容器由 512 字节 `BL60X_OTA` 头和应用 body 组成；M61 备用 FW 槽最多容纳 `0x168000`（1,474,560）字节的 RAW body。
+v3.5.2 Release 只公开：
 
-## 发布清单
+- `DS5Dongle-aim61-hs-v3.5.2.zip`（Standard）；
+- `DS5Dongle-aim61-hs-diag-v3.5.2.zip`（Diagnostic）；
+- `DS5Dongle-Flasher-Windows-v1.3.1.exe`；
+- `SHA256SUMS.txt`。
 
-稳定版为两种USB档位各发布镜像和清单，共四个资产：
+每份固件 ZIP 同时包含完整 UART 文件、一个 `.bin.ota` 和对应 `.ota.json`。裸 OTA 文件不单独公开。刷写器先验证 GitHub asset digest，再验证 ZIP 安全性、清单、RAW 头、完整镜像 SHA-256 和正文 SHA-256；设备最终验证签名和目标。
 
-- `DS5Dongle-aim61-fs-v<version>.bin.ota`
-- `DS5Dongle-aim61-fs-stable.ota.json`
-- `DS5Dongle-aim61-hs-v<version>.bin.ota`
-- `DS5Dongle-aim61-hs-stable.ota.json`
+## RAW OTA 容器
 
-Release 工作流只接受 `v?major.minor.patch` 标签：每部分为 0..254，且去掉可选 `v` 后的规范版本字符串最长 8 个 ASCII 字符。Bouffalo SDK 的 `ver_software[16]` 必须容纳 `EVENT_V<version>` 和终止 NUL；因此 `254.5.0` 可用，而 `254.254.254` 必须在构建前拒绝。工作流把同一个规范版本同时注入 `FIRMWARE_VERSION` 与 `PROJECT_SDK_VERSION`，SDK 生成的 OTA 头必须精确等于 `EVENT_Vmajor.minor.patch`，并与 manifest `version` 一致；发布工具在生成和验证阶段都会检查这条版本链。非 Release CI 构建使用 `3.5.1`。
-
-未来原生更新器可通过 GitHub 的 latest 别名读取清单：
+Bouffalo SDK 输出：
 
 ```text
-https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-fs-stable.ota.json
-https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest/download/DS5Dongle-aim61-hs-stable.ota.json
+0..15   "BL60X_OTA_Ver1.0"
+16..19  "RAW "
+20..23  body_size, uint32 LE
+32..47  hardware version
+48..63  "EVENT_V3.5.2\0"
+64..95  SHA-256(body)
+512..   application body
 ```
 
-清单 schema 1 的字段集合是固定的，不允许缺失或附加字段：
+工具拒绝非 RAW、长度不一致、正文为空、超过备用槽、头部 hash 错误或版本链不一致的输入。
+
+## OTA 清单
 
 ```json
 {
-  "board": "aim61",
-  "body_sha256": "<RAW body 的 64 位小写 SHA-256>",
-  "body_size": 863216,
-  "channel": "stable",
   "schema": 1,
-  "sha256": "<整个 .bin.ota 的 64 位小写 SHA-256>",
+  "channel": "beta",
+  "board": "aim61",
+  "usb_speed": "hs",
+  "profile": "standard",
+  "version": "3.5.2",
+  "size": 906832,
+  "sha256": "<完整 .bin.ota SHA-256>",
+  "body_size": 906320,
+  "body_sha256": "<正文 SHA-256>",
+  "url": "https://github.com/.../DS5Dongle-aim61-hs-v3.5.2.zip",
   "signature": {
     "algorithm": "ECDSA-P256-SHA256",
-    "key_id": "<发布公钥标识>",
-    "scope": "DS5DONGLE-OTA-V1",
-    "value": "<64 字节 r||s 的标准 Base64>"
-  },
-  "size": 863728,
-  "url": "https://github.com/.../DS5Dongle-aim61-fs-v1.2.3.bin.ota",
-  "usb_speed": "fs",
-  "version": "1.2.3"
+    "key_id": "local-m61-2026",
+    "scope": "DS5DONGLE-OTA-V2",
+    "value": "<Base64 raw r||s, 64 bytes>"
+  }
 }
 ```
 
-`version` 在清单中规范化为不带 `v` 的 `major.minor.patch`，每部分必须为 0..254，整体最多 8 个字符。只有 `dev` 清单可以把 `signature` 设为 `null`，且生成和验证工具都必须显式开启开发模式；`beta` 和 `stable` 必须签名。发布工具、主机更新器和设备都必须 fail closed，不能在公钥缺失、`key_id` 不匹配或签名失败时继续更新。
+`channel` 只能是 `dev/beta/stable`。正式和预发布资产都必须签名；未签名只允许隔离开发固件在 `channel=dev` 且显式启用不安全构建开关时使用，不能作为公开基线。
 
-仓库默认固件不接受未签名升级。只有隔离测试固件显式设置构建环境变量 `DS5_OTA_ALLOW_UNSIGNED_DEV=1`，且主机更新器明确启用开发模式，才可配合 `--allow-unsigned-dev` 清单；该组合必须显示不安全警告，绝不能作为串口基线或发布资产。
+## P-256 签名 canonical
 
-### 签名字节
-
-签名不是对 JSON 排版结果签名，而是先对下列恰好 57 字节的 canonical 做 SHA-256，再用 ECDSA secp256r1（P-256）签名。这样主机更新器和 BL618 固件无需实现相同的 JSON canonicalization：
+签名输入固定为 58 字节：
 
 ```text
-ASCII "DS5DONGLE-OTA-V1"（恰好 16 字节，无 NUL）
-board_id:u8（aim61 = 1）
-usb_speed:u8（FS = 0，HS = 1）
-semver_major:u8 || semver_minor:u8 || semver_patch:u8
-body_size:u32 little-endian
-body_sha256:32 raw bytes
+"DS5DONGLE-OTA-V2"             16 bytes, no NUL
+board_id                         1 byte, AIM61=1
+usb_speed                        1 byte, FS=0 / HS=1
+profile                          1 byte, Standard=0 / Diagnostic=1
+semver                           3 bytes
+body_size                        4 bytes LE
+SHA-256(body)                   32 bytes
 ```
 
-字段顺序固定，无换行、无 NUL、无终止换行。签名在 manifest 中编码为固定 64 字节 `r || s`，其中 r、s 各为 32 字节大端整数，并使用 low-S 形式。`size`/`sha256` 用于原生主机工具校验整个下载文件，设备实际执行所需的 board、speed、版本、body 长度和 body SHA 则由签名绑定；设备还必须核对 RAW 外头与这些签名元数据一致。
+签名是 ECDSA P-256/SHA-256 的 raw `r||s`，要求 canonical low-S。配置进入 canonical，因此不能把 Standard 的签名套到 Diagnostic，也不能签名后修改板型、速度、版本、长度或正文 hash。
 
-发布系统和原生更新器使用 65 字节 SEC1 uncompressed P-256 公钥（`04 || X || Y`，Base64）及允许的 `key_id`；固件中也必须固化同一个生产公钥。仓库不提供、也不伪造生产密钥。PEM 公钥形态如下，尖括号内容必须替换为真实公钥编码：
+发布配置：
 
-```pem
------BEGIN PUBLIC KEY-----
-<BASE64_ENCODED_P256_SUBJECT_PUBLIC_KEY_INFO>
------END PUBLIC KEY-----
-```
+- Secret `OTA_P256_PRIVATE_KEY_B64`：私钥 PEM 的 Base64；
+- Variable `OTA_P256_PUBLIC_KEY_SEC1_B64`：65 字节未压缩 `04||X||Y` 公钥的 Base64；
+- Variable `OTA_P256_KEY_ID`：1..64 个 `[0-9A-Za-z._-]` 字符。
 
-生成真实密钥时让私钥保持离线，绝不能提交到仓库：
+Release 工作流从私钥重新导出公钥并与配置公钥逐字节比较，再为两种配置分别签名。Release 构建缺少公钥时直接失败；普通 PR 构建不持有生产私钥。
 
-```bash
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ota-p256-private.pem
-openssl pkey -in ota-p256-private.pem -pubout -out ota-p256-public.pem
-```
+## HID 传输
 
-将 PEM 公钥严格验证并导出为固件、发布系统和原生更新器使用的 65 字节 SEC1 `04||X||Y`（工具会解析 SPKI 的 `id-ecPublicKey` 与 `prime256v1` OID，不会盲目截取文件尾部）：
+报告 ID 不计入以下 63 字节 payload：
 
-```powershell
-python tools\ota_release.py export-public-key `
-  --public-key ota-p256-public.pem `
-  --output ota-p256-public-65b.bin
-```
+- Output Report `0xFA`：DATA；
+- Feature Report `0xFC` SET：BEGIN/AUTH/COMMIT/ABORT；
+- Feature Report `0xFC` GET：ACK/ERROR 状态快照。
 
-`ota-p256-public-65b.bin` 必须 Base64 后作为同一份信任根提供给原生更新器和固件；私钥不能执行这一部署步骤，更不能复制到源码树或客户端资产中。GitHub 仓库需要配置：
+通用帧：
 
-- 加密 Secret `OTA_P256_PRIVATE_KEY_B64`：发布私钥 PEM 的 Base64，仅发布任务可读。
-- Repository variable `OTA_P256_PUBLIC_KEY_SEC1_B64`：上述 65 字节 `04||X||Y` 文件的 Base64。Release 固件矩阵会严格解码、检查长度与 `0x04` 前缀，再通过 `DS5_OTA_PUBLIC_KEY_FILE` 注入；缺失时 Release 构建直接失败。
-- Repository variable `OTA_P256_KEY_ID`：1..64 个 `[0-9A-Za-z._-]` 字符的公钥标识。
+| payload offset | size | 内容 |
+|---:|---:|---|
+| 0..1 | 2 | `OT` |
+| 2 | 1 | protocol=`2` |
+| 3 | 1 | opcode |
+| 4..7 | 4 | session, uint32 LE |
+| 8..11 | 4 | 参数或 DATA offset |
+| 12 | 1 | data length，0..46 |
+| 13..58 | 46 | data，余下清零 |
+| 59..62 | 4 | CRC32/IEEE(payload 0..58), LE |
 
-在 PowerShell 中生成两项 Base64 配置值时不要经文本编码转换：
+操作码：`BEGIN=0x01`、`AUTH=0x02`、`COMMIT=0x03`、`ABORT=0x04`、`STATUS=0x05`、`DATA=0x10`、`ACK=0x80`、`ERROR=0xFF`。
 
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("ota-p256-private.pem"))
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("ota-p256-public-65b.bin"))
-```
+BEGIN data 固定 43 字节：
 
-发布任务还会从私钥重新导出 SEC1 公钥，并与 `OTA_P256_PUBLIC_KEY_SEC1_B64` 做逐字节比较后才签清单；因此“固件内公钥、原生更新器公钥、清单 `key_id`、签名私钥”不能静默错配。runner 只在临时目录中使用私钥，发布资产不包含它。普通 PR/push 构建不要求生产变量，生成的固件保持 `KEY_CONFIGURED=0` 并对签名 OTA fail closed，不能拿来作为可 OTA 的正式基线。
+| offset | size | 内容 |
+|---:|---:|---|
+| 0 | 1 | board=1 |
+| 1 | 1 | speed=1（HS） |
+| 2..4 | 3 | semver |
+| 5 | 1 | flags，bit0=SIGNED |
+| 6..9 | 4 | body size, LE |
+| 10..41 | 32 | body SHA-256 |
+| 42 | 1 | target profile，0/1 |
 
-## 发布工具
+AUTH 把 64 字节 raw 签名拆成 `offset=0,len=46` 和 `offset=46,len=18` 两帧。
 
-检查 SDK 生成的 RAW 容器（类型字段必须为四字节 `RAW `，末尾是空格）：
+GET `0xFC` 返回 `len=44` 状态数据，frame argument 是 `accepted_offset`：
 
-```powershell
-python tools\ota_release.py inspect `
-  --image build\build_out\ds5dongle_bl618_bl616.bin.ota
-```
+| data offset | size | 内容 |
+|---:|---:|---|
+| 0 | 1 | state |
+| 1 | 1 | error |
+| 2 | 1 | last request |
+| 3 | 1 | flags |
+| 4..7 | 4 | committed offset |
+| 8..11 | 4 | total OTA size |
+| 12..15 | 4 | max file size |
+| 16..19 | 4 | capabilities |
+| 20 | 1 | board |
+| 21 | 1 | speed |
+| 22 | 1 | format |
+| 23 | 1 | max DATA bytes |
+| 24 | 1 | window frames |
+| 25 | 1 | active slot |
+| 26 | 1 | trial retry |
+| 27 | 1 | reboot delay（100 ms） |
+| 28..43 | 16 | current version |
 
-工具会校验 512 字节头、头内 body 长度、头内 body SHA-256、M61 备用槽上限，并另外计算整个 `.bin.ota` 的发布 SHA-256。
+状态：`IDLE=0`、`AUTHORIZING=1`、`PREPARING=2`、`RECEIVING=3`、`VERIFYING=4`、`READY_REBOOT=5`、`ERROR=6`、`ABORTED=7`。
 
-生成可复现的未签名开发清单：
+能力 bit：0 A/B、1 SHA-256、3 trial boot、4 maintenance、5 RAW、6 frame CRC32、7 delayed reboot、8 signature required、9 key configured。bit2 live resume 预留且当前为 0；断线后必须新建 session 从 BEGIN 开始。
 
-```powershell
-python tools\ota_release.py generate `
-  --image build\build_out\ds5dongle_bl618_bl616.bin.ota `
-  --manifest dist\DS5Dongle-aim61-fs-dev.ota.json `
-  --channel dev --version v1.2.3 --allow-unsigned-dev `
-  --usb-speed fs `
-  --url https://downloads.example.test/DS5Dongle-aim61-fs-v1.2.3.bin.ota
-```
+错误码 0..19：OK、BAD_MAGIC、BAD_VERSION、BAD_OPCODE、BAD_STATE、BAD_SESSION、BAD_OFFSET、BAD_LENGTH、BAD_CRC、BAD_TARGET、TOO_LARGE、QUEUE_FULL、FLASH、HASH、HEADER、INTERNAL、AUTH_REQUIRED、AUTH_FAILED、KEY_MISSING、TIMEOUT。
 
-生成稳定版必须提供真实私钥和 `key_id`：
+## 主机状态机
 
-```powershell
-python tools\ota_release.py generate `
-  --image dist\DS5Dongle-aim61-fs-v1.2.3.bin.ota `
-  --manifest dist\DS5Dongle-aim61-fs-stable.ota.json `
-  --channel stable --version v1.2.3 `
-  --usb-speed fs `
-  --url https://github.com/example/project/releases/download/v1.2.3/DS5Dongle-aim61-fs-v1.2.3.bin.ota `
-  --private-key C:\secure\ota-p256-private.pem --key-id release-2026
-```
+1. GET STATUS，确认 IDLE、AIM61、HS、协议 v2、最大文件长度、强制签名且已配置公钥。
+2. 生成非零 session，发送 BEGIN；等待 AUTHORIZING。
+3. 发送两帧 AUTH；等待 RECEIVING。设备在任务上下文验证 P-256 并准备备用槽。
+4. 按设备窗口发送最多 46 字节 DATA，批次后轮询 `accepted_offset`，不让 USB 回调队列溢出。
+5. 全部接受后发送 COMMIT。设备提交末尾 slice、核对完整/正文 hash、RAW 头和版本，标记试运行槽。
+6. 等待 READY_REBOOT 或计划内 USB 断开；重启后重新读取 `0xF8` 的 `版本|配置`。
+7. 任一步骤失败时尽力发送 ABORT；原活动槽不被替换。60 秒无活动自动 TIMEOUT。
 
-验证清单、镜像和签名：
+同版本只允许配置不同的显式切换；同版本同配置被拒绝，版本降级被拒绝。v3.5.2 回退 v3.5.1 必须走 UART 完整刷写。
 
-```powershell
-python tools\ota_release.py verify `
-  --image dist\DS5Dongle-aim61-fs-v1.2.3.bin.ota `
-  --manifest dist\DS5Dongle-aim61-fs-stable.ota.json `
-  --public-key ota-p256-public.pem --expected-key-id release-2026
-```
+## 固定协议向量
 
-High-Speed 使用完全相同的流程：把文件名中的 `fs` 改为 `hs`，并把 `generate` 命令的 `--usb-speed fs` 改为 `--usb-speed hs`。`usb_speed` 会进入57字节签名 canonical，不能在签名后修改；主机更新器必须把清单档位与设备 `STATUS.usb_speed` 比较，设备端 `BEGIN` 再做一次同速校验。
-
-签名和验证调用 OpenSSL 的 ECDSA P-256 实现，并要求 OpenSSL 3.5 或更新版本的 provider 支持 RFC 6979 deterministic nonce（`nonce-type:1`）；相同镜像、版本、URL、密钥和 `key_id` 会生成逐字节相同的清单。工具负责 DER 与固定 64 字节 raw `r||s` 的严格转换；找不到或版本过旧的 OpenSSL 时工具直接失败，也可以通过 `--openssl <路径>` 指定可执行文件。Release 发布任务固定使用带 OpenSSL 3.5+ 的 Windows Runner，不能改回仍只有 OpenSSL 3.0 的 `ubuntu-24.04`。
-
-## USB HID 帧协议 v1
-
-协议层的 report ID 与 63 字节 payload 分开描述；具体原生 HID API 是否要求在缓冲区前缀 report ID，由主机平台决定：
-
-- `0xFA` 是 Output DATA report，用于传输 OTA 数据帧。
-- `0xFC` 是 Feature CONTROL/STATUS report，用于控制请求和状态快照。
-
-两种 payload 都是固定 63 字节：
-
-| 字节 | 长度 | 含义 |
-|---|---:|---|
-| 0..1 | 2 | ASCII `OT` |
-| 2 | 1 | 协议版本 `1` |
-| 3 | 1 | DATA type 或 CONTROL opcode |
-| 4..7 | 4 | session，uint32 little-endian |
-| 8..11 | 4 | DATA offset 或控制参数，uint32 little-endian |
-| 12 | 1 | data length，最大 46 |
-| 13..58 | 46 | data，未使用部分必须补零 |
-| 59..62 | 4 | CRC-32/ISO-HDLC little-endian，覆盖字节 0..58 |
-
-DATA type 固定为 `0x10`。CONTROL opcode 是 `BEGIN=0x01`、`AUTH=0x02`、`COMMIT=0x03`、`ABORT=0x04`、`STATUS=0x05`、`ACK=0x80`、`ERROR=0xFF`。
-
-`BEGIN` 的 argument 是完整 `.bin.ota` 大小，data length 固定为 42：
-
-| BEGIN data 偏移 | 长度 | 含义 |
-|---|---:|---|
-| 0 | 1 | board ID，M61=`1` |
-| 1 | 1 | USB speed，FS=`0` |
-| 2..4 | 3 | semver major/minor/patch |
-| 5 | 1 | flags；stable signed=`bit0` |
-| 6..9 | 4 | RAW body size，uint32 LE |
-| 10..41 | 32 | RAW body SHA-256 |
-
-`AUTH` 只传固定 64 字节 P-256 raw `r||s`：第一帧 argument=`0`、len=`46`，第二帧 argument=`46`、len=`18`。设备用 BEGIN 元数据自行重建 57 字节 canonical，核对 RAW 头后使用固化的生产公钥验签；主机更新器不能用自报 `key_id` 改变设备信任根。
-
-主机更新器直接读取 `0xFC` Feature Report 的设备状态快照，不需要在每次轮询前再发送 `STATUS`，否则会无意义地占用控制队列。空闲快照的 session=`0`，可用于能力查询；传输期间快照带当前 session。设备返回 `ACK=0x80` 或 `ERROR=0xFF`，argument 是设备已接受的连续传输 offset，data length 固定为 44。`STATUS=0x05` 无 data 的控制帧仅保留作显式诊断/兼容请求，不是正常轮询的前置步骤：
-
-| STATUS data 偏移 | 长度 | 含义 |
-|---|---:|---|
-| 0 | 1 | update state |
-| 1 | 1 | error code |
-| 2 | 1 | last request opcode |
-| 3 | 1 | status flags |
-| 4..7 | 4 | committed offset，uint32 LE |
-| 8..11 | 4 | complete OTA size |
-| 12..15 | 4 | inactive slot 最大完整 OTA size |
-| 16..19 | 4 | capability bits |
-| 20..27 | 8 | board、speed、format、max data、window、active slot、trial retry、reboot delay |
-| 28..43 | 16 | 当前固件版本，ASCII/NUL padded |
-
-`capability bits` 当前定义为：bit0 A/B 槽、bit1 SHA-256、bit3 trial boot、bit4 maintenance、bit5 RAW OTA、bit6 帧 CRC32、bit7 延迟重启、bit8 强制签名、bit9 已配置发布公钥。bit2 `LIVE_RESUME` 保留但当前必须为 0；v1 的 DATA offset 只用于当前 session 内的顺序/落盘确认，不承诺客户端重启、USB 断线或跨 session 续传。
-
-错误码 0..19 依次为：OK、BAD_MAGIC、BAD_VERSION、BAD_OPCODE、BAD_STATE、BAD_SESSION、BAD_OFFSET、BAD_LENGTH、BAD_CRC、BAD_TARGET、TOO_LARGE、QUEUE_FULL、FLASH、HASH、HEADER、INTERNAL、AUTH_REQUIRED、AUTH_FAILED、KEY_MISSING、TIMEOUT。正在进行的 session 连续 60 秒无活动时，设备以 `TIMEOUT=19` 中止并退出维护态；主机更新器必须重新查询状态并用新 session 从 `BEGIN` 开始，不能沿用旧 offset。
-
-协议固定向量（每行均为不含 report ID 的 63 字节 payload）如下；固件、Python 和未来原生客户端测试必须逐字节一致：
+以下 payload 均为 63 字节（不含 HID report ID）：
 
 ```text
-BEGIN  = 4f54010178563412f02b0d002a010001020301f0290d00b0d51c58c8b9c1f458fadf16c7d375630ef51da4df81915893b05c0fa4ed8bc600000000f9c2342b
-AUTH0  = 4f54010278563412000000002e000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2dea3513bc
-AUTH46 = 4f540102785634122e000000122e2f303132333435363738393a3b3c3d3e3f00000000000000000000000000000000000000000000000000000000ae93fa7f
-ACK    = 4f54018078563412401000002c0300020100100000f02b0d0000821600fb0300000100012e1000f20f424c3631382d44533520332e350000000000f75742f8
-ERROR  = 4f5401ff78563412001000002c0611030100100000f02b0d0000821600fb0300000100012e1000f20f424c3631382d44533520332e350000000000ef54ddf6
+BEGIN  = 4f54020178563412f02b0d002b010101020301f0290d00b0d51c58c8b9c1f458fadf16c7d375630ef51da4df81915893b05c0fa4ed8bc6000000007c9724c8
+AUTH0  = 4f54020278563412000000002e000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d4643ec95
+AUTH46 = 4f540202785634122e000000122e2f303132333435363738393a3b3c3d3e3f0000000000000000000000000000000000000000000000000000000002e50556
+ACK    = 4f54028078563412401000002c0300020100100000f02b0d0000821600fb0300000100012e1000f20f424c3631382d44533520332e3500000000005b21bdd1
+ERROR  = 4f5402ff78563412001000002c0611030100100000f02b0d0000821600fb0300000100012e1000f20f424c3631382d44533520332e350000000000432222df
 ```
 
-推荐流程：
+这些向量由 `tools/test_ota_protocol.py` 锁定。
 
-1. 读取 `STATUS`，确认设备是 `aim61/fs` 或 `aim61/hs`、协议版本匹配且当前不在升级。
-2. `BEGIN` 发送总长度、目标、semver、签名 flag、RAW body 长度和 body SHA。
-3. stable 更新用两个 `AUTH` 帧发送 64 字节 P-256 raw `r||s`；设备重建 canonical 并验签成功后才进入接收状态。
-4. 用 `0xFA` 发送最多 46 字节的数据块。offset 是幂等序号；设备只确认连续写入的下一个 offset，重试同一 offset 不得重复推进。
-5. 周期性 GET `ACK/ERROR` 状态快照做背压和当前 session 的落盘进度确认，不为每次轮询额外排队 `STATUS` 命令。原生主机工具不得假定 USB 发送成功等于 Flash 已落盘；USB 断线、客户端重启或 60 秒设备超时后必须用新 session 从 `BEGIN` 重启传输。
-6. `COMMIT` 后设备依次校验 BL60X RAW 头、已签名的 body 长度/body SHA 元数据和 stable P-256 签名；全部通过后才能切换启动分区。整个 `.bin.ota` 的 size/SHA 是原生主机工具的下载完整性检查，不冒充设备侧签名校验。
-7. 重启并重新连接，读取新版本；新固件健康确认前保留旧槽。
+## 发布与验证
 
-参考编码器与跨语言固定向量位于 `tools/ota_protocol.py` 和 `tools/test_ota_protocol.py`。
+```powershell
+python tools\ota_release.py inspect --image build\build_out\ds5dongle_bl618_bl616.bin.ota
+python tools\ota_release.py generate --image <image.bin.ota> --manifest <profile.ota.json> `
+  --channel beta --version 3.5.2 --usb-speed hs --profile standard `
+  --url https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/download/v3.5.2/DS5Dongle-aim61-hs-v3.5.2.zip `
+  --private-key <private.pem> --key-id <key-id>
+python tools\ota_release.py verify --image <image.bin.ota> --manifest <profile.ota.json> `
+  --public-key <public.pem> --expected-key-id <key-id>
+```
 
-## 实机发布门槛
-
-首次完整线刷后，至少完成以下 M61 断电/回滚测试才可开启 stable：
-
-- 在擦除前、写入约 1%、25%、50%、99% 和验证后切换前分别断电，旧固件仍能启动。
-- 对 DATA 帧做丢包、重复、乱序和 CRC 错误注入，设备只能确认连续且已写入的 offset。
-- 写入错误 body、错误 header SHA、错误 P-256 key/签名和降级版本，设备必须拒绝切换；错误完整文件 SHA 或 `key_id` 必须先被主机更新器拒绝。
-- 新槽启动后主动触发崩溃/看门狗，Boot2 必须回滚旧槽；健康运行后再提交确认，之后不能误回滚。
-- 更新期间断开手柄并暂停 USB/蓝牙音频，确认 Flash 擦写不会破坏 DualSense 实时链路或 USB 控制传输。
-- OTA 不能擦除 PSM/KEY/DATA，蓝牙配对和设备配置在成功升级及回滚后都应保留。
-
-如果两槽或 Boot2/分区表已经损坏，应用级 OTA 不能救援，必须回到串口完整刷写。
+发布前应验证：正常升级、Standard/Diagnostic 双向切换、传输中掉电、签名/hash/目标错误拒绝、试运行失败回滚、配对与设置保留、UART 救援。v3.5.2 预发布按用户要求不等待真机测试，但不能把“CI 通过”描述成“真机已验证”。

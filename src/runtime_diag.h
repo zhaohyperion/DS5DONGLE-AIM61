@@ -11,12 +11,13 @@
 #define RUNTIME_DIAG_REPORT_ID          0xFDu
 #define RUNTIME_DIAG_REPORT_SIZE        63u
 #define RUNTIME_DIAG_CRC_OFFSET         59u
-#define RUNTIME_DIAG_PROTOCOL_VERSION   1u
+#define RUNTIME_DIAG_PROTOCOL_VERSION   2u
 #define RUNTIME_DIAG_HEADER_SIZE        16u
 #define RUNTIME_DIAG_DATA_OFFSET        16u
 #define RUNTIME_DIAG_DATA_MAX           43u
 #define RUNTIME_DIAG_PAGE_COUNT         7u
 #define RUNTIME_DIAG_SELECT_PAGE        0x01u
+#define RUNTIME_DIAG_SET_SESSION        0x02u
 #define RUNTIME_DIAG_SELECT_SIZE        3u
 #define RUNTIME_DIAG_PUBLISH_INTERVAL_MS 1000u
 
@@ -33,6 +34,7 @@ enum runtime_diag_page {
     RUNTIME_DIAG_PAGE_BRIDGE_LATENCY = 6,
 };
 
+#if DS5_DIAGNOSTIC_BUILD
 /* Prepare valid page-zero-selected reports before USB enumeration starts. */
 void runtime_diag_init(void);
 
@@ -45,5 +47,6 @@ void runtime_diag_task_update(uint64_t monotonic_us);
 bool runtime_diag_select_page_from_isr(const uint8_t *payload, uint32_t len);
 void runtime_diag_get_selected_report(
     uint8_t out[RUNTIME_DIAG_REPORT_SIZE]);
+#endif
 
 #endif /* RUNTIME_DIAG_H */

@@ -34,15 +34,15 @@
 #define OTA_CONTROL_REPORT_ID    0xFCu
 #define OTA_REPORT_PAYLOAD_SIZE  63u
 #define OTA_REPORT_CRC_OFFSET    59u
-#define OTA_PROTOCOL_VERSION     1u
+#define OTA_PROTOCOL_VERSION     2u
 #define OTA_DATA_BYTES_MAX       46u
 #define OTA_SDK_SLICE_SIZE       4096u
 #define OTA_BOUFFALO_HEADER_SIZE 512u
 #define OTA_REBOOT_DELAY_100MS   15u
 #define OTA_WINDOW_FRAMES        16u
 #define OTA_AUTH_SIGNATURE_SIZE  64u
-#define OTA_SIGN_CANONICAL_SIZE  57u
-#define OTA_BEGIN_DATA_SIZE      42u
+#define OTA_SIGN_CANONICAL_SIZE  58u
+#define OTA_BEGIN_DATA_SIZE      43u
 #define OTA_STATUS_DATA_SIZE     44u
 
 #define OTA_FRAME_MAGIC_0 'O'
@@ -107,6 +107,17 @@ enum ota_usb_speed {
     OTA_USB_HIGH_SPEED = 1,
 };
 
+enum ota_build_profile {
+    OTA_PROFILE_STANDARD   = 0,
+    OTA_PROFILE_DIAGNOSTIC = 1,
+};
+
+#if DS5_DIAGNOSTIC_BUILD
+#define OTA_CURRENT_BUILD_PROFILE OTA_PROFILE_DIAGNOSTIC
+#else
+#define OTA_CURRENT_BUILD_PROFILE OTA_PROFILE_STANDARD
+#endif
+
 enum ota_image_format {
     OTA_FORMAT_RAW_OTA = 1,
 };
@@ -131,6 +142,7 @@ enum ota_begin_data_offset {
     OTA_BEGIN_FLAGS_OFFSET       = 5,
     OTA_BEGIN_BODY_LEN_OFFSET    = 6,  /* uint32 LE */
     OTA_BEGIN_BODY_SHA_OFFSET    = 10, /* 32 bytes */
+    OTA_BEGIN_PROFILE_OFFSET     = 42,
 };
 
 enum ota_begin_flags {

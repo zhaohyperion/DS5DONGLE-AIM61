@@ -1,341 +1,146 @@
-# DS5DONGLE-AIM61
+# DS5Dongle AIM61
 
-基于 Bouffalo BL616/BL618 的 DualSense / DualSense Edge 无线转 USB 适配器。
-
-它通过 Bluetooth Classic HID 连接手柄，再向电脑呈现为标准有线 DualSense USB 设备；支持按键、摇杆、触摸板、陀螺仪、自适应扳机、灯光、震动以及双向 USB Audio。
+面向 Ai-M61-32S-Kit（BL618）的 DualSense / DualSense Edge 蓝牙转 USB 适配器固件，以及配套的 Windows 原生测试、诊断和刷写工具。
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
-![Target](https://img.shields.io/badge/default-Ai--M61--32S--Kit-orange)
-![Opus](https://img.shields.io/badge/Opus-1.5.2-green)
-![USB](https://img.shields.io/badge/USB-Full--Speed%20recommended-7952b3)
+![Firmware](https://img.shields.io/badge/firmware-v3.5.2-orange)
+![Flasher](https://img.shields.io/badge/flasher-v1.3.1-0067b8)
+![USB](https://img.shields.io/badge/USB-High--Speed-success)
 
-> [!IMPORTANT]
-> 这是非官方开源项目，与 Sony Interactive Entertainment 无关。“DualSense”“DualSense Edge”和“PlayStation”均为其商标。项目模拟 Sony USB VID/PID，使主机将设备识别为有线手柄，请自行评估使用风险。
+> 本项目与 Sony Interactive Entertainment 无关。“DualSense”“DualSense Edge”和“PlayStation”是其各自权利人的商标。固件模拟 Sony USB VID/PID，请自行评估使用环境和风险。
 
-> [!WARNING]
-> Ai-M61-32S-Kit 板载 Type-C 连接的是 CH340 串口，只用于供电、日志和烧录。手柄 USB 数据必须从 GPIO37/38 引出，不能只插板载 Type-C。
+## v3.5.2 发布组成
 
-## 项目状态
+v3.5.2 只提供 Ai-M61 High-Speed 两种配置，USB 描述符、产品名、VID/PID 和核心转发行为保持一致：
 
-| 项目 | 当前状态 |
-|---|---|
-| 默认硬件 | Ai-M61-32S-Kit / BL618 |
-| 默认 USB 模式 | Full-Speed 12 Mbps，兼容性优先 |
-| 可选 USB 模式 | High-Speed 480 Mbps |
-| 固件开发版本 | `3.5.1`；正式 Release 版本由标签注入 |
-| 音频编解码 | Opus 1.5.2，固定点，E907 DSP 快速路径 |
-| 安全 OTA 基础 | Ai-M61 Full-Speed / High-Speed，P-256 签名、同速校验、A/B 分区、试运行回滚；等待原生工具接管 |
-| 本地普通构建 | 可串口刷写；未注入发布公钥时，生产 OTA 会安全拒绝 |
-| 用户工具 | Windows 原生测试中心、设备调试与固件刷写器；公开配置网站已下线 |
+| 固件 | 文件 | 用途 |
+|---|---|---|
+| 常用版 HS | `DS5Dongle-aim61-hs-v3.5.2.zip` | 日常使用；性能优先，不枚举 `0xFD`，不创建诊断任务 |
+| 诊断版 HS | `DS5Dongle-aim61-hs-diag-v3.5.2.zip` | 引导测试、内部 RX/TX/音频/队列/内存诊断和持续负载 |
 
-当前仓库以 Ai-M61 为主要目标，同时保留 LCTech BL616 与 Sipeed M0S Dock 的构建支持。
+v3.5.2 首先作为 **Pre-release** 发布，不删除或替换 v3.5.1。刷写器默认只显示最新常用版并把 v3.5.2 常用版作为 OTA 目标；诊断版位于“高级固件”，也可在“设备调试”页一键进入。回到常用版同样使用签名 OTA。
 
-## 功能
+Windows 工具发布文件：`DS5Dongle-Flasher-Windows-v1.3.1.exe`。GitHub Release 只公开两份固件 ZIP、一个 EXE 和总 `SHA256SUMS.txt`；裸 `.bin` 仅保留在 CI 构建产物中。
 
-- DualSense 与 DualSense Edge 自动识别
-- Bluetooth Classic BR/EDR HID Host：扫描、配对、重连、SDP、L2CAP
-- 完整输入透传：按键、摇杆、扳机、触摸板、IMU、电量
-- 完整输出透传：震动、灯条、玩家灯、自适应扳机
-- USB Audio Class 1.0 双向音频
-  - 48 kHz USB 扬声器音频编码为 Opus 后发送到手柄
-  - 手柄麦克风 Opus 解码后输出为 USB 麦克风
-  - 音频通道驱动 HD Haptics
-- 最多记忆 8 个已配对手柄，支持按键快速切换
-- 固件配置协议、按键映射、遥测和运行期诊断（由本地原生工具接入）
-- 签名 A/B OTA、反降级、掉电保护和启动回滚
-- Windows GUI/CLI 一键刷写器
-- Ai-M61 4 MiB PSRAM 冷数据隔离，实时数据留在内部 SRAM/TCM
+## 主要功能
 
-## 工作方式
+- Bluetooth Classic BR/EDR HID Host，支持配对、重连和最多 8 个绑定记录。
+- DualSense / DualSense Edge 输入：按键、摇杆、扳机、触摸板、陀螺仪、加速度计和电量。
+- 输出：灯条、玩家灯、静音灯、左右震动、自适应扳机和手柄声音。
+- USB Audio Class 1.0 双向音频；Opus 1.5.2 固定点低延迟编解码及 E907 位精确优化。
+- Ai-M61 4 MiB PSRAM 只用于显式冷数据；实时队列、Opus 状态和 USB/BT 热数据保留在内部 SRAM/TCM。
+- P-256 签名、A/B 分区、掉电保护、试运行确认和失败回滚的 OTA 基础设施。
+- Windows 原生“DS5Dongle AIM61 工具中心”，中文默认、可切换英文、单一白色高对比主题。
 
-```mermaid
-flowchart LR
-    DS5["DualSense / Edge"]
-    BT["Bluetooth Classic HID"]
-    M61["Ai-M61 / BL618"]
-    USB["USB HID + UAC1"]
-    HOST["Windows / Linux / macOS"]
+## 工具中心
 
-    DS5 <-->|"Input · Output · Opus Audio"| BT
-    BT <--> M61
-    M61 <-->|"Gamepad · Speaker · Microphone"| USB
-    USB <--> HOST
-```
+工具中心包含三个职责明确的页签：
 
-固件的实时路径采用有界队列和静态缓冲：USB 输入使用 latest-state 双缓冲，蓝牙输出按 game/audio/control 分类调度，音频缓冲使用代际编号避免旧数据跨连接或跨音频会话传播。
+1. **测试中心**：实时输入、灯效、限强度震动、自适应扳机、手柄扬声器/耳机和 M61 USB 麦克风测试。
+2. **固件刷写**：读取设备版本/构建配置，校验完整 ZIP，使用 CH340 UART ISP 刷写。
+3. **设备调试**：常用/诊断配置双向 OTA、引导式诊断、M61 内部快照、Windows HID 间隔、10/20/50 Hz 持续负载和 JSON 导出。
 
-## 支持的开发板
+引导诊断不限时长，可重复按键多次，采样充足后由用户手动进入下一项。固定顺序覆盖端点预检、全部输入、触摸、六轴、灯效、左右震动、左右扳机、声音、麦克风和最终复位。输出强度默认受限；按 `Esc` 可立即停止声音、震动并复位扳机。
 
-| 开发板 | 芯片 | 原生 USB | 指示灯 | 默认支持 |
-|---|---|---|---|---|
-| **Ai-M61-32S-Kit** | BL618 QFN56 | GPIO37/38 飞线 | RGB + 白色 LED | 是 |
-| LCTech BL616 | BL616 QFN32 | 板载 Type-C | 单蓝灯 | 是 |
-| Sipeed M0S Dock | BL616 QFN32 | 板载 Type-C | 双红灯 | 是 |
+声音、震动、灯效和自适应扳机使用冻结在本地的 `ds.evua.cc` 兼容 HID `0x02` / Feature `0x80` 测试向量，不在运行时访问该网站。该网站公开脚本的“麦克风”操作只控制静音灯，因此本工具在保持该行为的同时，额外通过 Windows 的 M61 UAC 输入端点完成实际录音/回放测试。
 
-不同开发板的 USB、LED、BOOT 和 PSRAM 配置在编译期由 [`src/board_config.h`](src/board_config.h) 选择。不要把其他板型的完整固件包刷入 Ai-M61。
+诊断 JSON 使用 `ds5dongle-flasher-diagnostics/v2`，区分 RX、TX、音频输入和音频输出；包含引导阶段、用户确认、原始快照和 Pass/Warning/Fail 结论。旧 v1 快照仍可读取，缺失字段按“不支持”处理而不是填零。默认不导出蓝牙地址、序列号和设备路径。
 
 ## Ai-M61 接线
 
-Ai-M61 板载 Type-C 继续用于供电、串口日志和 UART ISP 烧录；另外准备一条 USB 数据线，将数据线接到排针：
+板载 Type-C 连接 CH340，仅用于供电、UART 日志和 ISP 刷写。原生 USB 数据需从 GPIO37/38 引出：
 
 ```text
-Ai-M61 GPIO37 / USB_DM  ─── USB D-（通常为白线）
-Ai-M61 GPIO38 / USB_DP  ─── USB D+（通常为绿线）
-Ai-M61 GND              ─── USB GND（通常为黑线）
+Ai-M61 GPIO37 / USB_DM  ─── USB D-
+Ai-M61 GPIO38 / USB_DP  ─── USB D+
+Ai-M61 GND              ─── USB GND
 ```
 
-注意事项：
+High-Speed 对线材、接头和飞线长度更敏感。D+/D- 应短、成对、阻抗尽量连续；除非确认供电拓扑安全，不要连接第二根 USB 线的 5 V。
 
-- 不要连接 USB 数据线的 5V 红线，除非已经确认供电拓扑不会形成反灌。
-- D+、D- 尽量短并成对走线；High-Speed 对线材和接线质量要求明显更高。
-- 第一次验证建议使用 Full-Speed 固件。
+## 构建
 
-## 快速开始
-
-### 1. 准备 SDK 和工具链
-
-项目依赖带有 DS5Dongle 蓝牙/USB 修改的 Bouffalo SDK：
-
-```bash
-git clone https://github.com/sqlCRT/bouffalo_sdk.git ../bouffalo_sdk
-git -C ../bouffalo_sdk checkout cf6adf74b374a0e485defa9c89610f3e7ffcc3ec
-```
-
-BL616/BL618 使用 T-Head 扩展指令集，需要 `riscv64-unknown-elf` T-Head 工具链。Windows 可使用：
+固件固定使用官方 Bouffalo SDK 2.3.31：
 
 ```powershell
-git clone https://gitee.com/bouffalolab/toolchain_gcc_t-head_windows.git "$env:USERPROFILE\Desktop\toolchain_gcc_t-head_windows"
+git clone https://github.com/bouffalolab/bouffalo_sdk.git ..\bouffalo_sdk
+git -C ..\bouffalo_sdk checkout 09abb06993d7aaa594648ecb6a3212c53a44f3da
+Get-ChildItem sdk-patches\*.patch | Sort-Object Name | ForEach-Object {
+  git -C ..\bouffalo_sdk apply --check --recount $_.FullName
+  git -C ..\bouffalo_sdk apply --recount $_.FullName
+}
 ```
 
-也可以通过环境变量指定自定义路径：
+补丁来源和取舍见 [`sdk-patches/README.md`](sdk-patches/README.md)。Windows 还需 T-Head `riscv64-unknown-elf` 工具链。
 
 ```powershell
 $env:BL_SDK_BASE = "C:\path\to\bouffalo_sdk"
 $env:TOOLCHAIN_PATH = "C:\path\to\toolchain_gcc_t-head_windows"
+$env:BOARD_TYPE = "aim61"
+$env:USB_SPEED = "hs"
+$env:FIRMWARE_VERSION = "3.5.2"
+
+$env:DS5_BUILD_PROFILE = "standard"
+$env:DS5_LOG_LEVEL = "0"
+.\build_windows.bat rebuild
+
+$env:DS5_BUILD_PROFILE = "diagnostic"
+$env:DS5_LOG_LEVEL = "1"
+.\build_windows.bat rebuild
 ```
 
-### 2. 编译 Ai-M61 固件
-
-Windows：
-
-```bat
-build_windows.bat rebuild   rem Ai-M61 Full-Speed，推荐
-build_windows.bat both      rem 同时构建 Full-Speed 与 High-Speed
-build_windows.bat build     rem 增量构建
-build_windows.bat clean     rem 清理构建目录
-```
-
-需要采集详细但低扰动的诊断计数时，可临时构建日志级别 3；正式发布仍建议默认级别 2：
-
-```bat
-set DS5_LOG_LEVEL=3
-build_windows.bat rebuild
-```
-
-macOS / Linux：
-
-```bash
-bash build_macos.sh rebuild
-USB_SPEED=hs bash build_macos.sh rebuild
-```
-
-其他开发板：
-
-```bash
-BOARD_TYPE=lctech616 bash build_macos.sh rebuild
-BOARD_TYPE=m0sdock bash build_macos.sh rebuild
-```
-
-构建参数：
-
-| 环境变量 | 可选值 | 默认值 |
-|---|---|---|
-| `BOARD_TYPE` | `aim61` / `lctech616` / `m0sdock` | `aim61` |
-| `USB_SPEED` | `fs` / `hs` | `fs` |
-| `DS5_LOG_LEVEL` | `0`..`3` | `2` |
-| `FIRMWARE_VERSION` | `X.Y.Z`，每段 0..254 | `3.5.1` |
-
-主要输出位于：
-
-```text
-firmware/aim61/ds5dongle-aim61.bin
-firmware/aim61/ds5dongle-aim61-hs.bin
-firmware/aim61/boot2_bl616_*.bin
-firmware/aim61/partition.bin
-```
-
-二进制和本地构建目录默认被 Git 忽略，应通过 GitHub Release 分发，不要直接提交到源码仓库。
-
-### 3. 首次完整烧录
-
-OTA 只更新应用分区。第一次安装必须通过 UART ISP 完整写入 Boot2、分区表和应用固件。
-
-#### 使用 Windows 一键刷写器
-
-1. 从 [Releases](https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/latest) 下载 `DS5Dongle-Flasher-Windows.exe`。
-2. Ai-M61 用板载 Type-C 连接电脑；如果没有 COM 口，可在刷写器内安装经过 SHA-256 和数字签名校验的 WCH CH340/CH341 官方驱动。
-3. 按住 **BOOT**，短按 **RESET**（也可按住 BOOT 重新插线），然后松开 BOOT。
-4. 打开刷写器，选择 `Ai-M61-32S-Kit`、`Full-Speed` 和对应 COM 口。
-5. 选择在线 Release，或加载本地完整固件 ZIP/目录；确认目标板型和 USB 速度后开始刷写。
-
-刷写器会自动读取已正常启动设备的 USB HID `0xF8` 固件版本信息；也可使用 `--device-info` 单独查询，不会进入 ISP 或写入 Flash。1.2.0 起可在 GUI 中运行“一键诊断”，读取 `0xFD` 分页运行态快照并导出本地 JSON；新版为七页并兼容旧六页固件，普通 `COM1` 等非 CH340 端口会被自动排除。1.3.0 起新增“测试中心”和“设备调试”页签：前者实时检查输入、传感器、灯效、震动、自适应扳机及 USB 音频，后者可运行 5/15/30/60 分钟自动压力测试；输出负载默认 20 Hz、可选 50 Hz 极限档，并采用 15 秒工作/5 秒释放保护周期；每 5 秒及严重 HID 停顿时采集 M61 快照，结合内部桥接计时与 Windows HID 抖动分析 USB、蓝牙、内存和音频性能。
-6. 成功后按 RESET 正常启动。若 460800 波特率失败，可在界面中改用 115200 重试。
-
-刷写器会先验证包结构、文件名、尺寸和 SHA-256，再调用内置并校验过的 Bouffalo `BLFlashCommand`。不要给 Ai-M61 刷入 LCTech/M0S 包，也不要把 OTA `.bin.ota` 当作完整线刷包。
-
-在本仓库发布第一个包含完整固件资产的 GitHub Release 之前，在线列表会为空；此时请按下文生成本地 ZIP，不要回退到旧仓库下载源。
-
-常用 CLI 检查命令：
+打包：
 
 ```powershell
-.\DS5Dongle-Flasher-Windows.exe --list
-.\DS5Dongle-Flasher-Windows.exe --diagnostics
-.\DS5Dongle-Flasher-Windows.exe --list-releases --board aim61 --usb-speed fs
-.\DS5Dongle-Flasher-Windows.exe --verify-release --release v3.5.1 --board aim61 --usb-speed fs
-.\DS5Dongle-Flasher-Windows.exe --release v3.5.1 --board aim61 --usb-speed fs --port COM5 --dry-run
+python tools\package_firmware.py --board aim61 --usb-speed hs --profile standard `
+  --version 3.5.2 --firmware-dir firmware\aim61 --output-dir dist
+python tools\package_firmware.py --board aim61 --usb-speed hs --profile diagnostic `
+  --version 3.5.2 --firmware-dir firmware\aim61 --output-dir dist
 ```
 
-#### 从本地构建生成完整包
+## 刷写与配对
 
-生成供刷写器使用的本地完整包：
+1. 从 [Releases](https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases) 下载 v1.3.1 工具并核对 `SHA256SUMS.txt`。
+2. 按住 Ai-M61 的 **BOOT**，短按 **RESET** 后松开 BOOT，使其进入 UART ISP。
+3. 在“固件刷写”页选择 CH340 端口和完整 ZIP；工具会检查板型、HS 配置、文件大小和包内 SHA-256。
+4. 正常复位。手柄关机时长按 **PS + Create** 进入蓝牙配对。
 
-```powershell
-python tools/package_firmware.py `
-  --board aim61 `
-  --usb-speed fs `
-  --version local `
-  --firmware-dir firmware/aim61 `
-  --output-dir dist
-```
+不要把 OTA `.bin.ota` 当作完整 UART 刷写包，也不要把其他开发板的 Boot2/分区表写入 Ai-M61。
 
-刷写器源码、完整 GUI/CLI 参数、包格式及自行构建方法见 [`tools/ds5dongle-flasher/`](tools/ds5dongle-flasher/) 和 [`docs/FLASHER.md`](docs/FLASHER.md)。
+## OTA 与存储
 
-### 4. 配对手柄
+OTA A/B 槽位位于板载 SPI Flash，不在 PSRAM。PSRAM 断电即失且不是可信启动介质，只能作为下载/诊断期间的临时缓冲。A/B 固件交换不会持续占用 CPU；只有下载、校验和写 Flash 阶段会产生短时负载。
 
-1. 给开发板供电并连接 Ai-M61 原生 USB 飞线。
-2. 手柄关机状态下，同时长按 **PS + Create**，直到灯条快速闪烁。
-3. 固件会扫描、配对并自动保存链路密钥。
-4. 主机应识别出有线 DualSense 或 DualSense Edge。
-
-常用 BOOT 手势：
-
-| 操作 | 功能 |
-|---|---|
-| 单击 | 切换到下一个已保存手柄 |
-| 双击 | 断开当前手柄并扫描新手柄 |
-| 长按约 3 秒 | 清空配对记录并重新扫描 |
-
-## USB 模式与轮询率
-
-| 固件模式 | USB 链路 | 特点 | 建议 |
-|---|---:|---|---|
-| Full-Speed | 12 Mbps | 线材和飞线兼容性最好 | 默认使用 |
-| High-Speed | 480 Mbps | 更高 USB 轮询上限，对布线更敏感 | 硬件验证后使用 |
-
-配置中的轮询模式对应约 250 Hz、500 Hz 和实时档；实际输入频率还受蓝牙链路、主机调度和手柄报告率限制。High-Speed 不会降低蓝牙本身的空口延迟。
-
-## 原生测试中心与工具方向
-
-独立配置网页及其构建、部署和前端测试代码已经移除，原公开配置网站也已下线，不再提供网页配置、网页诊断或网页 OTA。不要使用旧地址、缓存页面或第三方镜像操作设备。
-
-设备交互统一集中到 Windows 原生刷写器：测试中心负责手柄功能验证，设备调试负责长时间压力测试、Windows HID 抖动与 M61 内部转发延迟分析，固件刷写页负责 GitHub Release 下载、UART 恢复与版本管理。诊断结果只保存在本机，不上传服务器。
-
-固件的签名 A/B OTA、`0xFD` 运行诊断和配置协议继续作为底层能力保留，供受信任的原生工具使用；当前刷写器尚未开放应用级 OTA，升级与恢复仍以 UART 完整刷写为准。OTA 容器、签名和设备端传输协议见 [`docs/OTA.md`](docs/OTA.md)，生产私钥不得写入源码、构建日志或 GitHub 仓库。
-
-## 性能设计
-
-- USB 任务保持最高应用优先级，端点回调只做有界复制与通知。
-- 输入使用深度 1 latest-state 队列，拥塞时覆盖旧状态而不是累计延迟。
-- 蓝牙输出采用有界分类调度：游戏状态 latest-wins，音频和控制报告单独限深。
-- Opus 使用固定点 `RESTRICTED_LOWDELAY`、10 ms 帧、复杂度 0。
-- E907 优化包含 CLZ、Q15/Q16 DSP 乘法和 2 的幂除法快速路径。
-- USB DMA、PCM、麦克风环形缓冲、Opus 状态和 FreeRTOS 栈保留在内部 SRAM/TCM。
-- Ai-M61 PSRAM 只存放蓝牙扫描结果和 Feature Report 等冷数据，不进入通用堆。
-
-固件内置运行期统计，可通过刷写器“设备调试”页或 [`tools/m61-diagnostics.ps1`](tools/m61-diagnostics.ps1) 导出。性能结论应以真实硬件抓取的 p99、丢包和队列高水位为准，而不是只看理论轮询率。
-
-## 已知限制
-
-- 一次只桥接一个活动手柄。
-- OTA 协议只接受与当前设备 USB 档位一致的 Ai-M61 RAW 镜像，不支持 FS/HS 交叉升级；公开配置网站已经下线，当前刷写器也尚未开放应用级 OTA。
-- Ai-M61 High-Speed 对 USB 飞线、接头和主机控制器更敏感。
-- 键盘映射类型属于预留协议；当前固件只保证手柄到手柄的按键映射。
-- 首次安装和 Boot2/分区表变更必须使用串口完整刷写。
-- 本项目不承诺在 PlayStation 主机上工作，主要目标是 PC、Steam、SDL 和远程串流环境。
+同版本 `standard ↔ diagnostic` 允许显式切换，但自动更新只跟随相同配置。v3.5.2 不通过 OTA 自动降级到 v3.5.1；需要回退时使用 UART 完整刷写。配对、映射和设置分区在配置切换时保留。协议细节见 [`docs/OTA.md`](docs/OTA.md)。
 
 ## 测试
 
-Python 工具和协议测试：
-
-```bash
-python -m unittest discover -s tools -p "test_*.py"
-```
-
-Windows 刷写器：
-
 ```powershell
-cargo fmt --manifest-path tools/ds5dongle-flasher/Cargo.toml -- --check
-cargo test --manifest-path tools/ds5dongle-flasher/Cargo.toml
+python -m unittest discover -s tools -p "test_*.py"
+cargo fmt --manifest-path tools\ds5dongle-flasher\Cargo.toml -- --check
+cargo test --locked --manifest-path tools\ds5dongle-flasher\Cargo.toml
+git diff --check
 ```
 
-正式发布还应完成各板型 FS/HS 构建矩阵，以及真实硬件上的配对、重连、音频、待机恢复、掉电 OTA 和回滚测试。
+本次版本不等待真机才生成代码和预发行包，但 **Pre-release 不等于真机验证完成**。稳定推广前仍应在 Ai-M61 上验证配对/重连、DS/Edge、HS 信号完整性、扬声器/麦克风、5 分钟持续负载、掉电 OTA 与回滚。
 
-## 项目结构
+## 来源与致谢
 
-```text
-src/                         BL616/BL618 固件
-lib/opus/                    Opus 1.5.2 固件所需源码子集
-firmware/                    板型刷写配置与本地输出目录
-tools/ds5dongle-flasher/     Windows GUI/CLI 刷写器
-tools/ota_*.py               OTA 协议、签名和发布工具
-tools/m61-diagnostics.ps1    运行期诊断采集工具
-docs/                        OTA、诊断和刷写器详细文档
-.github/workflows/           构建与发布自动化
-```
+本项目沿用了多层上游成果，不能只归因于当前仓库：
 
-## 来源、演进与致谢
-
-本项目不是从零开始的独立实现。为避免把“历史参考”“直接代码来源”和“当前外部依赖”混为一谈，完整沿革如下。
-
-### 项目沿革与贡献
-
-| 来源 / 贡献者 | 与本项目的关系 |
+| 来源 | 与本项目的关系 |
 |---|---|
-| [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) | 最初的 Raspberry Pi Pico 2W 实现；提供 DualSense 蓝牙 HID 到 USB 的核心架构、协议处理和产品方向。上游为 MIT 许可。 |
-| [ccc007ccc/DS5Dongle](https://github.com/ccc007ccc/DS5Dongle) | 本仓库直接继承的 BL616/BL618/Ai-M61 开发主线，包含板卡移植、实时音频、E907 优化、刷写器与大量稳定性工程；原提交历史已完整保留。该历史版本为 MIT 许可，Copyright (c) 2026 awalol and contributors / ccc007ccc。 |
-| [sqlCRT/ds5dongle-bl618-opensource](https://github.com/sqlCRT/ds5dongle-bl618-opensource) | BL618 开源发布、三板型支持和后续功能基线；当前代码在此类 BL618 实现上继续整合 OTA、诊断、原生测试中心和工程化改进。上游项目采用 GPL-3.0。 |
-| [sqlCRT/bouffalo_sdk](https://github.com/sqlCRT/bouffalo_sdk) | 当前构建所需的 Bouffalo SDK 分支，基于 BouffaloSDK v2.3.28，补充了 DS5Dongle 所需的 Bluetooth HID `net_buf`、USB Audio 与刷写工具适配；本仓库固定使用提交 `cf6adf74b374a0e485defa9c89610f3e7ffcc3ec`。 |
-| [zhaohyperion/DS5DONGLE-AIM61](https://github.com/zhaohyperion/DS5DONGLE-AIM61) | 当前维护仓库：以 Ai-M61 为默认目标，承接固件、Windows 原生测试中心与刷写器、签名 A/B OTA、诊断与发布流程。 |
+| [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) | 最初的 DualSense 蓝牙 HID 到 USB 项目方向和核心设计，MIT |
+| [ccc007ccc/DS5Dongle](https://github.com/ccc007ccc/DS5Dongle) | BL616/BL618/Ai-M61 移植、实时音频、E907 优化和工程演进；原提交历史保留，MIT |
+| [sqlCRT/ds5dongle-bl618-opensource](https://github.com/sqlCRT/ds5dongle-bl618-opensource) | 本 BL618 固件主线的重要开源基准和后续功能来源，GPL-3.0 |
+| [bouffalolab/bouffalo_sdk](https://github.com/bouffalolab/bouffalo_sdk) | 官方 SDK 2.3.31 固定基线，Apache-2.0 |
+| [sqlCRT/bouffalo_sdk](https://github.com/sqlCRT/bouffalo_sdk) | AIM61/USB Audio/BR-EDR/PSRAM 修复的补丁来源；已审计为本仓库透明补丁，Apache-2.0 |
+| [xiph/opus](https://github.com/xiph/opus) | Opus 1.5.2 固定点编解码器，BSD-3-Clause |
+| [CherryUSB](https://github.com/cherry-embedded/CherryUSB) | Bouffalo SDK 内使用的 USB 设备栈，Apache-2.0 |
+| [ds.evua.cc](https://ds.evua.cc/) | 手柄输出测试行为的公开参考；兼容测试向量冻结在本地，不构成运行时依赖 |
 
-当前 Opus 基线是官方 [xiph/opus 1.5.2](https://github.com/xiph/opus/tree/v1.5.2)，不是第三方 Opus fork。E907 的 CLZ、Q15/Q16 DSP 乘法、2 的幂除法和 D4 音频快速路径来自本项目旧版 Opus 1.2.1 [M61 优化补丁组](https://github.com/zhaohyperion/DS5DONGLE-AIM61/tree/0968b719a38b5bfea951c8e87f3250ecac4e8fa8/m61/dualsense_hidp_probe/patches)，由 `ccc007ccc` 在真实 E907 热点分析和位精确测试基础上开发，之后适配并重新验证到 1.5.2。
-
-### 固件及协议栈依赖
-
-| 项目 | 用途 | 许可 / 备注 |
-|---|---|---|
-| [BouffaloSDK](https://github.com/bouffalolab/bouffalo_sdk) | BL616/BL618 HAL、启动、Flash、Bluetooth 与构建系统 | Apache-2.0；实际构建使用上表 `sqlCRT` 分支 |
-| [Zephyr Project](https://github.com/zephyrproject-rtos/zephyr) | Bouffalo Bluetooth Host 中采用的 API 与代码基础 | Apache-2.0，经 SDK 引入 |
-| [CherryUSB](https://github.com/cherry-embedded/CherryUSB) | USB HID/UAC1 Device Stack；SDK 固定版本为 v1.5.3 | Apache-2.0，经 SDK 引入 |
-| [FreeRTOS Kernel](https://github.com/FreeRTOS/FreeRTOS-Kernel) | 固件任务、队列、同步和定时 | MIT，经 SDK 引入；`src/FreeRTOSConfig.h` 保留原版权声明 |
-| [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) | OTA SHA-256 与 ECDSA P-256 设备端验签 | Apache-2.0 或 GPL-2.0-or-later 双许可，本项目按 Apache-2.0 使用，经 SDK 引入 |
-| [littlefs](https://github.com/littlefs-project/littlefs) | 配置与配对数据持久化，SDK 通过 EasyFlash 兼容接口暴露 | BSD-3-Clause，经 SDK 引入 |
-| [xiph/opus](https://github.com/xiph/opus) | DualSense 双向语音音频编解码，固定点模式 | BSD-3-Clause；仓库只保留固件编译所需的 1.5.2 源码、头文件和许可证 |
-
-[BTstack](https://github.com/bluekitchen/btstack) 与 [TinyUSB](https://github.com/hathach/tinyusb) 属于 `awalol/DS5Dongle` 的历史架构来源；当前 BL618 固件没有链接它们。Linux 内核 [`hid-playstation.c`](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-playstation.c) 仅用于 DualSense 报告布局和偏移交叉验证，仓库未复制 Linux 内核代码。
-
-原始 `awalol/DS5Dongle` 还致谢了 [rafaelvaloto/Pico_W-Dualsense](https://github.com/rafaelvaloto/Pico_W-Dualsense)（项目灵感）、[egormanga/SAxense](https://github.com/egormanga/SAxense)（蓝牙触觉概念验证）、[Controllers Wiki 的 DualSense 报告结构资料](https://controllers.fandom.com/wiki/Sony_DualSense) 与 [Paliverse/DualSenseX](https://github.com/Paliverse/DualSenseX)（扬声器报告包参考）。这些间接历史参考一并保留致谢，但不是当前仓库的直接构建依赖。
-
-### 工具与开发协助
-
-- Windows 刷写器由 Rust 构建，直接依赖 `anyhow`、`base64`、`eframe/egui`、`hidapi`（Windows 原生 `hid.dll` 后端）、`reqwest/rustls`、`rfd`、`serde`、`sha2`、`windows-sys` 和 `zip` 等项目；精确版本与完整传递依赖见 [`Cargo.toml`](tools/ds5dongle-flasher/Cargo.toml) 和 [`Cargo.lock`](tools/ds5dongle-flasher/Cargo.lock)。刷写后端来自 Bouffalo Lab `BLFlashCommand`；可选串口驱动由 [WCH](https://www.wch-ic.com/) 提供，驱动不会提交进仓库。
-- BL618 移植阶段使用 Cursor 与 Claude Opus 4.6 辅助开发；当前代码审计、OTA/刷写流程和文档整理使用 OpenAI Codex 辅助。所有合入结果仍由仓库维护者负责审查、测试与发布。
-
-感谢上述作者、维护者和社区贡献者。更严格的版权归属、许可证范围及“仅参考而未包含代码”的界线见 [`NOTICE`](NOTICE)；Git 提交历史是个人代码贡献的最终记录。
+完整许可证、版本、采用范围和未采用范围见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。如发现遗漏，请提交 Issue 补充，不应删除上游版权或许可证声明。
 
 ## 许可证
 
-本项目采用 [GNU General Public License v3.0](LICENSE)。第三方代码的版权和许可证信息见 [NOTICE](NOTICE)；`lib/opus` 的许可证见 [`lib/opus/LICENSE_PLEASE_READ.txt`](lib/opus/LICENSE_PLEASE_READ.txt)。
-
----
-
-**English summary:** DS5DONGLE-AIM61 bridges a DualSense or DualSense Edge controller over Bluetooth Classic HID to a PC as a wired USB HID/UAC1 device. Ai-M61-32S-Kit is the default target; Full-Speed USB is recommended. The firmware includes bidirectional Opus audio, adaptive triggers, haptics, diagnostics, and signed A/B OTA. See the build and wiring sections above before flashing.
+当前仓库整体按 [GPL-3.0](LICENSE) 发布。第三方组件继续受其各自许可证约束。

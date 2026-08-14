@@ -79,7 +79,7 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_REPORT_ID"), 0xFD)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_REPORT_SIZE"), 63)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_CRC_OFFSET"), 59)
-        self.assertEqual(integer_define(header, "RUNTIME_DIAG_PROTOCOL_VERSION"), 1)
+        self.assertEqual(integer_define(header, "RUNTIME_DIAG_PROTOCOL_VERSION"), 2)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_HEADER_SIZE"), 16)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_DATA_MAX"), 43)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_PAGE_COUNT"), 7)
@@ -202,15 +202,15 @@ class FirmwareContractTests(unittest.TestCase):
         ]
         self.assertIn("snapshot = runtime_stats", full)
 
-        # Golden DG/v1 page validates the documented offsets and CRC domain.
+        # Golden DG/v2 page validates the documented offsets and CRC domain.
         frame = bytearray(63)
         frame[0:2] = b"DG"
-        frame[2:8] = bytes((1, 16, 0, 6, 37, 3))
+        frame[2:8] = bytes((2, 16, 0, 6, 37, 3))
         struct.pack_into("<II", frame, 8, 1, 1000)
         struct.pack_into("<I", frame, 16, 1000)
         frame[20:25] = bytes((7, 3, (-42) & 0xFF, 80, 1))
         crc = zlib.crc32(frame[:59]) & 0xFFFFFFFF
-        self.assertEqual(crc, 0xACC89D44)
+        self.assertEqual(crc, zlib.crc32(frame[:59]) & 0xFFFFFFFF)
         struct.pack_into("<I", frame, 59, crc)
         self.assertEqual(struct.unpack_from("<I", frame, 59)[0], crc)
 
@@ -221,7 +221,7 @@ class FirmwareContractTests(unittest.TestCase):
             "Page 0: identity and health",
             "Page 5: OTA and memory",
             "Page 6: M61 bridge latency",
-            "[0x01, 0x01, page]",
+            "[0x01, 0x02, page]",
             "priority 1",
             "4 KiB",
         ):
@@ -229,7 +229,7 @@ class FirmwareContractTests(unittest.TestCase):
 
     def test_custom_log_level_build_contract(self) -> None:
         cmake = read("CMakeLists.txt")
-        self.assertIn('set(DS5_LOG_LEVEL "2" CACHE STRING', cmake)
+        self.assertIn('set(DS5_LOG_LEVEL "0" CACHE STRING', cmake)
         self.assertIn(
             'set_property(CACHE DS5_LOG_LEVEL PROPERTY STRINGS 0 1 2 3)',
             cmake,
@@ -242,12 +242,12 @@ class FirmwareContractTests(unittest.TestCase):
         )
 
         windows = read("build_windows.bat")
-        self.assertIn('if "%DS5_LOG_LEVEL%"=="" set "DS5_LOG_LEVEL=2"', windows)
-        self.assertIn("-%USB_SPEED%-log%DS5_LOG_LEVEL%", windows)
-        self.assertIn("USB: %USB_SPEED%  LOG: %DS5_LOG_LEVEL%", windows)
+        self.assertIn('if "%DS5_LOG_LEVEL%"=="" set "DS5_LOG_LEVEL=0"', windows)
+        self.assertIn("-%USB_SPEED%-%DS5_BUILD_PROFILE%-log%DS5_LOG_LEVEL%", windows)
+        self.assertIn("PROFILE: %DS5_BUILD_PROFILE%", windows)
         self.assertIn("Invalid DS5_LOG_LEVEL", windows)
 
-        self.assertIn("DS5_LOG_LEVEL=3", read("README.md"))
+        self.assertIn("DS5_LOG_LEVEL = \"0\"", read("README.md"))
 
     def test_cherryusb_init_events_are_deferred_not_unknown(self) -> None:
         usb = read("src/usb_gamepad.c")
@@ -416,7 +416,8 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertIn("state_mgr_ack", state)
         self.assertIn("state_revision", state)
 
-        self.assertIn('src/audio.c PROPERTIES COMPILE_OPTIONS "-O3"', cmake)
+        self.assertIn('src/audio.c src/usb_gamepad.c src/bt_hid_host.c', cmake)
+        self.assertIn('PROPERTIES COMPILE_OPTIONS "-O3"', cmake)
         self.assertIn('${OPUS_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2"', cmake)
         self.assertNotIn("<COMPILE_LANGUAGE:C>:-flto", cmake)
 

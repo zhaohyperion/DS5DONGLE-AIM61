@@ -19,6 +19,8 @@ const MAX_PAGES: usize = 16;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticSnapshot {
+    pub protocol_version: u8,
+    pub build_profile: String,
     pub snapshot_seq: u32,
     pub captured_at_unix_ms: u64,
     pub monotonic_ms: u32,
@@ -67,6 +69,7 @@ pub struct DeviceDiagnostic {
 
 #[derive(Clone, Debug)]
 struct DiagnosticPage {
+    protocol_version: u8,
     index: usize,
     count: usize,
     flags: u8,
@@ -131,6 +134,35 @@ fn read_firmware_version(device: &hidapi::HidDevice) -> Option<String> {
 
 #[cfg(windows)]
 fn capture_snapshot(device: &hidapi::HidDevice) -> Result<DiagnosticSnapshot> {
+    let protocol_version = read_protocol_version(device)?;
+    if protocol_version >= 2 {
+        device
+            .send_feature_report(&session_report(protocol_version, true))
+            .context("unable to start the diagnostic session")?;
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    let result = capture_snapshot_with_protocol(device, protocol_version);
+    if protocol_version >= 2 {
+        let _ = device.send_feature_report(&session_report(protocol_version, false));
+    }
+    result
+}
+
+#[cfg(windows)]
+fn read_protocol_version(device: &hidapi::HidDevice) -> Result<u8> {
+    let mut report = [0_u8; WIRE_REPORT_SIZE];
+    report[0] = REPORT_ID;
+    let length = device
+        .get_feature_report(&mut report)
+        .context("unable to probe diagnostic protocol")?;
+    Ok(decode_page(&report[..length])?.protocol_version)
+}
+
+#[cfg(windows)]
+fn capture_snapshot_with_protocol(
+    device: &hidapi::HidDevice,
+    protocol_version: u8,
+) -> Result<DiagnosticSnapshot> {
     for _attempt in 0..4 {
         let mut pages = Vec::new();
         let mut page_count = 1_usize;
@@ -140,7 +172,7 @@ fn capture_snapshot(device: &hidapi::HidDevice) -> Result<DiagnosticSnapshot> {
         let mut expected_monotonic = None;
 
         while page_index < page_count {
-            let selector = selector_report(page_index as u8);
+            let selector = selector_report(protocol_version, page_index as u8);
             device
                 .send_feature_report(&selector)
                 .with_context(|| {
@@ -180,12 +212,21 @@ fn capture_snapshot(device: &hidapi::HidDevice) -> Result<DiagnosticSnapshot> {
     bail!("diagnostic snapshot changed during paged capture; retry")
 }
 
-fn selector_report(page_index: u8) -> [u8; WIRE_REPORT_SIZE] {
+fn selector_report(protocol_version: u8, page_index: u8) -> [u8; WIRE_REPORT_SIZE] {
     let mut report = [0_u8; WIRE_REPORT_SIZE];
     report[0] = REPORT_ID;
     report[1] = 0x01;
-    report[2] = 0x01;
+    report[2] = protocol_version;
     report[3] = page_index;
+    report
+}
+
+fn session_report(protocol_version: u8, active: bool) -> [u8; WIRE_REPORT_SIZE] {
+    let mut report = [0_u8; WIRE_REPORT_SIZE];
+    report[0] = REPORT_ID;
+    report[1] = 0x02;
+    report[2] = protocol_version;
+    report[3] = u8::from(active);
     report
 }
 
@@ -206,7 +247,7 @@ fn decode_page(source: &[u8]) -> Result<DiagnosticPage> {
     if frame[0..2] != *b"DG" {
         bail!("device does not support the DG diagnostic protocol");
     }
-    if frame[2] != 1 {
+    if !matches!(frame[2], 1 | 2) {
         bail!("unsupported diagnostic protocol version {}", frame[2]);
     }
     if frame[3] as usize != HEADER_SIZE {
@@ -228,6 +269,7 @@ fn decode_page(source: &[u8]) -> Result<DiagnosticPage> {
         bail!("diagnostic page contains non-zero padding");
     }
     Ok(DiagnosticPage {
+        protocol_version: frame[2],
         index,
         count,
         flags: frame[7],
@@ -261,6 +303,8 @@ fn decode_snapshot(pages: &[DiagnosticPage]) -> Result<DiagnosticSnapshot> {
     let rssi = read_i8(p0, 6);
     let battery = read_u8(p0, 7, 0xff);
     Ok(DiagnosticSnapshot {
+        protocol_version: first.protocol_version,
+        build_profile: "diagnostic".to_owned(),
         snapshot_seq: first.snapshot_seq,
         captured_at_unix_ms: now_unix_ms(),
         monotonic_ms: first.monotonic_ms,
@@ -372,9 +416,9 @@ mod tests {
 
     #[test]
     fn diagnostic_selector_uses_the_full_hid_report_length() {
-        let selector = selector_report(5);
+        let selector = selector_report(2, 5);
         assert_eq!(selector.len(), 64);
-        assert_eq!(&selector[..4], &[REPORT_ID, 0x01, 0x01, 5]);
+        assert_eq!(&selector[..4], &[REPORT_ID, 0x01, 0x02, 5]);
         assert!(selector[4..].iter().all(|byte| *byte == 0));
     }
 

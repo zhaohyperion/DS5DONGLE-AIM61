@@ -5,6 +5,8 @@
 
 mod device_test;
 mod diagnostics;
+mod guided_test;
+mod ota_client;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -26,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-const PRODUCT_NAME: &str = "DS5DONGLE-AIM61 Flasher";
+const PRODUCT_NAME: &str = "DS5Dongle AIM61 工具中心";
 const FLASHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_API: &str =
     "https://api.github.com/repos/zhaohyperion/DS5DONGLE-AIM61/releases?per_page=30";
@@ -108,6 +110,27 @@ struct FlashRelease {
     archive: GithubAsset,
     board: Board,
     usb_speed: UsbSpeed,
+    profile: BuildProfile,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum BuildProfile {
+    Standard,
+    Diagnostic,
+}
+
+impl BuildProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Diagnostic => "Diagnostic",
+        }
+    }
+}
+
+fn default_build_profile() -> BuildProfile {
+    BuildProfile::Standard
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -158,6 +181,8 @@ struct FirmwareManifest {
     version: String,
     board: Board,
     usb_speed: UsbSpeed,
+    #[serde(default = "default_build_profile")]
+    profile: BuildProfile,
     chip: String,
     flash_size: u32,
     boot2: String,
@@ -246,6 +271,14 @@ struct FlasherDiagnosticBundle<'a> {
     flasher_version: &'static str,
     serial_devices: Vec<SerialDiagnosticRecord<'a>>,
     runtime_devices: &'a [diagnostics::DeviceDiagnostic],
+    test_phases: Vec<serde_json::Value>,
+    rx_metrics: serde_json::Value,
+    tx_metrics: serde_json::Value,
+    audio_input_metrics: serde_json::Value,
+    audio_output_metrics: serde_json::Value,
+    user_confirmations: Vec<serde_json::Value>,
+    result: &'static str,
+    raw_trace: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,6 +287,7 @@ struct FirmwareDeviceInfo {
     vendor_id: u16,
     product_id: u16,
     firmware_version: String,
+    build_profile: String,
 }
 
 struct RuntimeDirectory {
@@ -621,7 +655,7 @@ fn sha256_digest(asset: &GithubAsset) -> Option<&str> {
     asset.digest.as_deref()?.strip_prefix("sha256:")
 }
 
-fn asset_variant(name: &str) -> Option<(Board, UsbSpeed)> {
+fn asset_variant(name: &str) -> Option<(Board, UsbSpeed, BuildProfile)> {
     let lower = name.to_ascii_lowercase();
     if !lower.starts_with("ds5dongle-") || !lower.ends_with(".zip") {
         return None;
@@ -642,7 +676,12 @@ fn asset_variant(name: &str) -> Option<(Board, UsbSpeed)> {
     } else {
         return None;
     };
-    Some((board, speed))
+    let profile = if lower.contains("-diag-") {
+        BuildProfile::Diagnostic
+    } else {
+        BuildProfile::Standard
+    };
+    Some((board, speed, profile))
 }
 
 fn fetch_flash_releases(client: &Client) -> Result<Vec<FlashRelease>> {
@@ -664,7 +703,7 @@ fn fetch_flash_releases(client: &Client) -> Result<Vec<FlashRelease>> {
             .iter()
             .filter(|asset| sha256_digest(asset).is_some())
         {
-            let Some((board, usb_speed)) = asset_variant(&asset.name) else {
+            let Some((board, usb_speed, profile)) = asset_variant(&asset.name) else {
                 continue;
             };
             releases.push(FlashRelease {
@@ -679,6 +718,7 @@ fn fetch_flash_releases(client: &Client) -> Result<Vec<FlashRelease>> {
                 archive: asset.clone(),
                 board,
                 usb_speed,
+                profile,
             });
         }
     }
@@ -703,11 +743,12 @@ fn print_releases(releases: &[FlashRelease]) {
             .and_then(|value| value.get(..10))
             .unwrap_or("unknown date");
         println!(
-            "  {}. {} | {} / {} | {} | {} | {:.1} KiB\n     {}",
+            "  {}. {} | {} / {} / {} | {} | {} | {:.1} KiB\n     {}",
             index + 1,
             release.tag,
             release.board.label(),
             release.usb_speed.label(),
+            release.profile.label(),
             channel,
             date,
             release.archive.size as f64 / 1024.0,
@@ -716,24 +757,16 @@ fn print_releases(releases: &[FlashRelease]) {
     }
 }
 
-/* GitHub does not guarantee asset ordering.  Prefer the only board this
- * project can validate on real hardware, and prefer Full-Speed for initial
- * cable/USB compatibility.  Explicit CLI filters and GUI choices still allow
- * every supported board and speed. */
+/* GitHub returns releases newest-first. Prefer the newest AIM61 HS Standard
+ * asset even when it is a prerelease; Diagnostic stays behind the GUI's
+ * explicit advanced switch. */
 fn preferred_release_index(releases: &[FlashRelease]) -> Option<usize> {
     releases
         .iter()
         .position(|release| {
-            !release.prerelease
-                && release.board == Board::Aim61
-                && release.usb_speed == UsbSpeed::Fs
-        })
-        .or_else(|| {
-            releases.iter().position(|release| {
-                !release.prerelease
-                    && release.board == Board::Aim61
-                    && release.usb_speed == UsbSpeed::Hs
-            })
+            release.board == Board::Aim61
+                && release.usb_speed == UsbSpeed::Hs
+                && release.profile == BuildProfile::Standard
         })
         .or_else(|| releases.iter().position(|release| !release.prerelease))
         .or_else(|| (!releases.is_empty()).then_some(0))
@@ -853,13 +886,18 @@ fn validate_firmware_set(
         }
     }
     let expected_firmware = format!(
-        "ds5dongle-{}{}.bin",
+        "ds5dongle-{}{}{}.bin",
         manifest.board.id(),
         if manifest.usb_speed == UsbSpeed::Hs {
             "-hs"
         } else {
             ""
-        }
+        },
+        if manifest.profile == BuildProfile::Diagnostic {
+            "-diag"
+        } else {
+            ""
+        },
     );
     if firmware_name != expected_firmware {
         bail!("firmware filename does not match board/USB mode: expected {expected_firmware}");
@@ -1182,16 +1220,28 @@ fn diagnostic_bundle_json(
         })
         .collect();
     serde_json::to_string_pretty(&FlasherDiagnosticBundle {
-        schema: "ds5dongle-flasher-diagnostics/v1",
+        schema: "ds5dongle-flasher-diagnostics/v2",
         created_at_unix_ms: diagnostics::now_unix_ms(),
         flasher_version: FLASHER_VERSION,
         serial_devices,
         runtime_devices,
+        test_phases: Vec::new(),
+        rx_metrics: serde_json::json!({"status": "notRun"}),
+        tx_metrics: serde_json::json!({"status": "notRun"}),
+        audio_input_metrics: serde_json::json!({"status": "notRun"}),
+        audio_output_metrics: serde_json::json!({"status": "notRun"}),
+        user_confirmations: Vec::new(),
+        result: "snapshotOnly",
+        raw_trace: Vec::new(),
     })
     .context("unable to serialize diagnostic bundle")
 }
 
 fn decode_firmware_version_report(report: &[u8]) -> Option<String> {
+    decode_firmware_identity_report(report).map(|identity| identity.0)
+}
+
+fn decode_firmware_identity_report(report: &[u8]) -> Option<(String, String)> {
     let payload = report
         .first()
         .is_some_and(|byte| *byte == FIRMWARE_VERSION_REPORT_ID)
@@ -1202,7 +1252,15 @@ fn decode_firmware_version_report(report: &[u8]) -> Option<String> {
         .rposition(|byte| !matches!(byte, 0x00 | 0xff))
         .map(|index| index + 1)
         .unwrap_or(0);
-    let version = std::str::from_utf8(&payload[..end]).ok()?.trim();
+    let identity = std::str::from_utf8(&payload[..end]).ok()?.trim();
+    let (version, profile) = identity
+        .split_once('|')
+        .map_or((identity, "legacy"), |(version, profile)| {
+            (version, profile)
+        });
+    if !matches!(profile, "standard" | "diagnostic" | "legacy") {
+        return None;
+    }
     let components = version
         .split('.')
         .map(|component| component.parse::<u16>().ok())
@@ -1210,7 +1268,7 @@ fn decode_firmware_version_report(report: &[u8]) -> Option<String> {
     if components.len() != 3 || components.iter().any(|component| *component > 254) {
         return None;
     }
-    Some(version.to_owned())
+    Some((version.to_owned(), profile.to_owned()))
 }
 
 #[cfg(windows)]
@@ -1231,7 +1289,9 @@ fn probe_firmware_devices() -> Result<Vec<FirmwareDeviceInfo>> {
         let Ok(length) = device.get_feature_report(&mut report) else {
             continue;
         };
-        let Some(firmware_version) = decode_firmware_version_report(&report[..length]) else {
+        let Some((firmware_version, build_profile)) =
+            decode_firmware_identity_report(&report[..length])
+        else {
             continue;
         };
         devices.push(FirmwareDeviceInfo {
@@ -1243,6 +1303,7 @@ fn probe_firmware_devices() -> Result<Vec<FirmwareDeviceInfo>> {
             vendor_id: info.vendor_id(),
             product_id: info.product_id(),
             firmware_version,
+            build_profile,
         });
     }
     devices.sort_by(|left, right| {
@@ -1268,10 +1329,11 @@ fn print_firmware_devices(devices: &[FirmwareDeviceInfo]) {
     }
     for (index, device) in devices.iter().enumerate() {
         println!(
-            "{}. {} | firmware={} | VID:PID={:04X}:{:04X}",
+            "{}. {} | firmware={} | profile={} | VID:PID={:04X}:{:04X}",
             index + 1,
             device.product_name,
             device.firmware_version,
+            device.build_profile,
             device.vendor_id,
             device.product_id
         );
@@ -1605,6 +1667,10 @@ enum GuiEvent {
     FirmwareDevices(std::result::Result<Vec<FirmwareDeviceInfo>, String>),
     Diagnostics(std::result::Result<Vec<diagnostics::DeviceDiagnostic>, String>),
     AudioTestDone(std::result::Result<(), String>),
+    OtaDone {
+        profile: BuildProfile,
+        result: std::result::Result<(), String>,
+    },
     Log(String),
     DriverDone(std::result::Result<(), String>),
     FlashDone {
@@ -1712,6 +1778,7 @@ struct FlasherApp {
     device_test_output: device_test::OutputState,
     device_test_status: String,
     device_test_audio_busy: bool,
+    device_test_controller_tone: Option<device_test::ControllerAudioTarget>,
     device_test_connected: bool,
     device_debug_metrics: device_test::DebugMetrics,
     device_debug_duration_secs: u32,
@@ -1725,7 +1792,9 @@ struct FlasherApp {
     device_debug_next_snapshot: Option<Instant>,
     device_debug_alert_snapshot_max_ms: f32,
     device_debug_last_alert_snapshot: Option<Instant>,
+    guided_test: guided_test::GuidedTest,
     selected_release: usize,
+    show_advanced_firmware: bool,
     firmware_mode: FirmwareMode,
     local_firmware: Option<FirmwareSet>,
     selected_port: Option<String>,
@@ -1766,11 +1835,12 @@ impl FlasherApp {
                 .tr("尚未连接测试设备", "Test device is not connected")
                 .to_owned(),
             device_test_audio_busy: false,
+            device_test_controller_tone: None,
             device_test_connected: false,
             device_debug_metrics: device_test::DebugMetrics::default(),
-            device_debug_duration_secs: 900,
+            device_debug_duration_secs: 300,
             device_debug_stress_enabled: true,
-            device_debug_stress_rate_hz: 20,
+            device_debug_stress_rate_hz: 50,
             device_debug_started: None,
             device_debug_complete: false,
             device_debug_baseline: None,
@@ -1779,7 +1849,9 @@ impl FlasherApp {
             device_debug_next_snapshot: None,
             device_debug_alert_snapshot_max_ms: 0.0,
             device_debug_last_alert_snapshot: None,
+            guided_test: guided_test::GuidedTest::default(),
             selected_release: 0,
+            show_advanced_firmware: false,
             firmware_mode: FirmwareMode::Online,
             local_firmware: None,
             selected_port: None,
@@ -1919,7 +1991,10 @@ impl FlasherApp {
                         Language::En => format!("Connected: {name}; reading live input"),
                     };
                 }
-                device_test::TestEvent::Input(input) => self.device_test_input = input,
+                device_test::TestEvent::Input(input) => {
+                    self.guided_test.observe(&input);
+                    self.device_test_input = input;
+                }
                 device_test::TestEvent::Metrics(metrics) => {
                     self.device_debug_metrics = metrics;
                 }
@@ -1929,8 +2004,29 @@ impl FlasherApp {
                         .tr("测试输出已发送", "Test output sent")
                         .to_owned();
                 }
+                device_test::TestEvent::ControllerToneChanged(target) => {
+                    self.device_test_controller_tone = target;
+                    self.device_test_status = match (self.language, target) {
+                        (Language::ZhCn, Some(device_test::ControllerAudioTarget::Speaker)) => {
+                            "手柄扬声器 1 kHz 测试已启动；再次点击或点击停止可结束".to_owned()
+                        }
+                        (Language::ZhCn, Some(device_test::ControllerAudioTarget::Headphone)) => {
+                            "耳机 1 kHz 测试已启动；再次点击或点击停止可结束".to_owned()
+                        }
+                        (Language::En, Some(device_test::ControllerAudioTarget::Speaker)) => {
+                            "Controller speaker 1 kHz test started; click again or Stop to end"
+                                .to_owned()
+                        }
+                        (Language::En, Some(device_test::ControllerAudioTarget::Headphone)) => {
+                            "Headphone 1 kHz test started; click again or Stop to end".to_owned()
+                        }
+                        (Language::ZhCn, None) => "手柄 1 kHz 声音测试已停止".to_owned(),
+                        (Language::En, None) => "Controller 1 kHz audio test stopped".to_owned(),
+                    };
+                }
                 device_test::TestEvent::Error(error) => {
                     self.device_test_connected = false;
+                    self.device_test_controller_tone = None;
                     self.device_test_status = match self.language {
                         Language::ZhCn => format!("测试设备错误：{error}"),
                         Language::En => format!("Test device error: {error}"),
@@ -1944,6 +2040,7 @@ impl FlasherApp {
                 }
                 device_test::TestEvent::Stopped => {
                     self.device_test_connected = false;
+                    self.device_test_controller_tone = None;
                     self.device_test_status = self
                         .language
                         .tr("测试设备已断开", "Test device disconnected")
@@ -2054,11 +2151,11 @@ impl FlasherApp {
             return;
         };
         let report = serde_json::json!({
-            "schema": "ds5dongle-performance/v1",
+            "schema": "ds5dongle-flasher-diagnostics/v2",
             "createdAtUnixMs": diagnostics::now_unix_ms(),
             "flasherVersion": FLASHER_VERSION,
             "measurementScope": "Windows HID report arrival intervals; not absolute controller-to-display latency",
-            "configuredDurationSeconds": self.device_debug_duration_secs,
+            "configuredDurationSeconds": serde_json::Value::Null,
             "stressOutputsEnabled": self.device_debug_stress_enabled,
             "stressOutputRateHz": self.device_debug_stress_rate_hz,
             "stressDutyCycle": "15 seconds active / 5 seconds fully released",
@@ -2068,6 +2165,33 @@ impl FlasherApp {
             "runtimeSamples": &self.device_debug_runtime_samples,
             "runtimeFinal": &self.device_debug_final,
             "runtimeDiagnostics": &self.runtime_diagnostics,
+            "testPhases": &self.guided_test.phases,
+            "rxMetrics": {
+                "windowsHid": &self.device_debug_metrics,
+                "firmware": &self.device_debug_final,
+            },
+            "txMetrics": {
+                "stressOutputReports": self.device_debug_metrics.stress_output_reports,
+                "rateHz": self.device_debug_stress_rate_hz,
+            },
+            "audioInputMetrics": {
+                "firmwareSnapshot": &self.device_debug_final,
+                "method": "Windows M61 UAC capture plus user playback confirmation",
+            },
+            "audioOutputMetrics": {
+                "method": "frozen ds.evua.cc-compatible HID 0x02/0x80 vectors",
+            },
+            "userConfirmations": self.guided_test.phases.iter().map(|phase| serde_json::json!({
+                "phase": phase.id, "result": phase.result, "note": phase.note,
+            })).collect::<Vec<_>>(),
+            "result": if self.guided_test.phases.iter().any(|phase| phase.result == guided_test::PhaseResult::NotEffective) {
+                "fail"
+            } else if self.guided_test.active || self.guided_test.phases.iter().any(|phase| phase.result == guided_test::PhaseResult::Pending) {
+                "warning"
+            } else {
+                "pass"
+            },
+            "rawTrace": &self.device_debug_runtime_samples,
         });
         match serde_json::to_vec_pretty(&report)
             .context("unable to serialize performance report")
@@ -2102,6 +2226,101 @@ impl FlasherApp {
 
     fn selected_release(&self) -> Option<FlashRelease> {
         self.releases.get(self.selected_release).cloned()
+    }
+
+    fn latest_release_for_profile(&self, profile: BuildProfile) -> Option<FlashRelease> {
+        self.releases
+            .iter()
+            .find(|release| {
+                release.board == Board::Aim61
+                    && release.usb_speed == UsbSpeed::Hs
+                    && release.profile == profile
+            })
+            .cloned()
+    }
+
+    fn current_build_profile(&self) -> Option<BuildProfile> {
+        self.firmware_devices.iter().find_map(|device| {
+            if device.build_profile.eq_ignore_ascii_case("standard") {
+                Some(BuildProfile::Standard)
+            } else if device.build_profile.eq_ignore_ascii_case("diagnostic") {
+                Some(BuildProfile::Diagnostic)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn start_profile_ota(&mut self, profile: BuildProfile) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(release) = self.latest_release_for_profile(profile) else {
+            self.status = self
+                .language
+                .tr(
+                    "未找到目标配置的在线 OTA 固件。请先刷新固件列表。",
+                    "No online OTA firmware was found for the target profile. Refresh the list first.",
+                )
+                .to_owned();
+            return;
+        };
+
+        if let Some(session) = self.device_test_session.take() {
+            let _ = session.stop_all();
+            session.shutdown();
+        }
+        self.device_test_connected = false;
+        self.device_test_controller_tone = None;
+        self.device_debug_started = None;
+        self.busy = Some(match (self.language, profile) {
+            (Language::ZhCn, BuildProfile::Standard) => "正在 OTA 恢复常用版…".to_owned(),
+            (Language::ZhCn, BuildProfile::Diagnostic) => "正在 OTA 进入诊断模式…".to_owned(),
+            (Language::En, BuildProfile::Standard) => "Restoring Standard with OTA…".to_owned(),
+            (Language::En, BuildProfile::Diagnostic) => {
+                "Entering Diagnostic mode with OTA…".to_owned()
+            }
+        });
+        self.status = self
+            .language
+            .tr(
+                "正在校验并传输签名 OTA 固件；请勿断开 USB 或关闭程序。",
+                "Verifying and transferring the signed OTA image. Do not disconnect USB or close the app.",
+            )
+            .to_owned();
+        self.append_log(format!(
+            "OTA: {} -> {} / {}",
+            release.tag,
+            release.profile.label(),
+            release.archive.name
+        ));
+
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            // Let the test-center HID worker close its handle and reset outputs.
+            thread::sleep(Duration::from_millis(350));
+            let temp_path = env::temp_dir().join(format!(
+                "DS5Dongle-OTA-{}-{}-{}.zip",
+                std::process::id(),
+                diagnostics::now_unix_ms(),
+                profile.label().to_ascii_lowercase()
+            ));
+            let result = (|| -> Result<()> {
+                let client = github_client()?;
+                download_release_asset(&client, &release.archive, &temp_path)?;
+                ota_client::update_from_zip(&temp_path, profile, |message| {
+                    let _ = tx.send(GuiEvent::Log(message));
+                })?;
+                Ok(())
+            })()
+            .map_err(|error| format!("{error:#}"));
+            let _ = fs::remove_file(&temp_path);
+            if result.is_ok() {
+                // Firmware waits before rebooting. Give Windows time to enumerate the new profile.
+                thread::sleep(Duration::from_secs(3));
+            }
+            let _ = tx.send(GuiEvent::OtaDone { profile, result });
+        });
     }
 
     fn selected_firmware(&self) -> Option<SelectedFirmware> {
@@ -2706,6 +2925,44 @@ impl FlasherApp {
                         }
                     }
                 }
+                GuiEvent::OtaDone { profile, result } => {
+                    self.busy = None;
+                    match result {
+                        Ok(()) => {
+                            self.status = match (self.language, profile) {
+                                (Language::ZhCn, BuildProfile::Standard) => {
+                                    "常用版 OTA 已完成，设备已重新启动。".to_owned()
+                                }
+                                (Language::ZhCn, BuildProfile::Diagnostic) => {
+                                    "诊断版 OTA 已完成，设备已重新启动。".to_owned()
+                                }
+                                (Language::En, BuildProfile::Standard) => {
+                                    "Standard OTA completed and the device restarted.".to_owned()
+                                }
+                                (Language::En, BuildProfile::Diagnostic) => {
+                                    "Diagnostic OTA completed and the device restarted.".to_owned()
+                                }
+                            };
+                            self.append_log(self.status.clone());
+                            self.refresh_firmware_devices();
+                            self.ensure_device_session();
+                        }
+                        Err(error) => {
+                            self.status = self
+                                .language
+                                .tr(
+                                    "OTA 切换失败；设备原有固件未被激活槽覆盖。",
+                                    "OTA profile switch failed; the active firmware slot was not replaced.",
+                                )
+                                .to_owned();
+                            self.append_log(match self.language {
+                                Language::ZhCn => format!("OTA 错误：{error}"),
+                                Language::En => format!("OTA error: {error}"),
+                            });
+                            self.ensure_device_session();
+                        }
+                    }
+                }
                 GuiEvent::Log(line) => self.append_log(line),
                 GuiEvent::DriverDone(Ok(())) => {
                     self.busy = None;
@@ -3048,22 +3305,22 @@ fn input_button(ui: &mut eframe::egui::Ui, label: &str, pressed: bool) {
         });
 }
 
-const COLOR_APP_BG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(12, 18, 30);
-const COLOR_HEADER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(15, 24, 39);
-const COLOR_SURFACE: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(22, 32, 49);
-const COLOR_SURFACE_RAISED: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(29, 42, 63);
-const COLOR_BORDER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(58, 76, 101);
-const COLOR_TEXT_PRIMARY: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(239, 246, 255);
-const COLOR_TEXT_MUTED: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(174, 190, 212);
-const COLOR_ACCENT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(45, 180, 220);
-const COLOR_ACCENT_HOVER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(61, 205, 241);
-const COLOR_ACCENT_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(20, 69, 88);
-const COLOR_SUCCESS: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(74, 222, 128);
-const COLOR_SUCCESS_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(23, 78, 57);
-const COLOR_WARNING: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(251, 191, 36);
-const COLOR_WARNING_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(78, 55, 18);
-const COLOR_ERROR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 112, 112);
-const COLOR_ERROR_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(83, 31, 38);
+const COLOR_APP_BG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(244, 247, 251);
+const COLOR_HEADER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 255, 255);
+const COLOR_SURFACE: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 255, 255);
+const COLOR_SURFACE_RAISED: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(236, 242, 249);
+const COLOR_BORDER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(198, 210, 224);
+const COLOR_TEXT_PRIMARY: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(19, 35, 57);
+const COLOR_TEXT_MUTED: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(73, 91, 113);
+const COLOR_ACCENT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0, 103, 184);
+const COLOR_ACCENT_HOVER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0, 82, 148);
+const COLOR_ACCENT_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(222, 239, 253);
+const COLOR_SUCCESS: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(20, 112, 68);
+const COLOR_SUCCESS_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(226, 246, 235);
+const COLOR_WARNING: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(148, 91, 0);
+const COLOR_WARNING_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 244, 214);
+const COLOR_ERROR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(178, 32, 47);
+const COLOR_ERROR_SOFT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(253, 230, 233);
 
 #[derive(Clone, Copy)]
 enum NoticeTone {
@@ -3074,11 +3331,11 @@ enum NoticeTone {
 }
 
 fn configure_visual_style(ctx: &eframe::egui::Context) {
-    let mut visuals = eframe::egui::Visuals::dark();
+    let mut visuals = eframe::egui::Visuals::light();
     visuals.override_text_color = Some(COLOR_TEXT_PRIMARY);
     visuals.panel_fill = COLOR_APP_BG;
     visuals.window_fill = COLOR_SURFACE;
-    visuals.extreme_bg_color = eframe::egui::Color32::from_rgb(8, 13, 23);
+    visuals.extreme_bg_color = eframe::egui::Color32::WHITE;
     visuals.faint_bg_color = COLOR_SURFACE_RAISED;
     visuals.warn_fg_color = COLOR_WARNING;
     visuals.error_fg_color = COLOR_ERROR;
@@ -3092,8 +3349,8 @@ fn configure_visual_style(ctx: &eframe::egui::Context) {
     visuals.widgets.inactive.weak_bg_fill = COLOR_SURFACE_RAISED;
     visuals.widgets.inactive.bg_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_BORDER);
     visuals.widgets.inactive.fg_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_TEXT_PRIMARY);
-    visuals.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(39, 60, 83);
-    visuals.widgets.hovered.weak_bg_fill = eframe::egui::Color32::from_rgb(39, 60, 83);
+    visuals.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(225, 237, 250);
+    visuals.widgets.hovered.weak_bg_fill = eframe::egui::Color32::from_rgb(225, 237, 250);
     visuals.widgets.hovered.bg_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_ACCENT_HOVER);
     visuals.widgets.active.bg_fill = COLOR_ACCENT_SOFT;
     visuals.widgets.active.weak_bg_fill = COLOR_ACCENT_SOFT;
@@ -3220,6 +3477,20 @@ impl eframe::App for FlasherApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         self.process_events();
         self.process_device_test_events();
+        if ctx.input(|input| input.key_pressed(eframe::egui::Key::Escape)) {
+            self.device_test_output = device_test::OutputState::default();
+            self.device_test_controller_tone = None;
+            if let Some(session) = &self.device_test_session {
+                let _ = session.stop_all();
+            }
+            self.device_test_status = self
+                .language
+                .tr(
+                    "紧急停止：全部输出和扳机已复位",
+                    "Emergency stop: all outputs and triggers reset",
+                )
+                .to_owned();
+        }
         let debug_now = Instant::now();
         let new_severe_gap = self.device_debug_metrics.maximum_interval_ms >= 20.0
             && (self.device_debug_alert_snapshot_max_ms < 20.0
@@ -3245,11 +3516,6 @@ impl eframe::App for FlasherApp {
         {
             self.device_debug_next_snapshot = Some(debug_now + Duration::from_secs(5));
             self.capture_debug_snapshot();
-        }
-        if self.device_debug_started.is_some_and(|started| {
-            started.elapsed() >= Duration::from_secs(self.device_debug_duration_secs as u64)
-        }) {
-            self.stop_debug_benchmark(true);
         }
         let busy = self.busy.is_some();
         let language = self.language;
@@ -3450,6 +3716,14 @@ impl eframe::App for FlasherApp {
                     ui.label(language.tr("固件版本", "Firmware"));
                     ui.horizontal(|ui| match self.firmware_mode {
                         FirmwareMode::Online => {
+                            if !self.show_advanced_firmware
+                                && self
+                                    .selected_release()
+                                    .is_some_and(|release| release.profile == BuildProfile::Diagnostic)
+                            {
+                                self.selected_release =
+                                    preferred_release_index(&self.releases).unwrap_or(0);
+                            }
                             if self.loading_releases {
                                 ui.spinner();
                             }
@@ -3457,10 +3731,11 @@ impl eframe::App for FlasherApp {
                                 .selected_release()
                                 .map(|release| {
                                     format!(
-                                        "{} — {} / {} — {}",
+                                        "{} — {} / {} / {} — {}",
                                         release.tag,
                                         release.board.label(),
                                         release.usb_speed.label(),
+                                        release.profile.label(),
                                         release.name
                                     )
                                 })
@@ -3472,7 +3747,11 @@ impl eframe::App for FlasherApp {
                                     .selected_text(selected_text)
                                     .width(390.0)
                                     .show_ui(ui, |ui| {
+                                        let preferred = preferred_release_index(&self.releases);
                                         for (index, release) in self.releases.iter().enumerate() {
+                                            if !self.show_advanced_firmware && Some(index) != preferred {
+                                                continue;
+                                            }
                                             let channel = if release.prerelease {
                                                 language.tr(" [预发布]", " [prerelease]")
                                             } else {
@@ -3482,11 +3761,12 @@ impl eframe::App for FlasherApp {
                                                 &mut self.selected_release,
                                                 index,
                                                 format!(
-                                                    "{}{} — {} / {} — {}",
+                                                    "{}{} — {} / {} / {} — {}",
                                                     release.tag,
                                                     channel,
                                                     release.board.label(),
                                                     release.usb_speed.label(),
+                                                    release.profile.label(),
                                                     release.name
                                                 ),
                                             );
@@ -3502,6 +3782,13 @@ impl eframe::App for FlasherApp {
                             {
                                 self.refresh_releases();
                             }
+                            ui.checkbox(
+                                &mut self.show_advanced_firmware,
+                                language.tr(
+                                    "高级固件（显示诊断版）",
+                                    "Advanced firmware (show Diagnostic)",
+                                ),
+                            );
                         }
                         FirmwareMode::LocalZip => {
                             if ui
@@ -3738,6 +4025,8 @@ impl eframe::App for FlasherApp {
             let mut reconnect = false;
             let mut tone = None;
             let mut mic_test = false;
+            let mut start_controller_tone = None;
+            let mut stop_controller_tone = false;
             let input = self.device_test_input.clone();
             eframe::egui::CentralPanel::default()
                 .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
@@ -3933,12 +4222,14 @@ impl eframe::App for FlasherApp {
                                         .selected_text(match *value {
                                             device_test::TriggerPreset::Off => language.tr("关闭", "Off"),
                                             device_test::TriggerPreset::Resistance => language.tr("阻力", "Resistance"),
-                                            device_test::TriggerPreset::Pulse => language.tr("脉冲", "Pulse"),
+                                            device_test::TriggerPreset::Weapon => language.tr("扳机", "Weapon"),
+                                            device_test::TriggerPreset::Automatic => language.tr("自动扳机", "Automatic"),
                                         })
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(value, device_test::TriggerPreset::Off, language.tr("关闭", "Off"));
                                             ui.selectable_value(value, device_test::TriggerPreset::Resistance, language.tr("阻力", "Resistance"));
-                                            ui.selectable_value(value, device_test::TriggerPreset::Pulse, language.tr("脉冲", "Pulse"));
+                                            ui.selectable_value(value, device_test::TriggerPreset::Weapon, language.tr("扳机", "Weapon"));
+                                            ui.selectable_value(value, device_test::TriggerPreset::Automatic, language.tr("自动扳机", "Automatic"));
                                         });
                                 });
                             }
@@ -3976,14 +4267,68 @@ impl eframe::App for FlasherApp {
 
                     ui.add_space(12.0);
                     surface_frame().show(ui, |ui| {
-                    ui.heading(language.tr("USB 音频", "USB audio"));
+                    ui.heading(language.tr("手柄声音测试", "Controller audio test"));
+                    notice(
+                        ui,
+                        NoticeTone::Info,
+                        language.tr("原生 1 kHz 测试", "Native 1 kHz test"),
+                        language.tr(
+                            "通过与 ds.evua.cc 相同的 DualSense Feature Report 0x80，直接测试手柄扬声器或已插入手柄的耳机；无需更改 Windows 默认音频设备。",
+                            "Uses the same DualSense Feature Report 0x80 flow as ds.evua.cc to test the controller speaker or a headset connected to the controller; no Windows default-device change is required.",
+                        ),
+                    );
+                    ui.horizontal(|ui| {
+                        let speaker_active = self.device_test_controller_tone
+                            == Some(device_test::ControllerAudioTarget::Speaker);
+                        let headphone_active = self.device_test_controller_tone
+                            == Some(device_test::ControllerAudioTarget::Headphone);
+                        if ui.add_enabled(
+                            connected,
+                            eframe::egui::Button::new(if speaker_active {
+                                language.tr("停止扬声器", "Stop speaker")
+                            } else {
+                                language.tr("扬声器 1 kHz", "Speaker 1 kHz")
+                            }),
+                        ).clicked() {
+                            if speaker_active {
+                                stop_controller_tone = true;
+                            } else {
+                                start_controller_tone = Some(device_test::ControllerAudioTarget::Speaker);
+                            }
+                        }
+                        if ui.add_enabled(
+                            connected,
+                            eframe::egui::Button::new(if headphone_active {
+                                language.tr("停止耳机", "Stop headphone")
+                            } else {
+                                language.tr("耳机 1 kHz", "Headphone 1 kHz")
+                            }),
+                        ).clicked() {
+                            if headphone_active {
+                                stop_controller_tone = true;
+                            } else {
+                                start_controller_tone = Some(device_test::ControllerAudioTarget::Headphone);
+                            }
+                        }
+                        if ui.add_enabled(
+                            connected && self.device_test_controller_tone.is_some(),
+                            eframe::egui::Button::new(language.tr("停止 1 kHz", "Stop 1 kHz")),
+                        ).clicked() {
+                            stop_controller_tone = true;
+                        }
+                    });
+                    });
+
+                    ui.add_space(12.0);
+                    surface_frame().show(ui, |ui| {
+                    ui.heading(language.tr("USB 音频链路", "USB audio path"));
                     notice(
                         ui,
                         NoticeTone::Info,
                         language.tr("Windows 音频设备", "Windows audio device"),
                         language.tr(
-                            "先把 DualSense Wireless Controller 设为默认输出和输入。测试音为 2 秒，麦克风录制 5 秒后自动回放并删除临时文件。",
-                            "Set DualSense Wireless Controller as the default output and input first. Tones last 2 seconds; microphone audio records for 5 seconds, plays back, then deletes the temporary file.",
+                            "此区域单独测试 M61 的 USB 声卡链路。先把 DualSense Wireless Controller 设为 Windows 默认输出和输入；测试音为 2 秒，麦克风录制 5 秒后自动回放。",
+                            "This section separately tests the M61 USB audio path. Set DualSense Wireless Controller as the Windows default output and input first; tones last 2 seconds and microphone audio records for 5 seconds before playback.",
                         ),
                     );
                     ui.horizontal(|ui| {
@@ -4009,6 +4354,7 @@ impl eframe::App for FlasherApp {
 
             if reconnect {
                 self.device_test_connected = false;
+                self.device_test_controller_tone = None;
                 self.device_test_session = Some(device_test::TestSession::start());
             }
             if apply_output {
@@ -4022,6 +4368,19 @@ impl eframe::App for FlasherApp {
                 self.device_test_output = device_test::OutputState::default();
                 if let Some(session) = &self.device_test_session {
                     let _ = session.stop_all();
+                }
+            }
+            if let Some(target) = start_controller_tone {
+                if let Some(session) = &self.device_test_session {
+                    if let Err(error) = session.start_controller_tone(target) {
+                        self.device_test_status = format!("{error:#}");
+                    }
+                }
+            } else if stop_controller_tone {
+                if let Some(session) = &self.device_test_session {
+                    if let Err(error) = session.stop_controller_tone() {
+                        self.device_test_status = format!("{error:#}");
+                    }
                 }
             }
             if let Some(channel) = tone {
@@ -4038,6 +4397,11 @@ impl eframe::App for FlasherApp {
             let mut stop_benchmark = false;
             let mut capture_snapshot = false;
             let mut export_report = false;
+            let mut guide_start = false;
+            let mut guide_signal = false;
+            let mut guide_retest = false;
+            let mut guide_result = None;
+            let mut ota_switch = None;
             let metrics = self.device_debug_metrics.clone();
             let running = self.device_debug_started.is_some();
             let extreme_duration_blocked = self.device_debug_stress_enabled
@@ -4070,6 +4434,166 @@ impl eframe::App for FlasherApp {
                             "These values are Windows USB HID arrival intervals, not absolute button-to-display end-to-end latency.",
                         ),
                     );
+                    ui.add_space(12.0);
+
+                    surface_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(language.tr("固件运行模式", "Firmware runtime profile"));
+                            ui.with_layout(
+                                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                                |ui| {
+                                    ui.monospace(
+                                        self.current_build_profile()
+                                            .map(BuildProfile::label)
+                                            .unwrap_or(language.tr("未知", "Unknown")),
+                                    );
+                                },
+                            );
+                        });
+                        ui.label(
+                            eframe::egui::RichText::new(language.tr(
+                                "常用版关闭运行诊断采样以获得最低开销；诊断版开放 0xFD 快照和 M61 内部转发延迟。两者可通过签名 OTA 来回切换。",
+                                "Standard disables runtime diagnostic sampling for minimum overhead. Diagnostic enables 0xFD snapshots and internal M61 bridge latency. Signed OTA can switch both ways.",
+                            ))
+                            .color(COLOR_TEXT_MUTED),
+                        );
+                        ui.add_space(6.0);
+                        notice(
+                            ui,
+                            NoticeTone::Warning,
+                            language.tr("OTA 安全提示", "OTA safety"),
+                            language.tr(
+                                "切换期间会停止所有测试输出并暂时断开手柄接口。请保持 USB 供电，直到设备重新连接。",
+                                "All test outputs stop and the gamepad interface disconnects briefly. Keep USB powered until the device reconnects.",
+                            ),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let current = self.current_build_profile();
+                            if ui
+                                .add_enabled(
+                                    self.busy.is_none()
+                                        && current != Some(BuildProfile::Diagnostic)
+                                        && self.latest_release_for_profile(BuildProfile::Diagnostic).is_some(),
+                                    primary_button(language.tr(
+                                        "进入诊断模式（OTA）",
+                                        "Enter Diagnostic mode (OTA)",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                ota_switch = Some(BuildProfile::Diagnostic);
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.busy.is_none()
+                                        && current == Some(BuildProfile::Diagnostic)
+                                        && self.latest_release_for_profile(BuildProfile::Standard).is_some(),
+                                    eframe::egui::Button::new(language.tr(
+                                        "恢复常用版（OTA）",
+                                        "Restore Standard (OTA)",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                ota_switch = Some(BuildProfile::Standard);
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.busy.is_none() && !self.loading_firmware_devices,
+                                    eframe::egui::Button::new(language.tr(
+                                        "重新读取模式",
+                                        "Read profile again",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.refresh_firmware_devices();
+                            }
+                        });
+                    });
+
+                    ui.add_space(12.0);
+
+                    surface_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(language.tr("引导式设备诊断", "Guided device diagnostics"));
+                            ui.with_layout(
+                                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                                |ui| {
+                                    ui.label(format!(
+                                        "{}/{}",
+                                        self.guided_test.current + 1,
+                                        self.guided_test.phases.len()
+                                    ));
+                                },
+                            );
+                        });
+                        ui.label(
+                            eframe::egui::RichText::new(language.tr(
+                                "不限时长；可重复操作多次，采样充足后由用户手动进入下一项。断开设备时输出会自动停止。",
+                                "No time limit. Repeat actions as needed, then continue manually when samples are sufficient. Outputs stop on disconnect.",
+                            ))
+                            .color(COLOR_TEXT_MUTED),
+                        );
+                        if !self.guided_test.active {
+                            if ui
+                                .add_enabled(
+                                    self.device_test_connected,
+                                    primary_button(language.tr("开始引导测试", "Start guided test")),
+                                )
+                                .clicked()
+                            {
+                                guide_start = true;
+                            }
+                        } else {
+                            let phase = self.guided_test.phase();
+                            ui.separator();
+                            ui.strong(language.tr(phase.title_zh, phase.title_en));
+                            ui.label(language.tr(phase.instruction_zh, phase.instruction_en));
+                            ui.monospace(format!("Target: {}", phase.target));
+                            if !phase.samples.is_empty() {
+                                ui.label(
+                                    phase
+                                        .samples
+                                        .iter()
+                                        .map(|(name, count)| format!("{name}={count}"))
+                                        .collect::<Vec<_>>()
+                                        .join(" · "),
+                                );
+                            }
+                            let output_phase = matches!(
+                                phase.id,
+                                "leds" | "rumble" | "triggers_output" | "sound" | "microphone" | "summary"
+                            );
+                            if output_phase
+                                && ui
+                                    .add(primary_button(language.tr("生成当前测试信号", "Generate current test signal")))
+                                    .clicked()
+                            {
+                                guide_signal = true;
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(language.tr("通过并下一项", "Pass and next")).clicked() {
+                                    guide_result = Some(guided_test::PhaseResult::Pass);
+                                }
+                                if ui.button(language.tr("未生效", "Not effective")).clicked() {
+                                    guide_result = Some(guided_test::PhaseResult::NotEffective);
+                                }
+                                if ui.button(language.tr("跳过", "Skip")).clicked() {
+                                    guide_result = Some(guided_test::PhaseResult::Skipped);
+                                }
+                                if ui.button(language.tr("重新测试本项", "Retest phase")).clicked() {
+                                    guide_retest = true;
+                                }
+                            });
+                            if self.guided_test.phase().result == guided_test::PhaseResult::NotEffective {
+                                ui.label(language.tr("失败备注（可选）", "Failure note (optional)"));
+                                ui.text_edit_singleline(&mut self.guided_test.phase_mut().note);
+                            }
+                        }
+                    });
+
                     ui.add_space(12.0);
 
                     surface_frame().show(ui, |ui| {
@@ -4578,6 +5102,70 @@ impl eframe::App for FlasherApp {
             if export_report {
                 self.export_debug_report();
             }
+            if let Some(profile) = ota_switch {
+                self.start_profile_ota(profile);
+            }
+            if guide_start {
+                self.ensure_device_session();
+                self.guided_test.start();
+                self.capture_debug_snapshot();
+            }
+            if guide_retest {
+                self.guided_test.retest();
+            }
+            if guide_signal {
+                let phase_id = self.guided_test.phase().id;
+                match phase_id {
+                    "leds" => {
+                        let mut output = device_test::OutputState::default();
+                        output.lightbar_enabled = true;
+                        output.lightbar_rgb = [0, 96, 220];
+                        output.player_leds = 0x15;
+                        output.mute_led = 1;
+                        if let Some(session) = &self.device_test_session {
+                            let _ = session.set_output(output);
+                        }
+                    }
+                    "rumble" => {
+                        let mut output = device_test::OutputState::default();
+                        output.rumble_left = 89;
+                        output.rumble_right = 89;
+                        if let Some(session) = &self.device_test_session {
+                            let _ = session.set_output(output);
+                        }
+                    }
+                    "triggers_output" => {
+                        let mut output = device_test::OutputState::default();
+                        output.left_trigger = device_test::TriggerPreset::Resistance;
+                        output.right_trigger = device_test::TriggerPreset::Resistance;
+                        if let Some(session) = &self.device_test_session {
+                            let _ = session.set_output(output);
+                        }
+                    }
+                    "sound" => {
+                        if let Some(session) = &self.device_test_session {
+                            let _ = session
+                                .start_controller_tone(device_test::ControllerAudioTarget::Speaker);
+                        }
+                    }
+                    "microphone" => self.start_microphone_test(),
+                    "summary" => {
+                        if let Some(session) = &self.device_test_session {
+                            let _ = session.stop_all();
+                        }
+                        self.capture_debug_snapshot();
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(result) = guide_result {
+                if result == guided_test::PhaseResult::NotEffective {
+                    self.guided_test.phase_mut().result = result;
+                    self.capture_debug_snapshot();
+                } else {
+                    self.guided_test.mark_and_next(result);
+                }
+            }
         }
 
         if self.show_diagnostics_window {
@@ -4941,12 +5529,12 @@ fn run_gui() -> Result<()> {
     verify_embedded_tool()?;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 840.0])
-            .with_min_inner_size([900.0, 700.0]),
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([1280.0, 720.0]),
         ..Default::default()
     };
     eframe::run_native(
-        &format!("DS5Dongle Flasher {FLASHER_VERSION}"),
+        &format!("DS5Dongle AIM61 工具中心 {FLASHER_VERSION}"),
         options,
         Box::new(|cc| Ok(Box::new(FlasherApp::new(cc)))),
     )
@@ -4977,6 +5565,7 @@ mod tests {
             },
             board,
             usb_speed,
+            profile: BuildProfile::Standard,
         }
     }
 
@@ -4987,6 +5576,7 @@ mod tests {
             version: "test".into(),
             board: Board::Lctech616,
             usb_speed: UsbSpeed::Fs,
+            profile: BuildProfile::Standard,
             chip: "bl616".into(),
             flash_size: 4,
             boot2: "boot2_bl616_test.bin".into(),
@@ -5078,17 +5668,17 @@ mod tests {
     fn parses_release_asset_board_and_speed() {
         assert_eq!(
             asset_variant("DS5Dongle-lctech616-fs-v3.15.zip"),
-            Some((Board::Lctech616, UsbSpeed::Fs))
+            Some((Board::Lctech616, UsbSpeed::Fs, BuildProfile::Standard))
         );
         assert_eq!(
             asset_variant("DS5Dongle-aim61-hs-v3.15.zip"),
-            Some((Board::Aim61, UsbSpeed::Hs))
+            Some((Board::Aim61, UsbSpeed::Hs, BuildProfile::Standard))
         );
         assert_eq!(asset_variant("firmware.zip"), None);
     }
 
     #[test]
-    fn defaults_to_stable_aim61_full_speed_independent_of_asset_order() {
+    fn defaults_to_aim61_high_speed_standard_independent_of_asset_order() {
         let releases = vec![
             test_release("v4", Board::Lctech616, UsbSpeed::Fs, false),
             test_release("v4", Board::Aim61, UsbSpeed::Hs, false),
@@ -5097,15 +5687,15 @@ mod tests {
             test_release("v4", Board::M0sdock, UsbSpeed::Fs, false),
         ];
 
-        assert_eq!(preferred_release_index(&releases), Some(3));
+        assert_eq!(preferred_release_index(&releases), Some(1));
         let automatic = choose_release(&releases, None, true).unwrap();
         assert_eq!(automatic.board, Board::Aim61);
-        assert_eq!(automatic.usb_speed, UsbSpeed::Fs);
+        assert_eq!(automatic.usb_speed, UsbSpeed::Hs);
 
         // A tag shared by every board must use the same safe preference.
         let tagged = choose_release(&releases, Some("v4"), true).unwrap();
         assert_eq!(tagged.board, Board::Aim61);
-        assert_eq!(tagged.usb_speed, UsbSpeed::Fs);
+        assert_eq!(tagged.usb_speed, UsbSpeed::Hs);
     }
 
     #[test]
@@ -5122,6 +5712,15 @@ mod tests {
         ];
         assert_eq!(preferred_release_index(&prereleases), Some(0));
         assert_eq!(preferred_release_index(&[]), None);
+    }
+
+    #[test]
+    fn newest_standard_prerelease_precedes_older_stable_standard() {
+        let releases = vec![
+            test_release("v3.5.2", Board::Aim61, UsbSpeed::Hs, true),
+            test_release("v3.5.1", Board::Aim61, UsbSpeed::Hs, false),
+        ];
+        assert_eq!(preferred_release_index(&releases), Some(0));
     }
 
     #[test]

@@ -10,40 +10,40 @@ from tools import ota_protocol
 
 
 BEGIN_VECTOR = (
-    "4f54010178563412f02b0d002a"
-    "010001020301f0290d00"
+    "4f54020178563412f02b0d002b"
+    "010101020301f0290d00"
     "b0d51c58c8b9c1f458fadf16c7d375630ef51da4df81915893b05c0fa4ed8bc6"
-    "00000000f9c2342b"
+    "000000007c9724c8"
 )
 DATA_VECTOR = (
-    "4f540110785634122e00000019"
+    "4f540210785634122e00000019"
     "445335446f6e676c65204f5441207465737420766563746f72"
     "000000000000000000000000000000000000000000"
-    "84c23988"
+    "28b4c6a1"
 )
 AUTH0_VECTOR = (
-    "4f54010278563412000000002e"
+    "4f54020278563412000000002e"
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
     "202122232425262728292a2b2c2d"
-    "ea3513bc"
+    "4643ec95"
 )
 AUTH46_VECTOR = (
-    "4f540102785634122e00000012"
+    "4f540202785634122e00000012"
     "2e2f303132333435363738393a3b3c3d3e3f"
     "00000000000000000000000000000000000000000000000000000000"
-    "ae93fa7f"
+    "02e50556"
 )
 ACK_VECTOR = (
-    "4f54018078563412401000002c"
+    "4f54028078563412401000002c"
     "0300020100100000f02b0d0000821600fb0300000100012e1000f20f"
     "424c3631382d44533520332e35000000"
-    "0000f75742f8"
+    "00005b21bdd1"
 )
 ERROR_VECTOR = (
-    "4f5401ff78563412001000002c"
+    "4f5402ff78563412001000002c"
     "0611030100100000f02b0d0000821600fb0300000100012e1000f20f"
     "424c3631382d44533520332e35000000"
-    "0000ef54ddf6"
+    "0000432222df"
 )
 
 
@@ -91,8 +91,8 @@ class OtaProtocolTests(unittest.TestCase):
         self.assertEqual(header_integer("OTA_REPORT_CRC_OFFSET"), 59)
         self.assertEqual(header_integer("OTA_DATA_BYTES_MAX"), 46)
         self.assertEqual(header_integer("OTA_AUTH_SIGNATURE_SIZE"), 64)
-        self.assertEqual(header_integer("OTA_SIGN_CANONICAL_SIZE"), 57)
-        self.assertEqual(header_integer("OTA_BEGIN_DATA_SIZE"), 42)
+        self.assertEqual(header_integer("OTA_SIGN_CANONICAL_SIZE"), 58)
+        self.assertEqual(header_integer("OTA_BEGIN_DATA_SIZE"), 43)
         self.assertEqual(header_integer("OTA_STATUS_DATA_SIZE"), 44)
         self.assertEqual(header_integer("OTA_CTRL_BEGIN"), ota_protocol.OTA_CONTROL_BEGIN)
         self.assertEqual(header_integer("OTA_CTRL_AUTH"), ota_protocol.OTA_CONTROL_AUTH)
@@ -132,9 +132,10 @@ class OtaProtocolTests(unittest.TestCase):
         decoded = ota_protocol.decode_payload(0xFC, payload)
         self.assertEqual(decoded.session, 0x12345678)
         self.assertEqual(decoded.argument, 0x000D2BF0)
-        self.assertEqual(decoded.data[0:6], bytes((1, 0, 1, 2, 3, 1)))
+        self.assertEqual(decoded.data[0:6], bytes((1, 1, 1, 2, 3, 1)))
         self.assertEqual(struct.unpack_from("<I", decoded.data, 6)[0], body_size)
         self.assertEqual(decoded.data[10:42], body_sha)
+        self.assertEqual(decoded.data[42], ota_protocol.OTA_PROFILE_STANDARD)
 
     def test_begin_rejects_versions_outside_sdk_header_limits(self) -> None:
         for version in ((255, 0, 0), (0, 255, 0), (0, 0, 255)):

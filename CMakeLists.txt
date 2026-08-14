@@ -19,7 +19,7 @@ elseif(DEFINED ENV{PROJECT_SDK_VERSION} AND
        NOT "$ENV{PROJECT_SDK_VERSION}" STREQUAL "")
     set(DS5_SELECTED_VERSION "$ENV{PROJECT_SDK_VERSION}")
 else()
-    set(DS5_SELECTED_VERSION "3.5.1")
+    set(DS5_SELECTED_VERSION "3.5.2")
 endif()
 if(NOT DS5_SELECTED_VERSION MATCHES
    "^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])\\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])\\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])$")
@@ -46,7 +46,7 @@ if(NOT DEFINED DS5_LOG_LEVEL)
         set(DS5_LOG_LEVEL "$ENV{DS5_LOG_LEVEL}" CACHE STRING
             "DS5Dongle custom log level (0..3)")
     else()
-        set(DS5_LOG_LEVEL "2" CACHE STRING
+        set(DS5_LOG_LEVEL "0" CACHE STRING
             "DS5Dongle custom log level (0..3)")
     endif()
 endif()
@@ -56,6 +56,29 @@ if(NOT "${DS5_LOG_LEVEL}" MATCHES "^[0-3]$")
         "DS5_LOG_LEVEL must be exactly one of 0, 1, 2, or 3: ${DS5_LOG_LEVEL}")
 endif()
 message(STATUS "DS5Dongle custom log level: ${DS5_LOG_LEVEL}")
+
+# v3.5.2 is built as two deliberately separate HS profiles.  The standard
+# image keeps diagnostics entirely out of the descriptor, task graph and hot
+# paths; the diagnostic image enables the versioned 0xFD protocol.
+if(NOT DEFINED DS5_BUILD_PROFILE)
+    if(DEFINED ENV{DS5_BUILD_PROFILE} AND
+       NOT "$ENV{DS5_BUILD_PROFILE}" STREQUAL "")
+        set(DS5_BUILD_PROFILE "$ENV{DS5_BUILD_PROFILE}" CACHE STRING
+            "DS5Dongle build profile (standard or diagnostic)")
+    else()
+        set(DS5_BUILD_PROFILE "standard" CACHE STRING
+            "DS5Dongle build profile (standard or diagnostic)")
+    endif()
+endif()
+set_property(CACHE DS5_BUILD_PROFILE PROPERTY STRINGS standard diagnostic)
+if(DS5_BUILD_PROFILE STREQUAL "diagnostic")
+    set(DS5_DIAGNOSTIC_BUILD 1)
+elseif(DS5_BUILD_PROFILE STREQUAL "standard")
+    set(DS5_DIAGNOSTIC_BUILD 0)
+else()
+    message(FATAL_ERROR "DS5_BUILD_PROFILE must be standard or diagnostic")
+endif()
+message(STATUS "DS5Dongle build profile: ${DS5_BUILD_PROFILE}")
 
 # A release public key is supplied as a 65-byte SEC1 uncompressed P-256 point
 # (04 || X || Y).  Only X || Y enters the generated build header.  No default
@@ -135,6 +158,11 @@ if(NOT DEFINED ENV{BOARD_LCTECH_616} AND
     set(DS5_TARGET_HAS_PSRAM ON)
 endif()
 
+# Both v3.5.2 profiles use the SDK-supported GCC whole-program optimizer.
+# This keeps the standard image's realtime path small after diagnostic code is
+# compiled out and applies the same code-generation baseline to diagnostics.
+set(CONFIG_GCC_COMPILE_LTO y)
+
 find_package(bouffalo_sdk REQUIRED HINTS $ENV{BL_SDK_BASE})
 
 sdk_set_main_file(src/main.c)
@@ -144,6 +172,10 @@ sdk_set_main_file(src/main.c)
 # Scope them to the only targets that consume them.
 target_compile_definitions(app PRIVATE CONFIG_ENABLE_IMG_HASH)
 target_compile_definitions(app PRIVATE LOG_LEVEL=${DS5_LOG_LEVEL})
+target_compile_definitions(app PRIVATE
+    DS5_DIAGNOSTIC_BUILD=${DS5_DIAGNOSTIC_BUILD}
+    DS5_BUILD_PROFILE_NAME="${DS5_BUILD_PROFILE}"
+)
 if(TARGET libfota)
     target_compile_definitions(libfota PRIVATE CONFIG_OTA_VERSION_CHECK)
 else()
@@ -163,8 +195,10 @@ target_sources(app PRIVATE
     src/dse.c
     src/remap.c
     src/ota_update.c
-    src/runtime_diag.c
 )
+if(DS5_DIAGNOSTIC_BUILD)
+    target_sources(app PRIVATE src/runtime_diag.c)
+endif()
 
 sdk_add_include_directories(src)
 sdk_add_include_directories(${BL_SDK_BASE}/components/wireless/bluetooth/blestack/src/include)
@@ -227,14 +261,13 @@ target_compile_options(app PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-include${CMAKE_CURRENT_LIST_DIR}/lib/opus_config.h>
 )
 
-# The Bouffalo SDK defaults to -Os.  Keep that conservative setting for the
-# USB/BT control paths, but allow the two measured DSP hot spots to trade a
-# small amount of the ample flash budget for lower worst-case execution time.
-# Do not enable application-wide LTO: the Bouffalo post-build DWARF-CFI tool
-# extracts libapp.a with an ar invocation that cannot consume LTO bytecode.
-# Source-level options are emitted after the SDK defaults, so these override
-# -Os only for the selected translation units.
-set_source_files_properties(src/audio.c PROPERTIES COMPILE_OPTIONS "-O3")
+# Performance policy shared by both profiles.  Fast-math stays disabled so the
+# Opus fixed-point path remains bit-exact.  Hot bridge/audio sources use -O3;
+# codec sources use -O2 to avoid pathological code growth.
+set_source_files_properties(
+    src/audio.c src/usb_gamepad.c src/bt_hid_host.c
+    PROPERTIES COMPILE_OPTIONS "-O3"
+)
 set_source_files_properties(${OPUS_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
 
 project(ds5dongle_bl618)

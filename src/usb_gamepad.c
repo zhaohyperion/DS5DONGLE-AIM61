@@ -31,8 +31,13 @@
 #define USB_HID_ONLY_SIZE (9 + 9 + 7 + 7 + USB_KBD_DESC_SIZE)
 #define USB_AUDIO_DESC_SIZE 186
 #define USB_HID_CONFIG_SIZE (9 + USB_AUDIO_DESC_SIZE + USB_HID_ONLY_SIZE)
+#if DS5_DIAGNOSTIC_BUILD
 #define HID_REPORT_DESC_SIZE_DS  353
 #define HID_REPORT_DESC_SIZE_DSE 469
+#else
+#define HID_REPORT_DESC_SIZE_DS  345
+#define HID_REPORT_DESC_SIZE_DSE 461
+#endif
 #define KBD_REPORT_DESC_SIZE 45
 #define USB_KBD_INTERVAL_HS  7  /* 2^(7-1) microframes = 8 ms */
 #ifdef FORCE_FS_MODE
@@ -265,10 +270,12 @@ static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
     0x09, 0x3E,
     0x95, 0x3F,
     0xB1, 0x02,
+#if DS5_DIAGNOSTIC_BUILD
     0x85, RUNTIME_DIAG_REPORT_ID,
     0x09, 0x3F,
     0x95, 0x3F,
     0xB1, 0x02,
+#endif
 
     0xC0,             /* End Collection */
 };
@@ -345,7 +352,9 @@ static const uint8_t hid_report_desc_dse[HID_REPORT_DESC_SIZE_DSE] = {
     0x85, 0xFB, 0x09, 0x3C, 0x95, 0x3F, 0xB1, 0x02,  /* button remap table */
     0x85, OTA_DATA_REPORT_ID, 0x09, 0x3D, 0x95, 0x3F, 0x91, 0x02,
     0x85, OTA_CONTROL_REPORT_ID, 0x09, 0x3E, 0x95, 0x3F, 0xB1, 0x02,
+#if DS5_DIAGNOSTIC_BUILD
     0x85, RUNTIME_DIAG_REPORT_ID, 0x09, 0x3F, 0x95, 0x3F, 0xB1, 0x02,
+#endif
     0xC0,
 };
 
@@ -666,6 +675,7 @@ static volatile uint32_t stat_transfers_started = 0;
 static volatile uint32_t stat_transfers_completed = 0;
 static volatile uint32_t stat_start_errors = 0;
 
+#if DS5_DIAGNOSTIC_BUILD
 #define LATENCY_HIST_BUCKETS 16u
 static const uint32_t latency_hist_upper_us[LATENCY_HIST_BUCKETS] = {
     250u, 500u, 750u, 1000u, 1500u, 2000u, 3000u, 4000u,
@@ -717,6 +727,7 @@ static void latency_record(uint64_t completed_us)
     active_received_us = 0u;
     active_submit_us = 0u;
 }
+#endif
 
 /* Logging is deferred out of the TCM/USB interrupt path. */
 static volatile bool first_usb_send_log_pending = false;
@@ -741,7 +752,11 @@ static void try_send_pending(void)
     }
 
     active_received_us = pending_received_us[index];
+#if DS5_DIAGNOSTIC_BUILD
     active_submit_us = bflb_mtimer_get_time_us();
+#else
+    active_submit_us = 0u;
+#endif
     queued_generation = pending_generation;
     stat_transfers_started++;
     if (!first_usb_send_logged) {
@@ -756,7 +771,9 @@ ATTR_TCM_SECTION
 static void hid_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     (void)busid; (void)ep; (void)nbytes;
+#if DS5_DIAGNOSTIC_BUILD
     latency_record(bflb_mtimer_get_time_us());
+#endif
     stat_transfers_completed++;
     ep_in_busy = false;
     try_send_pending();
@@ -1412,6 +1429,7 @@ void usb_gamepad_get_runtime_stats(struct usb_gamepad_runtime_stats *out)
     taskEXIT_CRITICAL();
 }
 
+#if DS5_DIAGNOSTIC_BUILD
 static uint32_t latency_percentile(const uint32_t *histogram,
                                    uint32_t samples, uint32_t numerator)
 {
@@ -1471,6 +1489,13 @@ void usb_gamepad_get_latency_stats(struct usb_gamepad_latency_stats *out)
     out->total_p99_us = latency_percentile(histogram, samples, 99u);
     out->total_max_us = total_max;
 }
+#else
+void usb_gamepad_get_latency_stats(struct usb_gamepad_latency_stats *out)
+{
+    if (out)
+        memset(out, 0, sizeof(*out));
+}
+#endif
 
 void usb_gamepad_get_link_status(struct usb_gamepad_link_status *out)
 {
@@ -1496,8 +1521,11 @@ static uint8_t kbd_idle_report[USB_KBD_EP_MPS];
 static bool is_dongle_cmd(uint8_t report_id)
 {
     return (report_id >= 0xF6 && report_id <= 0xF9) ||
-           report_id == 0xFB || report_id == OTA_CONTROL_REPORT_ID ||
-           report_id == RUNTIME_DIAG_REPORT_ID;
+           report_id == 0xFB || report_id == OTA_CONTROL_REPORT_ID
+#if DS5_DIAGNOSTIC_BUILD
+           || report_id == RUNTIME_DIAG_REPORT_ID
+#endif
+           ;
 }
 
 /*
@@ -1613,9 +1641,16 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             LOG_ISR("[USB-ISR] GET_REPORT(0xF7) config %u bytes\n", cfg_len);
         } else if (report_id == 0xF8) {
             uint16_t ver_len = strlen(OTA_FIRMWARE_VERSION);
-            if (ver_len > FEATURE_DATA_MAX)
-                ver_len = FEATURE_DATA_MAX;
+            if (ver_len > FEATURE_DATA_MAX - 1u)
+                ver_len = FEATURE_DATA_MAX - 1u;
             memcpy(feature_resp_buf + 1, OTA_FIRMWARE_VERSION, ver_len);
+            feature_resp_buf[1 + ver_len++] = '|';
+            uint16_t profile_len = strlen(DS5_BUILD_PROFILE_NAME);
+            if (profile_len > FEATURE_DATA_MAX - ver_len)
+                profile_len = FEATURE_DATA_MAX - ver_len;
+            memcpy(feature_resp_buf + 1 + ver_len,
+                   DS5_BUILD_PROFILE_NAME, profile_len);
+            ver_len += profile_len;
             *data = feature_resp_buf;
             *len  = 1 + ver_len;
             LOG_ISR("[USB-ISR] GET_REPORT(0xF8) firmware version\n");
@@ -1645,11 +1680,13 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             ota_update_get_status_report(feature_resp_buf + 1);
             *data = feature_resp_buf;
             *len = 1 + OTA_REPORT_PAYLOAD_SIZE;
+#if DS5_DIAGNOSTIC_BUILD
         } else if (report_id == RUNTIME_DIAG_REPORT_ID) {
             /* The callback selects and copies an already-published page. */
             runtime_diag_get_selected_report(feature_resp_buf + 1);
             *data = feature_resp_buf;
             *len = 1 + RUNTIME_DIAG_REPORT_SIZE;
+#endif
         } else {
             *len = 0;
         }
@@ -1716,12 +1753,14 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             (void)ota_update_enqueue_control_from_isr(payload, payload_len);
         return;
     }
+#if DS5_DIAGNOSTIC_BUILD
     if (report_id == RUNTIME_DIAG_REPORT_ID && report_type == 0x03) {
         /* Selection is intentionally global and harmless: bounded validation
          * plus one atomic byte store, including during OTA maintenance. */
         (void)runtime_diag_select_page_from_isr(payload, payload_len);
         return;
     }
+#endif
 
     if (usb_maintenance_mode)
         return;
@@ -1763,7 +1802,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
          report_id == 0x62 || report_id == 0x80)) {
         set_report_entry_t entry;
         entry.report_id = report_id;
-        entry.is_dse    = true;
+        entry.is_dse    = report_id != 0x80;
         entry.len = (payload_len <= SET_REPORT_MAX_DATA)
                         ? payload_len : SET_REPORT_MAX_DATA;
         memcpy(entry.data, payload, entry.len);

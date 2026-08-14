@@ -12,7 +12,7 @@ OTA_CONTROL_REPORT_ID = 0xFC
 OTA_PAYLOAD_SIZE = 63
 OTA_CRC_OFFSET = 59
 OTA_MAGIC = b"OT"
-OTA_PROTOCOL_VERSION = 1
+OTA_PROTOCOL_VERSION = 2
 OTA_DATA_TYPE = 0x10
 OTA_DATA_CAPACITY = 46
 
@@ -26,12 +26,15 @@ OTA_CONTROL_ERROR = 0xFF
 
 OTA_BOARD_AIM61 = 1
 OTA_USB_FULL_SPEED = 0
+OTA_USB_HIGH_SPEED = 1
+OTA_PROFILE_STANDARD = 0
+OTA_PROFILE_DIAGNOSTIC = 1
 OTA_FORMAT_RAW = 1
 OTA_BEGIN_FLAG_SIGNED = 1 << 0
-OTA_BEGIN_DATA_SIZE = 42
+OTA_BEGIN_DATA_SIZE = 43
 OTA_AUTH_SIGNATURE_SIZE = 64
 OTA_STATUS_DATA_SIZE = 44
-OTA_CAP_LIVE_RESUME = 1 << 2  # Reserved in v1; current firmware does not advertise it.
+OTA_CAP_LIVE_RESUME = 1 << 2  # Reserved; current firmware does not advertise it.
 OTA_ERROR_TIMEOUT = 19
 
 CONTROL_OPCODES = {
@@ -140,6 +143,8 @@ def encode_begin(
     body_sha256: bytes,
     *,
     signed: bool = True,
+    usb_speed: int = OTA_USB_HIGH_SPEED,
+    profile: int = OTA_PROFILE_STANDARD,
 ) -> bytes:
     if len(version) != 3 or any(not 0 <= component < 255 for component in version):
         raise OtaProtocolError("semantic version must contain three values in 0..254")
@@ -153,13 +158,18 @@ def encode_begin(
         raise OtaProtocolError("complete OTA size must equal RAW body size + 512")
     if len(body_sha256) != 32:
         raise OtaProtocolError("RAW body SHA-256 must be exactly 32 bytes")
+    if usb_speed not in (OTA_USB_FULL_SPEED, OTA_USB_HIGH_SPEED):
+        raise OtaProtocolError("USB speed must be full-speed or high-speed")
+    if profile not in (OTA_PROFILE_STANDARD, OTA_PROFILE_DIAGNOSTIC):
+        raise OtaProtocolError("build profile must be standard or diagnostic")
     data = bytearray(OTA_BEGIN_DATA_SIZE)
     data[0] = OTA_BOARD_AIM61
-    data[1] = OTA_USB_FULL_SPEED
+    data[1] = usb_speed
     data[2:5] = bytes(version)
     data[5] = OTA_BEGIN_FLAG_SIGNED if signed else 0
     struct.pack_into("<I", data, 6, body_size)
     data[10:42] = body_sha256
+    data[42] = profile
     return encode_control(OTA_CONTROL_BEGIN, session, total_size, bytes(data))
 
 

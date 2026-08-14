@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File tools\m61-diagnostics.ps1 -SelfTest
 
 ## Firmware logging policy
 
-Production firmware stays at custom `LOG_LEVEL=2`: errors, warnings, and lifecycle events. A diagnostic build may use level 3 to emit fixed-size aggregate USB, audio, queue, and Bluetooth counters every ten seconds.
+The v3.5.2 standard profile uses custom `LOG_LEVEL=0` and has no `0xFD` descriptor, publisher task, diagnostic report banks, or periodic diagnostic work. The diagnostic profile normally uses level 1. Detailed snapshots are produced only while a host has activated a diagnostic session.
 
 The following paths must never print or hex-dump payloads:
 
@@ -60,18 +60,25 @@ For AI-M61, native USB still requires the USB_DM/USB_DP/GND wiring described in 
 
 ## Vendor HID Feature Report `0xFD`
 
-Runtime diagnostics use local vendor Feature Report `0xFD`. It is deliberately separate from configuration reports `0xF6`-`0xF9`, remapping `0xFB`, and OTA reports `0xFA`/`0xFC`; it is never forwarded to the controller. Both standard DualSense and DualSense Edge descriptors declare 63 payload bytes for this report.
+Runtime diagnostics use local vendor Feature Report `0xFD`. It is deliberately separate from configuration reports `0xF6`-`0xF9`, remapping `0xFB`, and OTA reports `0xFA`/`0xFC`; it is never forwarded to the controller. Only the **diagnostic firmware profile** declares it. The standard profile does not expose `0xFD` for either DualSense or DualSense Edge.
 
 The layouts below describe the 63-byte payload of Feature Report `0xFD`. CherryUSB internally prefixes that payload with the report ID, so the firmware class callback returns 64 bytes. Native host APIs may expose that prefix differently; it is never part of the CRC.
 
 ### Page selection
 
+Start a v2 session before capture, select pages, then stop the session when collection ends:
+
+```text
+sendFeatureReport(0xFD, [0x02, 0x02, 0x01])  # start
+sendFeatureReport(0xFD, [0x02, 0x02, 0x00])  # stop
+```
+
 Page zero is selected after boot. Select another page with:
 
 ```text
-sendFeatureReport(0xFD, [0x01, 0x01, page])
+sendFeatureReport(0xFD, [0x01, 0x02, page])
                          |     |     +-- page 0..6
-                         |     +-------- protocol version 1
+                         |     +-------- protocol version 2
                          +-------------- SELECT_PAGE opcode
 ```
 
@@ -81,12 +88,12 @@ The selector is device-global, so two host readers can race. A reader must valid
 
 ### Common response header
 
-Each second, the dedicated low-priority `diag` task builds all seven pages in an inactive bank and atomically publishes the complete bank. Every page in one snapshot has the same sequence and monotonic time. The task runs at FreeRTOS priority 1 with 1024 RV32 stack words (4 KiB), below LED, microphone, audio, Bluetooth, OTA, USB, and timer work.
+While a v2 session is active, the dedicated low-priority `diag` task builds all seven pages in an inactive bank and atomically publishes the complete bank once per second. When no session is active it returns without sampling. Every page in one snapshot has the same sequence and monotonic time. The task runs at FreeRTOS priority 1 with 1024 RV32 stack words (4 KiB), below LED, microphone, audio, Bluetooth, OTA, USB, and timer work.
 
 | Payload bytes | Type | Meaning |
 | --- | --- | --- |
 | `0..1` | ASCII | Magic `DG` |
-| `2` | `u8` | Protocol version, currently `1` |
+| `2` | `u8` | Protocol version, currently `2` |
 | `3` | `u8` | Header length, `16` |
 | `4` | `u8` | Page index, `0..6` |
 | `5` | `u8` | Page count, `7` |

@@ -72,6 +72,7 @@ typedef struct {
     uint8_t expected_body_sha256[32];
     uint8_t semver[3];
     uint8_t begin_flags;
+    uint8_t target_profile;
     uint8_t signature[OTA_AUTH_SIGNATURE_SIZE];
     uint8_t auth_received;
     uint8_t slice[OTA_SDK_SLICE_SIZE] __attribute__((aligned(32)));
@@ -238,7 +239,7 @@ static bool release_public_key_is_valid(void)
 
 static bool verify_signature(void)
 {
-    static const uint8_t domain[] = "DS5DONGLE-OTA-V1";
+    static const uint8_t domain[] = "DS5DONGLE-OTA-V2";
     static const uint8_t p256_order[32] = {
         0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -277,6 +278,7 @@ static bool verify_signature(void)
     offset += sizeof(domain) - 1u;
     canonical[offset++] = OTA_CURRENT_BOARD;
     canonical[offset++] = OTA_CURRENT_USB_SPEED;
+    canonical[offset++] = ota_ctx.target_profile;
     memcpy(canonical + offset, ota_ctx.semver, sizeof(ota_ctx.semver));
     offset += sizeof(ota_ctx.semver);
     write_le32(canonical + offset, ota_ctx.body_size);
@@ -433,6 +435,7 @@ static void reset_transfer_fields(void)
     ota_ctx.slice_len = 0;
     ota_ctx.auth_received = 0;
     ota_ctx.begin_flags = 0;
+    ota_ctx.target_profile = OTA_CURRENT_BUILD_PROFILE;
     ota_ctx.auth_required = false;
     ota_ctx.auth_verified = false;
     ota_ctx.header_checked = false;
@@ -655,6 +658,7 @@ static bool begin_matches_live_session(const uint8_t *report)
            data[OTA_BEGIN_SPEED_OFFSET] == OTA_CURRENT_USB_SPEED &&
            memcmp(data + OTA_BEGIN_SEMVER_OFFSET, ota_ctx.semver, 3) == 0 &&
            data[OTA_BEGIN_FLAGS_OFFSET] == ota_ctx.begin_flags &&
+           data[OTA_BEGIN_PROFILE_OFFSET] == ota_ctx.target_profile &&
            read_le32(data + OTA_BEGIN_BODY_LEN_OFFSET) == ota_ctx.body_size &&
            memcmp(data + OTA_BEGIN_BODY_SHA_OFFSET,
                   ota_ctx.expected_body_sha256, 32) == 0;
@@ -726,6 +730,7 @@ static void process_begin(const uint8_t *report)
     }
     if (data[OTA_BEGIN_BOARD_OFFSET] != OTA_CURRENT_BOARD ||
         data[OTA_BEGIN_SPEED_OFFSET] != OTA_CURRENT_USB_SPEED ||
+        data[OTA_BEGIN_PROFILE_OFFSET] > OTA_PROFILE_DIAGNOSTIC ||
         (flags & (uint8_t)~OTA_BEGIN_FLAG_SIGNED) != 0 ||
         data[OTA_BEGIN_SEMVER_OFFSET] == 0xFFu ||
         data[OTA_BEGIN_SEMVER_OFFSET + 1] == 0xFFu ||
@@ -735,12 +740,18 @@ static void process_begin(const uint8_t *report)
         publish_status();
         return;
     }
-    if (data[OTA_BEGIN_SEMVER_OFFSET] < APP_VER_X ||
+    bool version_older = data[OTA_BEGIN_SEMVER_OFFSET] < APP_VER_X ||
         (data[OTA_BEGIN_SEMVER_OFFSET] == APP_VER_X &&
          data[OTA_BEGIN_SEMVER_OFFSET + 1] < APP_VER_Y) ||
         (data[OTA_BEGIN_SEMVER_OFFSET] == APP_VER_X &&
          data[OTA_BEGIN_SEMVER_OFFSET + 1] == APP_VER_Y &&
-         data[OTA_BEGIN_SEMVER_OFFSET + 2] <= APP_VER_Z)) {
+         data[OTA_BEGIN_SEMVER_OFFSET + 2] < APP_VER_Z);
+    bool version_same = data[OTA_BEGIN_SEMVER_OFFSET] == APP_VER_X &&
+        data[OTA_BEGIN_SEMVER_OFFSET + 1] == APP_VER_Y &&
+        data[OTA_BEGIN_SEMVER_OFFSET + 2] == APP_VER_Z;
+    if (version_older ||
+        (version_same &&
+         data[OTA_BEGIN_PROFILE_OFFSET] == OTA_CURRENT_BUILD_PROFILE)) {
         ota_ctx.error = OTA_ERROR_BAD_TARGET;
         publish_status();
         return;
@@ -778,6 +789,7 @@ static void process_begin(const uint8_t *report)
     ota_ctx.total_size = total_size;
     ota_ctx.body_size = body_size;
     ota_ctx.begin_flags = flags;
+    ota_ctx.target_profile = data[OTA_BEGIN_PROFILE_OFFSET];
     memcpy(ota_ctx.semver, data + OTA_BEGIN_SEMVER_OFFSET, 3);
     memcpy(ota_ctx.expected_body_sha256,
            data + OTA_BEGIN_BODY_SHA_OFFSET, 32);

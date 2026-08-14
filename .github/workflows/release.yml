@@ -1,9 +1,9 @@
-name: Build firmware and Windows flasher
+name: Build v3.5.2 firmware and Flasher v1.3.1
 
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main, master]
   release:
     types: [published]
   workflow_dispatch:
@@ -11,87 +11,75 @@ on:
 permissions:
   contents: read
 
+env:
+  SDK_COMMIT: 09abb06993d7aaa594648ecb6a3212c53a44f3da
+
 jobs:
   firmware:
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        board: [aim61, lctech616, m0sdock]
-        speed: [fs, hs]
+        profile: [standard, diagnostic]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: sqlCRT/bouffalo_sdk
-          ref: cf6adf74b374a0e485defa9c89610f3e7ffcc3ec
+          repository: bouffalolab/bouffalo_sdk
+          ref: ${{ env.SDK_COMMIT }}
           path: dependencies/bouffalo_sdk
+      - name: Apply audited DS5Dongle SDK patches
+        shell: pwsh
+        run: |
+          if ((git -C dependencies/bouffalo_sdk rev-parse HEAD).Trim() -ne $env:SDK_COMMIT) {
+            throw "unexpected Bouffalo SDK commit"
+          }
+          Get-ChildItem sdk-patches -Filter *.patch | Sort-Object Name | ForEach-Object {
+            git -C dependencies/bouffalo_sdk apply --check --recount $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "SDK patch check failed: $($_.Name)" }
+            git -C dependencies/bouffalo_sdk apply --recount $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "SDK patch failed: $($_.Name)" }
+          }
       - name: Clone T-Head toolchain
         shell: pwsh
         run: git clone --depth 1 https://gitee.com/bouffalolab/toolchain_gcc_t-head_windows.git dependencies/toolchain
       - uses: actions/setup-python@v5
         with: {python-version: "3.13"}
-      - name: Build and package
+      - name: Build AIM61 High-Speed profile
         shell: pwsh
         env:
           BL_SDK_BASE: ${{ github.workspace }}\dependencies\bouffalo_sdk
           TOOLCHAIN_PATH: ${{ github.workspace }}\dependencies\toolchain
-          BOARD_TYPE: ${{ matrix.board }}
-          USB_SPEED: ${{ matrix.speed }}
+          BOARD_TYPE: aim61
+          USB_SPEED: hs
+          DS5_BUILD_PROFILE: ${{ matrix.profile }}
+          DS5_LOG_LEVEL: ${{ matrix.profile == 'diagnostic' && '1' || '0' }}
+          FIRMWARE_VERSION: 3.5.2
+          PROJECT_SDK_VERSION: 3.5.2
           OTA_P256_PUBLIC_KEY_SEC1_B64: ${{ vars.OTA_P256_PUBLIC_KEY_SEC1_B64 }}
         run: |
-          $firmwareVersion = "${{ github.event_name == 'release' && github.event.release.tag_name || '3.5.1' }}" -replace '^v', ''
-          if ($firmwareVersion -notmatch '^(?:[0-9]|[1-9][0-9]{1,2})\.(?:[0-9]|[1-9][0-9]{1,2})\.(?:[0-9]|[1-9][0-9]{1,2})$') {
-            throw "Release tag must be v?MAJOR.MINOR.PATCH with components 0..254"
-          }
-          $parts = $firmwareVersion.Split('.') | ForEach-Object { [int]$_ }
-          if ($parts | Where-Object { $_ -ge 255 }) { throw "Version components must be <= 254" }
-          if ($firmwareVersion.Length -gt 8) {
-            throw "Version must be at most 8 ASCII characters so EVENT_V<version> fits the OTA header"
-          }
-          $env:FIRMWARE_VERSION = $firmwareVersion
-          $env:PROJECT_SDK_VERSION = $firmwareVersion
           if ("${{ github.event_name }}" -eq "release") {
             if ([string]::IsNullOrWhiteSpace($env:OTA_P256_PUBLIC_KEY_SEC1_B64)) {
-              throw "OTA_P256_PUBLIC_KEY_SEC1_B64 repository variable is required for a release"
+              throw "OTA_P256_PUBLIC_KEY_SEC1_B64 is required for release firmware"
             }
-            try {
-              [byte[]]$otaPublicKey = [Convert]::FromBase64String(
-                $env:OTA_P256_PUBLIC_KEY_SEC1_B64.Trim()
-              )
-            } catch {
-              throw "OTA_P256_PUBLIC_KEY_SEC1_B64 is not valid Base64"
-            }
-            if ($otaPublicKey.Length -ne 65 -or $otaPublicKey[0] -ne 0x04) {
-              throw "OTA_P256_PUBLIC_KEY_SEC1_B64 must decode to 65-byte SEC1 04||X||Y"
-            }
-            $otaPublicKeyPath = Join-Path $env:RUNNER_TEMP "ds5dongle-ota-p256-public.sec1"
-            [IO.File]::WriteAllBytes($otaPublicKeyPath, $otaPublicKey)
-            $env:DS5_OTA_PUBLIC_KEY_FILE = $otaPublicKeyPath
-          } else {
-            Remove-Item Env:DS5_OTA_PUBLIC_KEY_FILE -ErrorAction SilentlyContinue
+            [byte[]]$key = [Convert]::FromBase64String($env:OTA_P256_PUBLIC_KEY_SEC1_B64.Trim())
+            if ($key.Length -ne 65 -or $key[0] -ne 4) { throw "invalid OTA P-256 public key" }
+            $keyPath = Join-Path $env:RUNNER_TEMP "ota-public.sec1"
+            [IO.File]::WriteAllBytes($keyPath, $key)
+            $env:DS5_OTA_PUBLIC_KEY_FILE = $keyPath
           }
           .\build_windows.bat rebuild
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ("${{ github.event_name }}" -eq "release") {
-            $generatedKeyHeader = "build\generated\ds5_ota\ota_release_public_key.h"
-            if (-not (Select-String -LiteralPath $generatedKeyHeader -Quiet `
-                  -SimpleMatch "DS5_OTA_RELEASE_PUBLIC_KEY_CONFIGURED 1")) {
-              throw "release firmware was built without the OTA public key"
-            }
-          }
-          python tools\package_firmware.py --board $env:BOARD_TYPE --usb-speed $env:USB_SPEED --version "${{ github.event.release.tag_name || github.sha }}" --firmware-dir "firmware\$env:BOARD_TYPE" --output-dir dist
-          if ($env:BOARD_TYPE -eq "aim61") {
-            $version = "${{ github.event.release.tag_name || github.sha }}".TrimStart("v")
-            $otaSource = "build\build_out\ds5dongle_bl618_bl616.bin.ota"
-            $otaTarget = "dist\DS5Dongle-aim61-$($env:USB_SPEED)-v$version.bin.ota"
-            python tools\ota_release.py inspect --image $otaSource
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            Copy-Item -LiteralPath $otaSource -Destination $otaTarget
-          }
+          python tools\package_firmware.py --board aim61 --usb-speed hs `
+            --profile $env:DS5_BUILD_PROFILE --version 3.5.2 `
+            --firmware-dir firmware\aim61 --output-dir dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $suffix = if ($env:DS5_BUILD_PROFILE -eq 'diagnostic') { '-diag' } else { '' }
+          Copy-Item build\build_out\ds5dongle_bl618_bl616.bin.ota `
+            "dist\DS5Dongle-aim61-hs$suffix-v3.5.2.bin.ota"
       - uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.board }}-${{ matrix.speed }}
+          name: firmware-aim61-hs-${{ matrix.profile }}
           path: dist/*
           if-no-files-found: error
 
@@ -101,119 +89,114 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: sqlCRT/bouffalo_sdk
-          ref: cf6adf74b374a0e485defa9c89610f3e7ffcc3ec
+          repository: bouffalolab/bouffalo_sdk
+          ref: ${{ env.SDK_COMMIT }}
           path: dependencies/bouffalo_sdk
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
       - uses: actions/setup-python@v5
         with: {python-version: "3.13"}
-      - name: Test package builder and flasher
+      - name: Test package tooling and build Flasher
         shell: pwsh
         env:
           M61_BLFLASHCOMMAND: ${{ github.workspace }}\dependencies\bouffalo_sdk\tools\bflb_tools\bouffalo_flash_cube\BLFlashCommand.exe
         run: |
-          python -m unittest tools.test_package_firmware tools.test_ota_release tools.test_ota_protocol
+          python -m unittest tools.test_package_firmware tools.test_ota_release tools.test_ota_protocol tools.test_firmware_contract
           cargo fmt --manifest-path tools\ds5dongle-flasher\Cargo.toml -- --check
-          cargo test --manifest-path tools\ds5dongle-flasher\Cargo.toml
-          cargo build --release --manifest-path tools\ds5dongle-flasher\Cargo.toml
+          cargo test --locked --manifest-path tools\ds5dongle-flasher\Cargo.toml
+          cargo build --locked --release --manifest-path tools\ds5dongle-flasher\Cargo.toml
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item tools\ds5dongle-flasher\target\release\ds5dongle-flasher.exe dist\DS5Dongle-Flasher-Windows.exe
-          (Get-FileHash dist\DS5Dongle-Flasher-Windows.exe -Algorithm SHA256).Hash.ToLowerInvariant() + '  DS5Dongle-Flasher-Windows.exe' | Set-Content dist\DS5Dongle-Flasher-Windows.exe.sha256 -Encoding ascii
+          Copy-Item tools\ds5dongle-flasher\target\release\ds5dongle-flasher.exe `
+            dist\DS5Dongle-Flasher-Windows-v1.3.1.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-flasher
+          name: windows-flasher-v1.3.1
           path: dist/*
           if-no-files-found: error
 
   publish:
     if: github.event_name == 'release'
     needs: [firmware, flasher]
-    # Deterministic ECDSA uses OpenSSL's RFC 6979 ``nonce-type`` support,
-    # introduced in OpenSSL 3.5.  The Windows 2025 runner carries OpenSSL
-    # 3.6, while ubuntu-24.04 still carries OpenSSL 3.0.
     runs-on: windows-2025
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with: {path: dist, merge-multiple: true}
+        with: {path: artifacts}
       - uses: actions/setup-python@v5
         with: {python-version: "3.13"}
-      - name: Sign and verify stable M61 OTA manifest
-        shell: bash
+      - name: Sign profile-bound OTA metadata and place it inside each ZIP
+        shell: pwsh
         env:
           OTA_P256_PRIVATE_KEY_B64: ${{ secrets.OTA_P256_PRIVATE_KEY_B64 }}
           OTA_P256_KEY_ID: ${{ vars.OTA_P256_KEY_ID }}
           OTA_P256_PUBLIC_KEY_SEC1_B64: ${{ vars.OTA_P256_PUBLIC_KEY_SEC1_B64 }}
         run: |
-          set -euo pipefail
-          if [[ -z "$OTA_P256_PRIVATE_KEY_B64" ]]; then
-            echo "::error::OTA_P256_PRIVATE_KEY_B64 secret is required for a stable release" >&2
-            exit 1
-          fi
-          if [[ -z "$OTA_P256_KEY_ID" ]]; then
-            echo "::error::OTA_P256_KEY_ID repository variable is required" >&2
-            exit 1
-          fi
-          if [[ ! "$OTA_P256_KEY_ID" =~ ^[0-9A-Za-z._-]{1,64}$ ]]; then
-            echo "::error::OTA_P256_KEY_ID must match [0-9A-Za-z._-]{1,64}" >&2
-            exit 1
-          fi
-          if [[ -z "$OTA_P256_PUBLIC_KEY_SEC1_B64" ]]; then
-            echo "::error::OTA_P256_PUBLIC_KEY_SEC1_B64 repository variable is required" >&2
-            exit 1
-          fi
-          private_key="$RUNNER_TEMP/ds5dongle-ota-p256.pem"
-          public_key="$RUNNER_TEMP/ds5dongle-ota-p256-public.pem"
-          configured_sec1="$RUNNER_TEMP/ds5dongle-ota-p256-configured.sec1"
-          derived_sec1="$RUNNER_TEMP/ds5dongle-ota-p256-derived.sec1"
-          trap 'rm -f "$private_key" "$public_key" "$configured_sec1" "$derived_sec1"' EXIT
-          umask 077
-          printf '%s' "$OTA_P256_PRIVATE_KEY_B64" | base64 --decode > "$private_key"
-          printf '%s' "$OTA_P256_PUBLIC_KEY_SEC1_B64" | base64 --decode > "$configured_sec1"
-          CONFIGURED_SEC1="$configured_sec1" python -c 'import os, sys; from pathlib import Path; data=Path(os.environ["CONFIGURED_SEC1"]).read_bytes(); sys.exit("OTA_P256_PUBLIC_KEY_SEC1_B64 must decode to 65-byte SEC1 04||X||Y") if len(data) != 65 or data[0] != 4 else None'
-          openssl pkey -in "$private_key" -pubout -out "$public_key"
-          python tools/ota_release.py export-public-key \
-            --public-key "$public_key" \
-            --output "$derived_sec1"
-          if ! cmp -s "$configured_sec1" "$derived_sec1"; then
-            echo "::error::release private key does not match OTA_P256_PUBLIC_KEY_SEC1_B64" >&2
-            exit 1
-          fi
-          for usb_speed in fs hs; do
-            ota_image="$(find dist -maxdepth 1 -type f -name "DS5Dongle-aim61-${usb_speed}-v*.bin.ota" -print -quit)"
-            if [[ -z "$ota_image" ]]; then
-              echo "::error::M61 ${usb_speed} RAW OTA asset was not built" >&2
-              exit 1
-            fi
-            ota_name="$(basename "$ota_image")"
-            ota_manifest="dist/DS5Dongle-aim61-${usb_speed}-stable.ota.json"
-            ota_url="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ github.event.release.tag_name }}/$ota_name"
-            python tools/ota_release.py generate \
-              --image "$ota_image" \
-              --manifest "$ota_manifest" \
-              --channel stable \
-              --version "${{ github.event.release.tag_name }}" \
-              --usb-speed "$usb_speed" \
-              --url "$ota_url" \
-              --private-key "$private_key" \
-              --key-id "$OTA_P256_KEY_ID"
-            python tools/ota_release.py verify \
-              --image "$ota_image" \
-              --manifest "$ota_manifest" \
-              --public-key "$public_key" \
-              --expected-key-id "$OTA_P256_KEY_ID"
-          done
+          if ([string]::IsNullOrWhiteSpace($env:OTA_P256_PRIVATE_KEY_B64) -or
+              [string]::IsNullOrWhiteSpace($env:OTA_P256_KEY_ID) -or
+              [string]::IsNullOrWhiteSpace($env:OTA_P256_PUBLIC_KEY_SEC1_B64)) {
+            throw "OTA signing secret, key ID and public key are required"
+          }
+          $privateKey = Join-Path $env:RUNNER_TEMP 'ota-private.pem'
+          $publicPem = Join-Path $env:RUNNER_TEMP 'ota-public.pem'
+          $derivedSec1 = Join-Path $env:RUNNER_TEMP 'ota-derived.sec1'
+          $configuredSec1 = Join-Path $env:RUNNER_TEMP 'ota-configured.sec1'
+          [IO.File]::WriteAllBytes($privateKey, [Convert]::FromBase64String($env:OTA_P256_PRIVATE_KEY_B64.Trim()))
+          [IO.File]::WriteAllBytes($configuredSec1, [Convert]::FromBase64String($env:OTA_P256_PUBLIC_KEY_SEC1_B64.Trim()))
+          openssl pkey -in $privateKey -pubout -out $publicPem
+          if ($LASTEXITCODE -ne 0) { throw 'unable to derive OTA public key' }
+          python tools\ota_release.py export-public-key --public-key $publicPem --output $derivedSec1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $configuredHash = (Get-FileHash $configuredSec1 -Algorithm SHA256).Hash
+          $derivedHash = (Get-FileHash $derivedSec1 -Algorithm SHA256).Hash
+          if ($configuredHash -ne $derivedHash) {
+            throw 'OTA private/public release keys do not match'
+          }
+          $channel = if ('${{ github.event.release.prerelease }}' -eq 'true') { 'beta' } else { 'stable' }
+          foreach ($profile in @('standard', 'diagnostic')) {
+            $suffix = if ($profile -eq 'diagnostic') { '-diag' } else { '' }
+            $zip = Get-ChildItem artifacts -Recurse -File -Filter "DS5Dongle-aim61-hs$suffix-v3.5.2.zip" | Select-Object -First 1
+            $image = Get-ChildItem artifacts -Recurse -File -Filter "DS5Dongle-aim61-hs$suffix-v3.5.2.bin.ota" | Select-Object -First 1
+            if (-not $zip -or -not $image) { throw "missing $profile firmware artifact" }
+            $manifest = Join-Path $env:RUNNER_TEMP "DS5Dongle-aim61-hs-$profile-v3.5.2.ota.json"
+            $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/$($zip.Name)"
+            python tools\ota_release.py generate --image $image.FullName --manifest $manifest `
+              --channel $channel --version 3.5.2 --usb-speed hs --profile $profile `
+              --url $url --private-key $privateKey --key-id $env:OTA_P256_KEY_ID
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            python tools\ota_release.py verify --image $image.FullName --manifest $manifest `
+              --public-key $publicPem --expected-key-id $env:OTA_P256_KEY_ID
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            python tools\repack_firmware_zip.py --archive $zip.FullName `
+              --ota-image $image.FullName --ota-manifest $manifest
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Assemble the intentionally small public asset set
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Get-ChildItem artifacts -Recurse -File | Where-Object {
+            $_.Name -in @(
+              'DS5Dongle-aim61-hs-v3.5.2.zip',
+              'DS5Dongle-aim61-hs-diag-v3.5.2.zip',
+              'DS5Dongle-Flasher-Windows-v1.3.1.exe'
+            )
+          } | Copy-Item -Destination release
+          $required = @(
+            'DS5Dongle-aim61-hs-v3.5.2.zip',
+            'DS5Dongle-aim61-hs-diag-v3.5.2.zip',
+            'DS5Dongle-Flasher-Windows-v1.3.1.exe'
+          )
+          foreach ($name in $required) {
+            if (-not (Test-Path "release\$name")) { throw "missing release asset: $name" }
+          }
+          Get-ChildItem release -File | Sort-Object Name | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content release\SHA256SUMS.txt -Encoding ascii
       - name: Upload release assets
-        shell: bash
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mapfile -d '' assets < <(find dist -maxdepth 1 -type f -print0)
-          if (( ${#assets[@]} == 0 )); then
-            echo "::error::No release files were produced" >&2
-            exit 1
-          fi
-          gh release upload "${{ github.event.release.tag_name }}" \
-            "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" release\* --clobber

@@ -8,8 +8,10 @@ use super::{DUALSENSE_PRODUCT_IDS, SONY_VENDOR_ID};
 
 const INPUT_REPORT_ID: u8 = 0x01;
 const OUTPUT_REPORT_ID: u8 = 0x02;
+const WAVEOUT_FEATURE_REPORT_ID: u8 = 0x80;
 const REPORT_BYTES: usize = 64;
 const OUTPUT_PAYLOAD_BYTES: usize = 47;
+const FEATURE_PAYLOAD_BYTES: usize = 63;
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -183,7 +185,14 @@ impl DebugAccumulator {
 pub enum TriggerPreset {
     Off,
     Resistance,
-    Pulse,
+    Weapon,
+    Automatic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerAudioTarget {
+    Speaker,
+    Headphone,
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +224,8 @@ impl Default for OutputState {
 
 enum TestCommand {
     Output(OutputState),
+    StartControllerTone(ControllerAudioTarget),
+    StopControllerTone,
     StopAll,
     ResetMetrics,
     SetMetricsActive(bool),
@@ -228,6 +239,7 @@ pub enum TestEvent {
     Input(InputState),
     Metrics(DebugMetrics),
     OutputSent,
+    ControllerToneChanged(Option<ControllerAudioTarget>),
     Error(String),
     Stopped,
 }
@@ -257,6 +269,18 @@ impl TestSession {
     pub fn stop_all(&self) -> Result<()> {
         self.commands
             .send(TestCommand::StopAll)
+            .context("device test worker has stopped")
+    }
+
+    pub fn start_controller_tone(&self, target: ControllerAudioTarget) -> Result<()> {
+        self.commands
+            .send(TestCommand::StartControllerTone(target))
+            .context("device test worker has stopped")
+    }
+
+    pub fn stop_controller_tone(&self) -> Result<()> {
+        self.commands
+            .send(TestCommand::StopControllerTone)
             .context("device test worker has stopped")
     }
 
@@ -296,12 +320,17 @@ impl Drop for TestSession {
 struct HidOutputReset<'a> {
     device: &'a hidapi::HidDevice,
     edge_report: bool,
+    audio_restore: (u8, u8),
 }
 
 #[cfg(windows)]
 impl Drop for HidOutputReset<'_> {
     fn drop(&mut self) {
-        let report = pad_edge_report(build_stop_report(), self.edge_report);
+        let _ = send_waveout_control(self.device, false);
+        let report = pad_edge_report(
+            build_audio_restore_report(&OutputState::default(), self.audio_restore),
+            self.edge_report,
+        );
         let _ = self.device.write(&report);
     }
 }
@@ -328,9 +357,11 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
         let device = info
             .open_device(&api)
             .context("unable to open the DS5 gamepad HID interface; close Steam, DS4Windows and other controller tools")?;
+        let audio_restore = read_configured_audio_volumes(&device).unwrap_or((100, 100));
         let _output_reset = HidOutputReset {
             device: &device,
             edge_report,
+            audio_restore,
         };
         let _ = events.send(TestEvent::Connected(name));
 
@@ -349,19 +380,67 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
         let mut stress_last_output = Instant::now();
         let mut stress_interval = Duration::from_millis(50);
         let mut stress_output_reports = 0_u64;
+        let mut output_state = OutputState::default();
+        let mut controller_tone = None;
         let mut report = [0_u8; REPORT_BYTES];
         loop {
             loop {
                 match commands.try_recv() {
                     Ok(TestCommand::Output(state)) => {
-                        let report = pad_edge_report(build_output_report(&state), edge_report);
+                        output_state = state;
+                        let report = pad_edge_report(
+                            build_output_report_with_audio(&output_state, controller_tone),
+                            edge_report,
+                        );
                         device
                             .write(&report)
                             .context("failed to write DS5 output report")?;
                         let _ = events.send(TestEvent::OutputSent);
                     }
+                    Ok(TestCommand::StartControllerTone(target)) => {
+                        if controller_tone.is_some() {
+                            send_waveout_control(&device, false)
+                                .context("failed to stop the previous DualSense tone")?;
+                        }
+                        let report = pad_edge_report(
+                            build_output_report_with_audio(&output_state, Some(target)),
+                            edge_report,
+                        );
+                        device
+                            .write(&report)
+                            .context("failed to select the DualSense audio output")?;
+                        thread::sleep(Duration::from_millis(40));
+                        send_waveout_setup(&device, target)
+                            .context("failed to configure the DualSense 1 kHz tone")?;
+                        send_waveout_control(&device, true)
+                            .context("failed to start the DualSense 1 kHz tone")?;
+                        controller_tone = Some(target);
+                        let _ = events.send(TestEvent::ControllerToneChanged(controller_tone));
+                    }
+                    Ok(TestCommand::StopControllerTone) => {
+                        send_waveout_control(&device, false)
+                            .context("failed to stop the DualSense 1 kHz tone")?;
+                        controller_tone = None;
+                        let report = pad_edge_report(
+                            build_audio_restore_report(&output_state, audio_restore),
+                            edge_report,
+                        );
+                        device
+                            .write(&report)
+                            .context("failed to restore the DualSense audio output")?;
+                        let _ = events.send(TestEvent::ControllerToneChanged(None));
+                    }
                     Ok(TestCommand::StopAll) => {
-                        let report = pad_edge_report(build_stop_report(), edge_report);
+                        if controller_tone.take().is_some() {
+                            send_waveout_control(&device, false)
+                                .context("failed to stop the DualSense 1 kHz tone")?;
+                            let _ = events.send(TestEvent::ControllerToneChanged(None));
+                        }
+                        output_state = OutputState::default();
+                        let report = pad_edge_report(
+                            build_audio_restore_report(&output_state, audio_restore),
+                            edge_report,
+                        );
                         device
                             .write(&report)
                             .context("failed to stop DS5 test outputs")?;
@@ -400,6 +479,9 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                         }
                     }
                     Ok(TestCommand::Shutdown) => {
+                        if controller_tone.is_some() {
+                            let _ = send_waveout_control(&device, false);
+                        }
                         let report = pad_edge_report(build_stop_report(), edge_report);
                         let _ = device.write(&report);
                         let _ = events.send(TestEvent::Stopped);
@@ -407,6 +489,9 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
+                        if controller_tone.is_some() {
+                            let _ = send_waveout_control(&device, false);
+                        }
                         let report = pad_edge_report(build_stop_report(), edge_report);
                         let _ = device.write(&report);
                         return Ok(());
@@ -416,7 +501,10 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
 
             if stress_active && stress_last_output.elapsed() >= stress_interval {
                 let state = stress_output_state(stress_started.elapsed());
-                let report = pad_edge_report(build_output_report(&state), edge_report);
+                let report = pad_edge_report(
+                    build_output_report_with_audio(&state, controller_tone),
+                    edge_report,
+                );
                 device
                     .write(&report)
                     .context("failed to write DS5 stress-test output report")?;
@@ -511,8 +599,8 @@ fn stress_output_state(elapsed: Duration) -> OutputState {
             lightbar_enabled: true,
             lightbar_rgb: [190, 50, 255],
             player_leds: 0x11,
-            left_trigger: TriggerPreset::Pulse,
-            right_trigger: TriggerPreset::Pulse,
+            left_trigger: TriggerPreset::Resistance,
+            right_trigger: TriggerPreset::Resistance,
             ..OutputState::default()
         },
         /* Five seconds of complete actuator release limits motor heating,
@@ -599,6 +687,13 @@ fn parse_touch(source: &[u8], offset: usize) -> TouchPoint {
 }
 
 fn build_output_report(state: &OutputState) -> Vec<u8> {
+    build_output_report_with_audio(state, None)
+}
+
+fn build_output_report_with_audio(
+    state: &OutputState,
+    audio_target: Option<ControllerAudioTarget>,
+) -> Vec<u8> {
     let mut report = vec![0_u8; OUTPUT_PAYLOAD_BYTES + 1];
     report[0] = OUTPUT_REPORT_ID;
     let data = &mut report[1..];
@@ -609,34 +704,52 @@ fn build_output_report(state: &OutputState) -> Vec<u8> {
     data[1] = 0x15;
     data[2] = state.rumble_right;
     data[3] = state.rumble_left;
+    match audio_target {
+        Some(ControllerAudioTarget::Speaker) => {
+            data[0] |= 0xa0;
+            data[5] = 220;
+            data[7] = 48;
+        }
+        Some(ControllerAudioTarget::Headphone) => {
+            data[0] |= 0x90;
+            data[4] = 150;
+        }
+        None => {}
+    }
     data[8] = state.mute_led.min(2);
-    data[38] = 0x07;
+    data[38] = 0x03;
+    data[39] = 0x02;
     data[41] = 0x02;
     data[42] = 0;
     data[43] = state.player_leds & 0x1f;
-    encode_trigger(data, 10, state.right_trigger, 0x04);
-    encode_trigger(data, 21, state.left_trigger, 0x08);
+    encode_trigger(data, 10, state.right_trigger);
+    encode_trigger(data, 21, state.left_trigger);
     if state.lightbar_enabled {
         data[44..47].copy_from_slice(&state.lightbar_rgb);
     }
     report
 }
 
-fn encode_trigger(data: &mut [u8], offset: usize, preset: TriggerPreset, flag: u8) {
+fn encode_trigger(data: &mut [u8], offset: usize, preset: TriggerPreset) {
+    data[offset..offset + 8].fill(0);
     match preset {
         TriggerPreset::Off => {}
         TriggerPreset::Resistance => {
-            data[0] |= flag;
             data[offset] = 0x01;
-            data[offset + 1] = 110;
-            data[offset + 2] = 180;
+            data[offset + 1] = 40;
+            data[offset + 2] = 230;
         }
-        TriggerPreset::Pulse => {
-            data[0] |= flag;
+        TriggerPreset::Weapon => {
             data[offset] = 0x02;
-            data[offset + 1] = 80;
-            data[offset + 2] = 160;
-            data[offset + 3] = 60;
+            data[offset + 1] = 15;
+            data[offset + 2] = 100;
+            data[offset + 3] = 255;
+        }
+        TriggerPreset::Automatic => {
+            data[offset] = 0x06;
+            data[offset + 1] = 10;
+            data[offset + 2] = 255;
+            data[offset + 3] = 20;
         }
     }
 }
@@ -651,7 +764,72 @@ fn build_stop_report() -> Vec<u8> {
     data[10] = 0;
     data[21] = 0;
     data[38] = 0x03;
+    data[39] = 0x02;
     data[41] = 0x02;
+    report
+}
+
+fn build_audio_restore_report(state: &OutputState, audio_restore: (u8, u8)) -> Vec<u8> {
+    let mut report = build_output_report(state);
+    let data = &mut report[1..];
+    data[0] |= 0xb0;
+    data[4] = audio_restore.1;
+    data[5] = audio_restore.0;
+    data[7] = 0;
+    report
+}
+
+#[cfg(windows)]
+fn read_configured_audio_volumes(device: &hidapi::HidDevice) -> Option<(u8, u8)> {
+    let mut report = [0_u8; REPORT_BYTES];
+    report[0] = 0xf7;
+    let length = device.get_feature_report(&mut report).ok()?;
+    (length >= 8 && report[0] == 0xf7).then_some((report[6], report[7]))
+}
+
+#[cfg(windows)]
+fn send_waveout_setup(device: &hidapi::HidDevice, target: ControllerAudioTarget) -> Result<()> {
+    send_waveout_feature(device, &waveout_setup_payload(target))
+}
+
+fn waveout_setup_payload(target: ControllerAudioTarget) -> Vec<u8> {
+    let mut waveout = [0_u8; 20];
+    match target {
+        ControllerAudioTarget::Speaker => waveout[2] = 8,
+        ControllerAudioTarget::Headphone => {
+            waveout[4] = 4;
+            waveout[6] = 6;
+        }
+    }
+    let mut payload = Vec::with_capacity(22);
+    payload.extend_from_slice(&[6, 4]);
+    payload.extend_from_slice(&waveout);
+    payload
+}
+
+#[cfg(windows)]
+fn send_waveout_control(device: &hidapi::HidDevice, enabled: bool) -> Result<()> {
+    send_waveout_feature(device, &waveout_control_payload(enabled))
+}
+
+fn waveout_control_payload(enabled: bool) -> [u8; 5] {
+    [6, 2, u8::from(enabled), 1, 0]
+}
+
+#[cfg(windows)]
+fn send_waveout_feature(device: &hidapi::HidDevice, payload: &[u8]) -> Result<()> {
+    let report = build_waveout_feature_report(payload);
+    device
+        .send_feature_report(&report)
+        .context("failed to write DualSense Feature Report 0x80")?;
+    Ok(())
+}
+
+fn build_waveout_feature_report(payload: &[u8]) -> Vec<u8> {
+    let mut report = vec![0_u8; FEATURE_PAYLOAD_BYTES + 1];
+    report[0] = WAVEOUT_FEATURE_REPORT_ID;
+    let copy_len = payload.len().min(FEATURE_PAYLOAD_BYTES);
+    report[1..1 + copy_len].copy_from_slice(&payload[..copy_len]);
     report
 }
 
@@ -835,13 +1013,15 @@ mod tests {
             player_leds: 0x1f,
             mute_led: 1,
             left_trigger: TriggerPreset::Resistance,
-            right_trigger: TriggerPreset::Pulse,
+            right_trigger: TriggerPreset::Weapon,
         };
         let report = build_output_report(&state);
         assert_eq!(report.len(), 48);
         assert_eq!(report[0], OUTPUT_REPORT_ID);
-        assert_eq!(report[1] & 0x0f, 0x0f);
-        assert_eq!(report[2] & 0x15, 0x15);
+        assert_eq!(report[1], 0x0f);
+        assert_eq!(report[2], 0x15);
+        assert_eq!(&report[11..15], &[2, 15, 100, 255]);
+        assert_eq!(&report[22..25], &[1, 40, 230]);
         assert_eq!(&report[45..48], &[1, 2, 3]);
     }
 
@@ -854,6 +1034,36 @@ mod tests {
             u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize,
             wav.len() - 44
         );
+    }
+
+    #[test]
+    fn controller_audio_reports_match_reference_waveout_protocol() {
+        let speaker =
+            build_waveout_feature_report(&waveout_setup_payload(ControllerAudioTarget::Speaker));
+        let headphone =
+            build_waveout_feature_report(&waveout_setup_payload(ControllerAudioTarget::Headphone));
+        let start = build_waveout_feature_report(&waveout_control_payload(true));
+        let stop = build_waveout_feature_report(&waveout_control_payload(false));
+        assert_eq!(speaker.len(), 64);
+        assert_eq!(speaker[0], 0x80);
+        assert_eq!(&speaker[1..6], &[6, 4, 0, 0, 8]);
+        assert_eq!(&headphone[1..10], &[6, 4, 0, 0, 0, 0, 4, 0, 6]);
+        assert_eq!(&start[1..6], &[6, 2, 1, 1, 0]);
+        assert_eq!(&stop[1..6], &[6, 2, 0, 1, 0]);
+    }
+
+    #[test]
+    fn controller_audio_output_restores_saved_volumes() {
+        let state = OutputState::default();
+        let speaker = build_output_report_with_audio(&state, Some(ControllerAudioTarget::Speaker));
+        let headphone =
+            build_output_report_with_audio(&state, Some(ControllerAudioTarget::Headphone));
+        let restored = build_audio_restore_report(&state, (77, 88));
+        assert_eq!(speaker[6], 220);
+        assert_eq!(speaker[8], 48);
+        assert_eq!(headphone[5], 150);
+        assert_eq!((restored[5], restored[6], restored[8]), (88, 77, 0));
+        assert_eq!(restored[1] & 0xb0, 0xb0);
     }
 
     #[test]

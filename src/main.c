@@ -415,9 +415,13 @@ static void on_hid_input(const uint8_t *data, uint16_t len)
 
     if (len >= DS5_BT_INPUT_REPORT_SIZE) {
         input_queue_item_t item;
-        /* Start the bridge timer at the Bluetooth HID input callback entry.
-         * This intentionally includes validation, queueing and USB-task work. */
+        /* Standard builds do not read the timer or update diagnostic counters
+         * on this latency-sensitive callback. */
+#if DS5_DIAGNOSTIC_BUILD
         item.received_us = bflb_mtimer_get_time_us();
+#else
+        item.received_us = 0u;
+#endif
         bool accept;
         taskENTER_CRITICAL();
         accept = ds5_connected;
@@ -1235,6 +1239,7 @@ static void diagnostics_log_runtime(void)
 }
 #endif
 
+#if DS5_DIAGNOSTIC_BUILD
 static void diagnostics_task(void *arg)
 {
     (void)arg;
@@ -1256,6 +1261,7 @@ static void diagnostics_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(RUNTIME_DIAG_PUBLISH_INTERVAL_MS));
     }
 }
+#endif
 
 static void usb_task(void *arg)
 {
@@ -1670,7 +1676,9 @@ int main(void)
     /* Initialize the immutable empty bank before USB can enumerate.  Failure
      * to allocate the low-priority publisher leaves 0xFD at sequence zero and
      * must never prevent the controller bridge from starting. */
+#if DS5_DIAGNOSTIC_BUILD
     runtime_diag_init();
+#endif
 
     xTaskCreate(bt_task,    "bt",    BT_TASK_STACK_SIZE,
                 NULL, BT_TASK_PRIORITY, NULL);
@@ -1691,10 +1699,12 @@ int main(void)
     }
     /* Create optional diagnostics last so it can never consume memory needed
      * by bridge, audio, indicator, or OTA workers. */
+#if DS5_DIAGNOSTIC_BUILD
     if (xTaskCreate(diagnostics_task, "diag", DIAG_TASK_STACK_DEPTH,
                     NULL, DIAG_TASK_PRIORITY, NULL) != pdPASS) {
         LOG_ERR("[B] diagnostics task alloc FAIL; bridge continues\n");
     }
+#endif
     LOG_INF("[B] init done, starting scheduler\n");
     vTaskStartScheduler();
 

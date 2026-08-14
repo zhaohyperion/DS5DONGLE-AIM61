@@ -31,8 +31,9 @@ MANIFEST_SCHEMA = 1
 MANIFEST_BOARD = "aim61"
 MANIFEST_BOARD_ID = 1
 MANIFEST_USB_SPEED_IDS = {"fs": 0, "hs": 1}
+MANIFEST_PROFILE_IDS = {"standard": 0, "diagnostic": 1}
 SIGNATURE_ALGORITHM = "ECDSA-P256-SHA256"
-SIGNATURE_SCOPE = "DS5DONGLE-OTA-V1"
+SIGNATURE_SCOPE = "DS5DONGLE-OTA-V2"
 SIGNATURE_CANONICAL_MAGIC = SIGNATURE_SCOPE.encode("ascii")
 P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 CHANNELS = ("dev", "beta", "stable")
@@ -162,6 +163,12 @@ def _validate_usb_speed(usb_speed: Any) -> str:
     return usb_speed
 
 
+def _validate_profile(profile: Any) -> str:
+    if not isinstance(profile, str) or profile not in MANIFEST_PROFILE_IDS:
+        raise OtaReleaseError("OTA manifest profile must be standard or diagnostic")
+    return profile
+
+
 def signature_payload(manifest: dict[str, Any], info: OtaImageInfo) -> bytes:
     """Return the exact 57-byte P-256 authorization canonical."""
     if type(manifest.get("schema")) is not int or manifest.get("schema") != MANIFEST_SCHEMA:
@@ -172,6 +179,7 @@ def signature_payload(manifest: dict[str, Any], info: OtaImageInfo) -> bytes:
     if manifest.get("board") != MANIFEST_BOARD:
         raise OtaReleaseError("OTA manifest board must be aim61")
     usb_speed = _validate_usb_speed(manifest.get("usb_speed"))
+    profile = _validate_profile(manifest.get("profile"))
     raw_version = manifest.get("version")
     version = _validate_version(raw_version)
     if raw_version != version:
@@ -204,14 +212,14 @@ def signature_payload(manifest: dict[str, Any], info: OtaImageInfo) -> bytes:
     canonical = b"".join(
         (
             SIGNATURE_CANONICAL_MAGIC,
-            bytes((MANIFEST_BOARD_ID, MANIFEST_USB_SPEED_IDS[usb_speed])),
+            bytes((MANIFEST_BOARD_ID, MANIFEST_USB_SPEED_IDS[usb_speed], MANIFEST_PROFILE_IDS[profile])),
             bytes(_version_triplet(version)),
             struct.pack("<I", info.body_size),
             bytes.fromhex(info.body_sha256),
         )
     )
-    if len(canonical) != 57:
-        raise AssertionError(f"P-256 OTA canonical must be 57 bytes, got {len(canonical)}")
+    if len(canonical) != 58:
+        raise AssertionError(f"P-256 OTA canonical must be 58 bytes, got {len(canonical)}")
     return canonical
 
 
@@ -462,6 +470,7 @@ def build_manifest(
     version: str,
     url: str,
     usb_speed: str = "fs",
+    profile: str = "standard",
     private_key: Path | None = None,
     key_id: str | None = None,
     openssl: str | None = None,
@@ -477,11 +486,13 @@ def build_manifest(
         )
     url = _validate_url(url)
     usb_speed = _validate_usb_speed(usb_speed)
+    profile = _validate_profile(profile)
     manifest: dict[str, Any] = {
         "schema": MANIFEST_SCHEMA,
         "channel": channel,
         "board": MANIFEST_BOARD,
         "usb_speed": usb_speed,
+        "profile": profile,
         "version": version,
         "size": info.size,
         "sha256": info.sha256,
@@ -534,6 +545,7 @@ def _load_manifest(path: Path) -> dict[str, Any]:
         "channel",
         "board",
         "usb_speed",
+        "profile",
         "version",
         "size",
         "sha256",
@@ -643,6 +655,7 @@ def _parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--version", required=True)
     generate_parser.add_argument("--url", required=True)
     generate_parser.add_argument("--usb-speed", choices=tuple(MANIFEST_USB_SPEED_IDS), required=True)
+    generate_parser.add_argument("--profile", choices=tuple(MANIFEST_PROFILE_IDS), required=True)
     generate_parser.add_argument("--private-key", type=Path)
     generate_parser.add_argument("--key-id")
     generate_parser.add_argument("--openssl")
@@ -696,6 +709,7 @@ def main(argv: list[str] | None = None) -> int:
                 version=args.version,
                 url=args.url,
                 usb_speed=args.usb_speed,
+                profile=args.profile,
                 private_key=args.private_key,
                 key_id=args.key_id,
                 openssl=args.openssl,

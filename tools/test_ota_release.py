@@ -44,28 +44,32 @@ class OtaReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ota_release.OtaReleaseError, "at most 8"):
                     ota_release._validate_version(version)
 
-    def test_release_workflow_builds_and_signs_m61_fs_and_hs_ota(self) -> None:
+    def test_release_workflow_builds_and_signs_two_m61_hs_profiles(self) -> None:
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('$env:FIRMWARE_VERSION = $firmwareVersion', workflow)
-        self.assertIn('$env:PROJECT_SDK_VERSION = $firmwareVersion', workflow)
-        self.assertIn('$firmwareVersion.Length -gt 8', workflow)
-        self.assertIn('DS5Dongle-aim61-$($env:USB_SPEED)-v$version.bin.ota', workflow)
-        self.assertIn('for usb_speed in fs hs', workflow)
-        self.assertIn('DS5Dongle-aim61-${usb_speed}-stable.ota.json', workflow)
+        self.assertIn('FIRMWARE_VERSION: 3.5.2', workflow)
+        self.assertIn('PROJECT_SDK_VERSION: 3.5.2', workflow)
+        self.assertIn('profile: [standard, diagnostic]', workflow)
+        self.assertIn('DS5Dongle-aim61-hs$suffix-v3.5.2.bin.ota', workflow)
+        self.assertIn("foreach ($profile in @('standard', 'diagnostic'))", workflow)
+        self.assertIn('--profile $profile', workflow)
         self.assertIn("secrets.OTA_P256_PRIVATE_KEY_B64", workflow)
         self.assertIn("vars.OTA_P256_KEY_ID", workflow)
         self.assertGreaterEqual(
             workflow.count("vars.OTA_P256_PUBLIC_KEY_SEC1_B64"), 2
         )
-        self.assertIn("$env:DS5_OTA_PUBLIC_KEY_FILE = $otaPublicKeyPath", workflow)
-        self.assertIn("DS5_OTA_RELEASE_PUBLIC_KEY_CONFIGURED 1", workflow)
-        self.assertIn("tools/ota_release.py export-public-key", workflow)
-        self.assertIn('cmp -s "$configured_sec1" "$derived_sec1"', workflow)
+        self.assertIn("$env:DS5_OTA_PUBLIC_KEY_FILE = $keyPath", workflow)
+        cmake = (Path(__file__).resolve().parents[1] / "CMakeLists.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("DS5_OTA_RELEASE_PUBLIC_KEY_CONFIGURED 1", cmake)
+        self.assertIn("tools\\ota_release.py export-public-key", workflow)
+        self.assertIn("$configuredHash = (Get-FileHash", workflow)
+        self.assertIn("if ($configuredHash -ne $derivedHash)", workflow)
         self.assertIn("path: dist/*", workflow)
         self.assertIn("runs-on: windows-2025", workflow)
-        self.assertIn("nonce-type", workflow)
+        self.assertIn("tools\\repack_firmware_zip.py", workflow)
         self.assertNotIn("ED25519", workflow.upper())
 
     def test_parses_raw_header_and_checks_both_hashes(self) -> None:
@@ -194,6 +198,7 @@ class OtaReleaseTests(unittest.TestCase):
             "channel": "stable",
             "board": "aim61",
             "usb_speed": "fs",
+            "profile": "diagnostic",
             "version": "1.2.3",
             "size": info.size,
             "sha256": info.sha256,
@@ -203,14 +208,14 @@ class OtaReleaseTests(unittest.TestCase):
             "signature": None,
         }
         expected_hex = (
-            "445335444f4e474c452d4f54412d5631"
-            "0100010203"
+            "445335444f4e474c452d4f54412d5632"
+            "010001010203"
             "04030201"
             + "00" * 31
             + "ff"
         )
         canonical = ota_release.signature_payload(manifest, info)
-        self.assertEqual(len(canonical), 57)
+        self.assertEqual(len(canonical), 58)
         self.assertEqual(canonical.hex(), expected_hex)
 
     def test_ecdsa_der_raw_conversion_uses_fixed_width_low_s(self) -> None:

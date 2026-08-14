@@ -19,6 +19,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--board", choices=BOARDS, required=True)
     parser.add_argument("--usb-speed", choices=("fs", "hs"), required=True)
+    parser.add_argument("--profile", choices=("standard", "diagnostic"), default="standard")
     parser.add_argument("--version", required=True)
     parser.add_argument("--firmware-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("dist"))
@@ -30,7 +31,8 @@ def main() -> int:
         raise SystemExit(f"expected one boot2_bl616_*.bin in {source}, found {len(boot2)}")
     partition = source / "partition.bin"
     suffix = "-hs" if args.usb_speed == "hs" else ""
-    firmware = source / f"ds5dongle-{args.board}{suffix}.bin"
+    profile_suffix = "-diag" if args.profile == "diagnostic" else ""
+    firmware = source / f"ds5dongle-{args.board}{suffix}{profile_suffix}.bin"
     for path in (partition, firmware):
         if not path.is_file():
             raise SystemExit(f"missing required file: {path}")
@@ -41,7 +43,9 @@ def main() -> int:
 
     manifest = {
         "schema": 1, "project": "DS5Dongle", "version": args.version,
-        "board": args.board, "usb_speed": args.usb_speed, "chip": "bl616",
+        "board": args.board, "usb_speed": args.usb_speed,
+        "profile": args.profile, "diagnostics_protocol": 2 if args.profile == "diagnostic" else None,
+        "chip": "bl616",
         "flash_size": BOARDS[args.board], "boot2": boot2[0].name,
         "partition": partition.name, "firmware": firmware.name,
     }
@@ -56,7 +60,8 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     version = args.version.removeprefix("v")
-    output = args.output_dir / f"DS5Dongle-{args.board}-{args.usb_speed}-v{version}.zip"
+    profile_name = "-diag" if args.profile == "diagnostic" else ""
+    output = args.output_dir / f"DS5Dongle-{args.board}-{args.usb_speed}{profile_name}-v{version}.zip"
     timestamp = (2026, 1, 1, 0, 0, 0)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name, data in sorted(payloads.items()):

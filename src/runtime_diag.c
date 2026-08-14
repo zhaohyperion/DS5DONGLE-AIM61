@@ -22,6 +22,7 @@ static uint8_t diag_reports[2][RUNTIME_DIAG_PAGE_COUNT]
                __attribute__((aligned(4)));
 static volatile uint8_t diag_report_index;
 static volatile uint8_t diag_selected_page;
+static volatile bool diag_session_active;
 
 static volatile uint32_t diag_get_requests;
 static volatile uint32_t diag_select_requests;
@@ -136,6 +137,7 @@ void runtime_diag_init(void)
     memset(diag_reports, 0, sizeof(diag_reports));
     diag_report_index = 0;
     diag_selected_page = RUNTIME_DIAG_PAGE_IDENTITY;
+    diag_session_active = false;
     diag_get_requests = 0;
     diag_select_requests = 0;
     diag_select_errors = 0;
@@ -156,6 +158,8 @@ void runtime_diag_init(void)
 
 void runtime_diag_task_update(uint64_t monotonic_us)
 {
+    if (!diag_session_active)
+        return;
     const uint64_t interval_us =
         (uint64_t)RUNTIME_DIAG_PUBLISH_INTERVAL_MS * 1000u;
     if (diag_sequence != 0 &&
@@ -465,6 +469,16 @@ ATTR_TCM_SECTION
 bool runtime_diag_select_page_from_isr(const uint8_t *payload, uint32_t len)
 {
     diag_select_requests++;
+    if (payload && len >= RUNTIME_DIAG_SELECT_SIZE &&
+        payload[0] == RUNTIME_DIAG_SET_SESSION &&
+        payload[1] == RUNTIME_DIAG_PROTOCOL_VERSION) {
+        diag_session_active = payload[2] != 0;
+        if (diag_session_active) {
+            diag_last_publish_us = 0;
+            diag_sequence = 0;
+        }
+        return true;
+    }
     if (!payload || len < RUNTIME_DIAG_SELECT_SIZE ||
         payload[0] != RUNTIME_DIAG_SELECT_PAGE ||
         payload[1] != RUNTIME_DIAG_PROTOCOL_VERSION ||
