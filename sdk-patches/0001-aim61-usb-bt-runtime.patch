@@ -59,7 +59,6 @@ diff --git a/components/usb/cherryusb/class/audio/usbd_audio.c b/components/usb/
 +                            case AUDIO_REQUEST_SET_RES:
 +                                break;
                              default:
-                                 USB_LOG_WRN("Unhandled Audio Class bRequest 0x%02x in cs 0x%02x\r\n", setup->bRequest, control_selector);
                                  return -1;
 diff --git a/components/wireless/bluetooth/blestack/src/common/buf.c b/components/wireless/bluetooth/blestack/src/common/buf.c
 --- a/components/wireless/bluetooth/blestack/src/common/buf.c
@@ -127,24 +126,3 @@ diff --git a/components/wireless/bluetooth/blestack/src/host/l2cap_internal.h b/
 +
  /*
   * Handle security level changed on link passing HCI status of performed
-diff --git a/project.build b/project.build
---- a/project.build
-+++ b/project.build
-@@ -149,7 +149,11 @@ $(BUILD_DIR): Makefile cmake_cache library_build
- 	$(MAKE) -C $(BUILD_DIR) combine
- 
--cmake_cache: cmake_config
-+_cmake_reset_cache:
-+	-$(CMAKE) -E remove $(BUILD_DIR)/CMakeCache.txt
-+	-$(CMAKE) -E remove_directory $(BUILD_DIR)/CMakeFiles
-+
-+cmake_cache: cmake_config _cmake_reset_cache
- 	$(MAKE) library_cmake_cache
- 	$(CMAKE) -S . -B $(BUILD_DIR) -G $(cmake_generator) $(cmake_definition)
-@@ -167,7 +171,7 @@ endif
- app_deps:
- 	@DIR=$(BUILD_DIR) sh -c 'find $${DIR} -mindepth 4 -name CMakeFiles |while read x; do y=$${x##$${DIR}/build_out/}; echo $${y%%CMakeFiles}; done'
- 
--ninja:Makefile
-+ninja:Makefile cmake_config _cmake_reset_cache
- 	$(CMAKE) -S . -B $(BUILD_DIR) -G Ninja $(cmake_definition)

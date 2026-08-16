@@ -16,7 +16,8 @@ Included:
 - verified flash-clock fallback needed by BL618/AIM61 PSRAM initialization;
 - CherryUSB audio control compatibility and endpoint-close/VDMA recovery;
 - dedicated HID buffer pools and BR/EDR L2CAP completion callback;
-- deterministic CMake cache reset used by profile/speed matrix builds.
+- the official 2.3.31 baseline already contains deterministic CMake/Ninja
+  cache resets, so the fork's older `project.build` variant is not reapplied.
 
 Excluded:
 
