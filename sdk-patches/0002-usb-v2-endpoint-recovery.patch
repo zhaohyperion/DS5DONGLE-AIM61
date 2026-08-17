@@ -1,0 +1,120 @@
+diff --git a/drivers/lhal/src/bflb_usb_v2.c b/drivers/lhal/src/bflb_usb_v2.c
+--- a/drivers/lhal/src/bflb_usb_v2.c
++++ b/drivers/lhal/src/bflb_usb_v2.c
+@@ -1183,8 +1183,69 @@ int usbd_ep_open(uint8_t busid, const struct usb_endpoint_descriptor *ep)
+     return 0;
+ }
+ 
++static uint8_t bflb_usb_get_ep_fifo(uint8_t ep_idx)
++{
++    uint32_t regval;
++    uint32_t regaddr;
++
++    if (ep_idx == 0 || ep_idx > USB_NUM_BIDIR_ENDPOINTS) {
++        return 0xff;
++    }
++
++    if (ep_idx < 5) {
++        regaddr = BFLB_USB_BASE + USB_DEV_EPMAP0_OFFSET;
++    } else {
++        ep_idx = ep_idx - 4;
++        regaddr = BFLB_USB_BASE + USB_DEV_EPMAP1_OFFSET;
++    }
++
++    regval = getreg32(regaddr);
++    return (regval >> ((ep_idx - 1) * 8)) & 0x0f;
++}
++
+ int usbd_ep_close(uint8_t busid, const uint8_t ep)
+ {
++    (void)busid;
++    uint8_t ep_idx = USB_EP_GET_IDX(ep);
++
++    if (ep_idx == 0) {
++        return 0;
++    }
++
++    uint8_t fifo = bflb_usb_get_ep_fifo(ep_idx);
++    if (fifo == 0xff || fifo == 0x0f) {
++        return 0;
++    }
++
++    uint32_t regval;
++    uint32_t regaddr;
++
++    if (fifo < 4) {
++        regaddr = BFLB_USB_BASE + USB_VDMA_F0PS1_OFFSET + fifo * 8;
++    } else {
++        regaddr = BFLB_USB_BASE + USB_VDMA_FNPS1_OFFSET + (fifo - 4) * 8;
++    }
++    regval = getreg32(regaddr);
++    regval &= ~USB_VDMA_START_CXF;
++    putreg32(regval, regaddr);
++    bflb_usb_reset_fifo(fifo);
++
++    if (USB_EP_DIR_IS_IN(ep)) {
++        g_bl_udc.in_ep[ep_idx].ep_active = false;
++        g_bl_udc.in_ep[ep_idx].xfer_buf = NULL;
++        g_bl_udc.in_ep[ep_idx].xfer_len = 0;
++        g_bl_udc.in_ep[ep_idx].actual_xfer_len = 0;
++    } else {
++        g_bl_udc.out_ep[ep_idx].ep_active = false;
++        g_bl_udc.out_ep[ep_idx].xfer_buf = NULL;
++        g_bl_udc.out_ep[ep_idx].xfer_len = 0;
++        g_bl_udc.out_ep[ep_idx].actual_xfer_len = 0;
++    }
++
+     return 0;
+ }
+@@ -1338,6 +1399,8 @@ int usbd_ep_start_read(uint8_t busid, const uint8_t ep, uint8_t *data, uint32_t
+     return 0;
+ }
+ 
++static uint32_t f0_no_cmplt_cnt = 0;
++
+ void USBD_IRQHandler(uint8_t busid)
+ {
+@@ -1355,12 +1418,21 @@ void USBD_IRQHandler(uint8_t busid)
+ 
+             if (subgroup_intstatus & USB_CX_SETUP_INT) {
+                 bflb_usb_vdma_start_read(USB_FIFO_CXF, g_setup_buffer, 8);
++                volatile uint32_t vdma_wait = 0;
+                 while (getreg32(BFLB_USB_BASE + USB_VDMA_CXFPS1_OFFSET) & USB_VDMA_START_CXF) {
++                    if (++vdma_wait > 100000) {
++                        regval = getreg32(BFLB_USB_BASE + USB_VDMA_CXFPS1_OFFSET);
++                        regval &= ~USB_VDMA_START_CXF;
++                        putreg32(regval, BFLB_USB_BASE + USB_VDMA_CXFPS1_OFFSET);
++                        bflb_usb_reset_fifo(USB_FIFO_CXF);
++                        goto skip_setup;
++                    }
+                 }
+ 
+                 bflb_usb_source_group_int_clear(3, USB_VDMA_CMPLT_CXF);
+ 
+                 usbd_event_ep0_setup_complete_handler(busid, g_setup_buffer);
++skip_setup:;
+             }
+         }
+@@ -1465,6 +1537,27 @@ void USBD_IRQHandler(uint8_t busid)
+                     }
+                 }
+             }
++
++            {
++                uint8_t f0_ep = bflb_usb_get_fifo_ep(0);
++                if (subgroup_intstatus & USB_VDMA_CMPLT_F0) {
++                    f0_no_cmplt_cnt = 0;
++                } else if (g_bl_udc.out_ep[f0_ep].ep_active) {
++                    f0_no_cmplt_cnt++;
++                    if (f0_no_cmplt_cnt >= 200) {
++                        f0_no_cmplt_cnt = 0;
++                        bflb_usb_reset_fifo(USB_FIFO_F0);
++                        regval = getreg32(BFLB_USB_BASE + USB_VDMA_F0PS1_OFFSET);
++                        regval &= ~USB_VDMA_START_F0;
++                        putreg32(regval, BFLB_USB_BASE + USB_VDMA_F0PS1_OFFSET);
++                        g_bl_udc.out_ep[f0_ep].ep_active = false;
++                        printf("[VDMA] F0 safety-net: cleared & deactivated\n");
++                    }
++                }
++            }
+         }

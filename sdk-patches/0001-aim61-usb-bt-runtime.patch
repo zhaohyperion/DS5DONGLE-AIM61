@@ -1,0 +1,128 @@
+diff --git a/bsp/board/bl616dk/board_flash_psram.c b/bsp/board/bl616dk/board_flash_psram.c
+--- a/bsp/board/bl616dk/board_flash_psram.c
++++ b/bsp/board/bl616dk/board_flash_psram.c
+@@ -382,8 +382,45 @@ void ATTR_CLOCK_SECTION __attribute__((noinline)) board_set_flash_80m(void)
+         }
+     }
+ 
++    /* Fallback: if delay==0, PLL was restored to pre_sdmin which may not match
++     * the nominal divider ratios. Reset PLL to standard sdmin first, then try
++     * 80MHz -> 60MHz -> 48MHz with 1T/1.5T timing. */
+     if (config_change == 0) {
+-        /* restore flash config */
++        clk_pll_set(26214400);
++        bflb_sflash_reset_continue_read(p_flash_cfg);
++        flash_reset_io_cs_delay();
++
++        static const struct { uint8_t clk; uint8_t div; } fb[] = {
++            { GLB_SFLASH_CLK_MUXPLL_80M,   0 },
++            { GLB_SFLASH_CLK_WIFIPLL_120M, 1 },
++            { GLB_SFLASH_CLK_WIFIPLL_96M,  1 },
++        };
++        for (unsigned i = 0; i < sizeof(fb)/sizeof(fb[0]) && !config_change; i++) {
++            for (uint8_t rx_inv = 0; rx_inv <= 1 && !config_change; rx_inv++) {
++                sf_ctrl_cfg.clk_delay = 1;
++                sf_ctrl_cfg.clk_invert = 1;
++                sf_ctrl_cfg.rx_clk_invert = rx_inv;
++                bflb_sflash_init(&sf_ctrl_cfg, NULL);
++                GLB_Set_SF_CLK(1, fb[i].clk, fb[i].div);
++                if (flash_check_bootheader(p_flash_cfg, 0) == 0) {
++                    config_change = 1;
++                }
++            }
++        }
++
++        if (config_change == 0) {
++            sf_ctrl_cfg.clk_delay = 1;
++            sf_ctrl_cfg.clk_invert = 1;
++            sf_ctrl_cfg.rx_clk_invert = 0;
++            bflb_sflash_init(&sf_ctrl_cfg, NULL);
++            GLB_Set_SF_CLK(1, GLB_SFLASH_CLK_MUXPLL_80M, 0);
++            config_change = 1;
++        }
++    }
++
++    if (config_change == 0) {
++        /* all attempts failed, restore original flash config */
+         flash_reset_io_cs_delay();
+         BL_WR_WORD(0x2000b000, sf_ctrl_0);
+         BL_WR_WORD(0x2000b004, sf_ctrl_1);
+diff --git a/components/usb/cherryusb/class/audio/usbd_audio.c b/components/usb/cherryusb/class/audio/usbd_audio.c
+--- a/components/usb/cherryusb/class/audio/usbd_audio.c
++++ b/components/usb/cherryusb/class/audio/usbd_audio.c
+@@ -168,6 +168,10 @@ static int audio_class_interface_request_handler(uint8_t busid, struct usb_setup
+                                 (*data)[1] = 0x01;
+                                 *len = 2;
+                                 break;
++                            case AUDIO_REQUEST_SET_MIN:
++                            case AUDIO_REQUEST_SET_MAX:
++                            case AUDIO_REQUEST_SET_RES:
++                                break;
+                             default:
+                                 return -1;
+diff --git a/components/wireless/bluetooth/blestack/src/common/buf.c b/components/wireless/bluetooth/blestack/src/common/buf.c
+--- a/components/wireless/bluetooth/blestack/src/common/buf.c
++++ b/components/wireless/bluetooth/blestack/src/common/buf.c
+@@ -208,6 +208,10 @@ extern struct net_buf_pool dynamic_gatt_pool;
+ #endif /* CONFIG_BLE_USING_DYNAMIC_RAM */
+ #endif
+ 
++/* Application-defined pools (bt_hid_host.c) */
++extern struct net_buf_pool hid_tx_pool;
++extern struct net_buf_pool hid_rx_pool;
++
+ #if (CONFIG_BLE_USING_DYNAMIC_RAM)
+ struct net_buf_pool* *_net_buf_pool_list[] = {
+ #else
+@@ -256,6 +260,8 @@ struct net_buf_pool *_net_buf_pool_list[] = {
+ 	#if defined(CONFIG_DYNAMIC_GATTS)
+ 	&dynamic_gatt_pool,
+ 	#endif
++	&hid_tx_pool,
++	&hid_rx_pool,
+ };
+diff --git a/components/wireless/bluetooth/blestack/src/host/l2cap_br.c b/components/wireless/bluetooth/blestack/src/host/l2cap_br.c
+--- a/components/wireless/bluetooth/blestack/src/host/l2cap_br.c
++++ b/components/wireless/bluetooth/blestack/src/host/l2cap_br.c
+@@ -49,8 +49,8 @@
+ #define L2CAP_BR_PSM_SDP	0x0001
+ 
+-#define L2CAP_BR_INFO_TIMEOUT		K_SECONDS(4)
+-#define L2CAP_BR_CFG_TIMEOUT		K_SECONDS(4)
++#define L2CAP_BR_INFO_TIMEOUT		K_SECONDS(10)
++#define L2CAP_BR_CFG_TIMEOUT		K_SECONDS(10)
+ #define L2CAP_BR_DISCONN_TIMEOUT	K_SECONDS(1)
+ #define L2CAP_BR_CONN_TIMEOUT		K_SECONDS(40)
+@@ -1395,6 +1395,20 @@ int bt_l2cap_br_chan_send(struct bt_l2cap_chan *chan, struct net_buf *buf)
+ 	return buf->len;
+ }
+ 
++int bt_l2cap_br_chan_send_cb(struct bt_l2cap_chan *chan, struct net_buf *buf,
++                              bt_conn_tx_cb_t cb, void *user_data)
++{
++	struct bt_l2cap_br_chan *ch = BR_CHAN(chan);
++
++	if (buf->len > ch->tx.mtu) {
++		return -EMSGSIZE;
++	}
++
++	bt_l2cap_send_cb(ch->chan.conn, ch->tx.cid, buf, cb, user_data);
++
++	return buf->len;
++}
++
+ static int l2cap_br_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
+ {
+diff --git a/components/wireless/bluetooth/blestack/src/host/l2cap_internal.h b/components/wireless/bluetooth/blestack/src/host/l2cap_internal.h
+--- a/components/wireless/bluetooth/blestack/src/host/l2cap_internal.h
++++ b/components/wireless/bluetooth/blestack/src/host/l2cap_internal.h
+@@ -345,6 +345,12 @@ int bt_l2cap_br_chan_connect(struct bt_conn *conn, struct bt_l2cap_chan *chan,
+ /* Send packet data to connected peer */
+ int bt_l2cap_br_chan_send(struct bt_l2cap_chan *chan, struct net_buf *buf);
+ 
++/* Send packet data with an HCI-ACK completion callback. */
++int bt_l2cap_br_chan_send_cb(struct bt_l2cap_chan *chan, struct net_buf *buf,
++                              bt_conn_tx_cb_t cb, void *user_data);
++
+ /*
+  * Handle security level changed on link passing HCI status of performed
