@@ -9,6 +9,8 @@ use super::{DUALSENSE_PRODUCT_IDS, SONY_VENDOR_ID};
 const INPUT_REPORT_ID: u8 = 0x01;
 const OUTPUT_REPORT_ID: u8 = 0x02;
 const WAVEOUT_FEATURE_REPORT_ID: u8 = 0x80;
+const STICK_CALIBRATION_SET_REPORT_ID: u8 = 0x82;
+const STICK_CALIBRATION_STATUS_REPORT_ID: u8 = 0x83;
 const REPORT_BYTES: usize = 64;
 const OUTPUT_PAYLOAD_BYTES: usize = 47;
 const FEATURE_PAYLOAD_BYTES: usize = 63;
@@ -55,6 +57,11 @@ pub struct InputState {
     pub accel_z: i16,
     pub touch: [TouchPoint; 2],
     pub battery_percent: Option<u8>,
+    pub battery_charging: bool,
+    pub battery_cable_connected: bool,
+    pub battery_error: bool,
+    pub headphone_connected: bool,
+    pub headset_microphone_connected: bool,
     pub report_count: u64,
     pub report_rate_hz: f32,
 }
@@ -195,6 +202,44 @@ pub enum ControllerAudioTarget {
     Headphone,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuidedOutputDemo {
+    Lights,
+    Rumble,
+    Triggers,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalibrationStep {
+    CenterBegin,
+    CenterSample,
+    CenterCommit,
+    RangeBegin,
+    RangeCommit,
+}
+
+impl CalibrationStep {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::CenterBegin => "centerBegin",
+            Self::CenterSample => "centerSample",
+            Self::CenterCommit => "centerCommit",
+            Self::RangeBegin => "rangeBegin",
+            Self::RangeCommit => "rangeCommit",
+        }
+    }
+
+    fn request(self) -> [u8; 3] {
+        match self {
+            Self::CenterBegin => [1, 1, 1],
+            Self::CenterSample => [3, 1, 1],
+            Self::CenterCommit => [2, 1, 1],
+            Self::RangeBegin => [1, 1, 2],
+            Self::RangeCommit => [2, 1, 2],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OutputState {
     pub rumble_right: u8,
@@ -224,12 +269,14 @@ impl Default for OutputState {
 
 enum TestCommand {
     Output(OutputState),
+    GuidedOutputDemo(GuidedOutputDemo),
     StartControllerTone(ControllerAudioTarget),
     StopControllerTone,
     StopAll,
     ResetMetrics,
     SetMetricsActive(bool),
     SetStressActive { active: bool, rate_hz: u32 },
+    Calibrate(CalibrationStep),
     Shutdown,
 }
 
@@ -240,6 +287,8 @@ pub enum TestEvent {
     Metrics(DebugMetrics),
     OutputSent,
     ControllerToneChanged(Option<ControllerAudioTarget>),
+    CalibrationCompleted(CalibrationStep),
+    CalibrationFailed(CalibrationStep, String),
     Error(String),
     Stopped,
 }
@@ -263,6 +312,12 @@ impl TestSession {
     pub fn set_output(&self, state: OutputState) -> Result<()> {
         self.commands
             .send(TestCommand::Output(state))
+            .context("device test worker has stopped")
+    }
+
+    pub fn start_guided_output_demo(&self, demo: GuidedOutputDemo) -> Result<()> {
+        self.commands
+            .send(TestCommand::GuidedOutputDemo(demo))
             .context("device test worker has stopped")
     }
 
@@ -305,6 +360,12 @@ impl TestSession {
             .context("device test worker has stopped")
     }
 
+    pub fn calibrate(&self, step: CalibrationStep) -> Result<()> {
+        self.commands
+            .send(TestCommand::Calibrate(step))
+            .context("device test worker has stopped")
+    }
+
     pub fn shutdown(&self) {
         let _ = self.commands.send(TestCommand::Shutdown);
     }
@@ -313,6 +374,22 @@ impl TestSession {
 impl Drop for TestSession {
     fn drop(&mut self) {
         let _ = self.commands.send(TestCommand::Shutdown);
+    }
+}
+
+struct GuidedDemoState {
+    kind: GuidedOutputDemo,
+    frame: usize,
+    next_frame_at: Instant,
+}
+
+impl GuidedDemoState {
+    fn new(kind: GuidedOutputDemo) -> Self {
+        Self {
+            kind,
+            frame: 0,
+            next_frame_at: Instant::now(),
+        }
     }
 }
 
@@ -370,6 +447,7 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
         let mut report_rate_hz = 0.0_f32;
         let mut rate_started = Instant::now();
         let mut last_ui_emit = Instant::now() - Duration::from_millis(20);
+        let mut last_published_input: Option<InputState> = None;
         let mut metrics_active = false;
         let mut metrics_started = Instant::now();
         let mut metrics_last_report: Option<Instant> = None;
@@ -382,11 +460,13 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
         let mut stress_output_reports = 0_u64;
         let mut output_state = OutputState::default();
         let mut controller_tone = None;
+        let mut guided_demo: Option<GuidedDemoState> = None;
         let mut report = [0_u8; REPORT_BYTES];
         loop {
             loop {
                 match commands.try_recv() {
                     Ok(TestCommand::Output(state)) => {
+                        guided_demo = None;
                         output_state = state;
                         let report = pad_edge_report(
                             build_output_report_with_audio(&output_state, controller_tone),
@@ -397,7 +477,13 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                             .context("failed to write DS5 output report")?;
                         let _ = events.send(TestEvent::OutputSent);
                     }
+                    Ok(TestCommand::GuidedOutputDemo(kind)) => {
+                        guided_demo = Some(GuidedDemoState::new(kind));
+                    }
                     Ok(TestCommand::StartControllerTone(target)) => {
+                        if guided_demo.take().is_some() {
+                            output_state = OutputState::default();
+                        }
                         if controller_tone.is_some() {
                             send_waveout_control(&device, false)
                                 .context("failed to stop the previous DualSense tone")?;
@@ -431,6 +517,7 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                         let _ = events.send(TestEvent::ControllerToneChanged(None));
                     }
                     Ok(TestCommand::StopAll) => {
+                        guided_demo = None;
                         if controller_tone.take().is_some() {
                             send_waveout_control(&device, false)
                                 .context("failed to stop the DualSense 1 kHz tone")?;
@@ -467,15 +554,39 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                         }
                     }
                     Ok(TestCommand::SetStressActive { active, rate_hz }) => {
+                        guided_demo = None;
                         stress_active = active;
                         stress_interval = Duration::from_millis(1000 / rate_hz.max(1) as u64);
                         stress_started = Instant::now();
                         stress_last_output = Instant::now() - stress_interval;
                         if !active {
+                            output_state = OutputState::default();
                             let report = pad_edge_report(build_stop_report(), edge_report);
                             device
                                 .write(&report)
                                 .context("failed to stop DS5 stress-test outputs")?;
+                        }
+                    }
+                    Ok(TestCommand::Calibrate(step)) => {
+                        guided_demo = None;
+                        if controller_tone.take().is_some() {
+                            send_waveout_control(&device, false)
+                                .context("failed to stop the DualSense tone before calibration")?;
+                            let _ = events.send(TestEvent::ControllerToneChanged(None));
+                        }
+                        output_state = OutputState::default();
+                        let report = pad_edge_report(build_stop_report(), edge_report);
+                        device
+                            .write(&report)
+                            .context("failed to release test outputs before calibration")?;
+                        match run_calibration_step(&device, step, edge_report) {
+                            Ok(()) => {
+                                let _ = events.send(TestEvent::CalibrationCompleted(step));
+                            }
+                            Err(error) => {
+                                let _ = events
+                                    .send(TestEvent::CalibrationFailed(step, format!("{error:#}")));
+                            }
                         }
                     }
                     Ok(TestCommand::Shutdown) => {
@@ -496,6 +607,27 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                         let _ = device.write(&report);
                         return Ok(());
                     }
+                }
+            }
+
+            if guided_demo
+                .as_ref()
+                .is_some_and(|demo| Instant::now() >= demo.next_frame_at)
+            {
+                let mut demo = guided_demo.take().expect("guided demo state disappeared");
+                if let Some((state, duration)) = guided_demo_frame(demo.kind, demo.frame) {
+                    let report = pad_edge_report(
+                        build_output_report_with_audio(&state, controller_tone),
+                        edge_report,
+                    );
+                    device
+                        .write(&report)
+                        .context("failed to write guided DS5 output sequence")?;
+                    output_state = state;
+                    demo.frame += 1;
+                    demo.next_frame_at = Instant::now() + duration;
+                    guided_demo = Some(demo);
+                    let _ = events.send(TestEvent::OutputSent);
                 }
             }
 
@@ -547,7 +679,14 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                         state.report_rate_hz = report_rate_hz;
                         // Read every packet for an honest rate measurement, but
                         // publish only the latest state at approximately 60 Hz.
-                        if last_ui_emit.elapsed() >= Duration::from_millis(16) {
+                        let urgent_input_change =
+                            last_published_input.as_ref().is_none_or(|previous| {
+                                input_change_requires_immediate_publish(previous, &state)
+                            });
+                        if urgent_input_change
+                            || last_ui_emit.elapsed() >= Duration::from_millis(16)
+                        {
+                            last_published_input = Some(state.clone());
                             let _ = events.send(TestEvent::Input(state));
                             last_ui_emit = Instant::now();
                         }
@@ -562,6 +701,130 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
     }
 }
 
+fn input_change_requires_immediate_publish(previous: &InputState, current: &InputState) -> bool {
+    previous.dpad != current.dpad
+        || previous.square != current.square
+        || previous.cross != current.cross
+        || previous.circle != current.circle
+        || previous.triangle != current.triangle
+        || previous.l1 != current.l1
+        || previous.r1 != current.r1
+        || previous.l2_button != current.l2_button
+        || previous.r2_button != current.r2_button
+        || previous.create != current.create
+        || previous.options != current.options
+        || previous.l3 != current.l3
+        || previous.r3 != current.r3
+        || previous.ps != current.ps
+        || previous.touchpad_click != current.touchpad_click
+        || previous.mute != current.mute
+        || previous.touch[0].active != current.touch[0].active
+        || previous.touch[1].active != current.touch[1].active
+        || previous.battery_charging != current.battery_charging
+        || previous.battery_cable_connected != current.battery_cable_connected
+        || previous.battery_error != current.battery_error
+        || previous.headphone_connected != current.headphone_connected
+        || previous.headset_microphone_connected != current.headset_microphone_connected
+}
+
+#[cfg(windows)]
+fn run_calibration_step(
+    device: &hidapi::HidDevice,
+    step: CalibrationStep,
+    dualsense_edge: bool,
+) -> Result<()> {
+    let transaction_count = if dualsense_edge
+        && matches!(
+            step,
+            CalibrationStep::CenterCommit | CalibrationStep::RangeCommit
+        ) {
+        2
+    } else {
+        1
+    };
+    for transaction in 0..transaction_count {
+        send_calibration_transaction(device, step, dualsense_edge, transaction)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_calibration_transaction(
+    device: &hidapi::HidDevice,
+    step: CalibrationStep,
+    dualsense_edge: bool,
+    transaction: usize,
+) -> Result<()> {
+    // The DS5 descriptor declares report 0x82 as nine payload bytes. Keep the
+    // unused and CRC-reserved bytes zero; M61 fills the Bluetooth feature CRC.
+    let mut request = [0_u8; 10];
+    request[0] = STICK_CALIBRATION_SET_REPORT_ID;
+    request[1..4].copy_from_slice(&step.request());
+    device
+        .send_feature_report(&request)
+        .with_context(|| format!("failed to send stick calibration step {step:?}"))?;
+
+    // Through M61, the first 0x83 read intentionally causes an asynchronous
+    // Bluetooth GET_REPORT and can return no data. Poll with a tight bound so
+    // a missing controller or unsupported firmware never hangs the UI.
+    let expected = calibration_expected_statuses(step, dualsense_edge, transaction);
+    let mut last_status = None;
+    for _ in 0..10 {
+        thread::sleep(Duration::from_millis(40));
+        let mut response = [0_u8; REPORT_BYTES];
+        response[0] = STICK_CALIBRATION_STATUS_REPORT_ID;
+        match device.get_feature_report(&mut response) {
+            Ok(length) if length >= 4 => {
+                let actual = [response[0], response[1], response[2], response[3]];
+                if expected.contains(&actual) {
+                    return Ok(());
+                }
+                last_status = Some(actual);
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    if let Some(actual) = last_status {
+        bail!(
+            "controller rejected stick calibration step {step:?}: expected {}, received {}",
+            expected
+                .iter()
+                .map(hex::encode_upper)
+                .collect::<Vec<_>>()
+                .join(" or "),
+            hex::encode_upper(actual)
+        );
+    }
+    bail!(
+        "no 0x83 calibration response; update M61 firmware to a build that supports the guarded 0x82 bridge"
+    )
+}
+
+fn calibration_expected_statuses(
+    step: CalibrationStep,
+    dualsense_edge: bool,
+    transaction: usize,
+) -> &'static [[u8; 4]] {
+    const CENTER_ACTIVE: &[[u8; 4]] = &[[0x83, 0x01, 0x01, 0x01]];
+    const CENTER_COMMITTED: &[[u8; 4]] = &[[0x83, 0x01, 0x01, 0x02]];
+    const EDGE_CENTER_COMMITTED: &[[u8; 4]] = &[[0x83, 0x01, 0x01, 0x03], [0x83, 0x01, 0x03, 0x12]];
+    const RANGE_ACTIVE: &[[u8; 4]] = &[[0x83, 0x01, 0x02, 0x01]];
+    const RANGE_COMMITTED: &[[u8; 4]] = &[[0x83, 0x01, 0x02, 0x02]];
+    const EDGE_RANGE_COMMITTED: &[[u8; 4]] = &[[0x83, 0x01, 0x02, 0x03]];
+
+    match (step, dualsense_edge, transaction) {
+        (CalibrationStep::CenterBegin | CalibrationStep::CenterSample, _, _) => CENTER_ACTIVE,
+        (CalibrationStep::CenterCommit, true, 0) => CENTER_ACTIVE,
+        (CalibrationStep::CenterCommit, true, _) => EDGE_CENTER_COMMITTED,
+        (CalibrationStep::CenterCommit, false, _) => CENTER_COMMITTED,
+        (CalibrationStep::RangeBegin, _, _) => RANGE_ACTIVE,
+        (CalibrationStep::RangeCommit, true, 0) => RANGE_ACTIVE,
+        (CalibrationStep::RangeCommit, true, _) => EDGE_RANGE_COMMITTED,
+        (CalibrationStep::RangeCommit, false, _) => RANGE_COMMITTED,
+    }
+}
+
 #[cfg(test)]
 fn calculate_metrics(intervals_us: &[u32], elapsed: Duration) -> DebugMetrics {
     let mut accumulator = DebugAccumulator::new();
@@ -569,6 +832,73 @@ fn calculate_metrics(intervals_us: &[u32], elapsed: Duration) -> DebugMetrics {
         accumulator.record(*interval);
     }
     accumulator.metrics(elapsed, 0)
+}
+
+fn guided_demo_frame(kind: GuidedOutputDemo, frame: usize) -> Option<(OutputState, Duration)> {
+    match kind {
+        GuidedOutputDemo::Rumble => {
+            if frame >= 12 {
+                return None;
+            }
+            let (state, duration_ms) = match frame % 4 {
+                0 => (
+                    OutputState {
+                        rumble_left: 89,
+                        ..OutputState::default()
+                    },
+                    500,
+                ),
+                1 => (OutputState::default(), 200),
+                2 => (
+                    OutputState {
+                        rumble_right: 89,
+                        ..OutputState::default()
+                    },
+                    500,
+                ),
+                _ => (OutputState::default(), 300),
+            };
+            Some((state, Duration::from_millis(duration_ms)))
+        }
+        GuidedOutputDemo::Lights => {
+            if frame > 9 {
+                return None;
+            }
+            if frame == 9 {
+                return Some((OutputState::default(), Duration::from_millis(100)));
+            }
+            let colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255]];
+            let player_patterns = [0b10001, 0b01010, 0b00100];
+            Some((
+                OutputState {
+                    lightbar_enabled: true,
+                    lightbar_rgb: colors[frame / 3],
+                    player_leds: player_patterns[frame % 3],
+                    mute_led: 2,
+                    ..OutputState::default()
+                },
+                Duration::from_millis(250),
+            ))
+        }
+        GuidedOutputDemo::Triggers => {
+            if frame >= 6 {
+                return None;
+            }
+            let active = frame % 2 == 0;
+            Some((
+                if active {
+                    OutputState {
+                        left_trigger: TriggerPreset::Resistance,
+                        right_trigger: TriggerPreset::Resistance,
+                        ..OutputState::default()
+                    }
+                } else {
+                    OutputState::default()
+                },
+                Duration::from_millis(if active { 700 } else { 300 }),
+            ))
+        }
+    }
 }
 
 fn stress_output_state(elapsed: Duration) -> OutputState {
@@ -623,13 +953,13 @@ fn parse_input_report(source: &[u8]) -> Option<InputState> {
     } else {
         source
     };
-    if payload.len() < 53 {
+    if payload.len() < 54 {
         return None;
     }
     let buttons0 = payload[7];
     let buttons1 = payload[8];
     let buttons2 = payload[9];
-    let battery = payload[52] & 0x0f;
+    let battery = parse_battery_status(payload[52]);
     Some(InputState {
         lx: payload[0],
         ly: payload[1],
@@ -654,16 +984,64 @@ fn parse_input_report(source: &[u8]) -> Option<InputState> {
         touchpad_click: buttons2 & 0x02 != 0,
         mute: buttons2 & 0x04 != 0,
         gyro_x: read_i16(payload, 15),
-        gyro_z: read_i16(payload, 17),
-        gyro_y: read_i16(payload, 19),
+        gyro_y: read_i16(payload, 17),
+        gyro_z: read_i16(payload, 19),
         accel_x: read_i16(payload, 21),
         accel_y: read_i16(payload, 23),
         accel_z: read_i16(payload, 25),
         touch: [parse_touch(payload, 32), parse_touch(payload, 36)],
-        battery_percent: (battery <= 10).then_some((battery * 10).min(100)),
+        battery_percent: battery.percent,
+        battery_charging: battery.charging,
+        battery_cable_connected: battery.cable_connected,
+        battery_error: battery.error,
+        headphone_connected: payload[53] & 0x01 != 0,
+        headset_microphone_connected: payload[53] & 0x02 != 0,
         report_count: 0,
         report_rate_hz: 0.0,
     })
+}
+
+struct BatteryStatus {
+    percent: Option<u8>,
+    charging: bool,
+    cable_connected: bool,
+    error: bool,
+}
+
+fn parse_battery_status(raw: u8) -> BatteryStatus {
+    let level = raw & 0x0f;
+    match raw >> 4 {
+        0 => BatteryStatus {
+            percent: Some((level.saturating_mul(10) + 5).min(100)),
+            charging: false,
+            cable_connected: false,
+            error: false,
+        },
+        1 => BatteryStatus {
+            percent: Some((level.saturating_mul(10) + 5).min(100)),
+            charging: true,
+            cable_connected: true,
+            error: false,
+        },
+        2 => BatteryStatus {
+            percent: Some(100),
+            charging: false,
+            cable_connected: true,
+            error: false,
+        },
+        15 => BatteryStatus {
+            percent: Some(0),
+            charging: true,
+            cable_connected: true,
+            error: false,
+        },
+        _ => BatteryStatus {
+            percent: None,
+            charging: false,
+            cable_connected: false,
+            error: true,
+        },
+    }
 }
 
 fn read_i16(source: &[u8], offset: usize) -> i16 {
@@ -707,12 +1085,12 @@ fn build_output_report_with_audio(
     match audio_target {
         Some(ControllerAudioTarget::Speaker) => {
             data[0] |= 0xa0;
-            data[5] = 220;
+            data[5] = 85;
             data[7] = 48;
         }
         Some(ControllerAudioTarget::Headphone) => {
             data[0] |= 0x90;
-            data[4] = 150;
+            data[4] = 65;
         }
         None => {}
     }
@@ -852,6 +1230,23 @@ pub enum AudioChannel {
     Both,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MicrophoneTestMetrics {
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub bits_per_sample: u16,
+    pub duration_ms: u64,
+    pub rms_percent: f32,
+    pub peak_percent: f32,
+    pub active_windows: u32,
+    pub signal_detected: bool,
+    pub speech_rms_percent: Option<f32>,
+    pub silence_rms_percent: Option<f32>,
+    pub signal_to_silence_db: Option<f32>,
+    pub stereo_difference_rms_percent: Option<f32>,
+}
+
 fn make_test_wav(channel: AudioChannel) -> Vec<u8> {
     const RATE: u32 = 48_000;
     const SECONDS: u32 = 2;
@@ -904,7 +1299,9 @@ fn play_wav_memory(wav: &[u8]) -> Result<()> {
         )
     };
     if ok == 0 {
-        bail!("Windows could not play the test tone")
+        bail!(
+            "Windows could not play the test tone; verify that the M61 USB audio output is enabled and selected as the default output device"
+        )
     }
     Ok(())
 }
@@ -914,7 +1311,7 @@ fn play_wav_memory(_wav: &[u8]) -> Result<()> {
     bail!("audio tests are available on Windows only")
 }
 
-pub fn record_and_play_microphone(seconds: u32) -> Result<()> {
+pub fn record_and_play_microphone(seconds: u32) -> Result<MicrophoneTestMetrics> {
     #[cfg(not(windows))]
     bail!("audio tests are available on Windows only");
 
@@ -936,7 +1333,9 @@ pub fn record_and_play_microphone(seconds: u32) -> Result<()> {
                 "set ds5mic channels 2 samplespersec 48000 bitspersample 16 alignment 4 bytespersec 192000",
             )?;
             mci("record ds5mic")?;
-            thread::sleep(Duration::from_secs(seconds.clamp(1, 10) as u64));
+            thread::sleep(Duration::from_secs(
+                microphone_recording_seconds(seconds) as u64
+            ));
             mci("stop ds5mic")?;
             mci(&format!("save ds5mic \"{path_text}\""))?;
             Ok(())
@@ -944,6 +1343,9 @@ pub fn record_and_play_microphone(seconds: u32) -> Result<()> {
         let _ = mci("close ds5mic");
         result?;
 
+        let analysis = std::fs::read(&path)
+            .context("unable to read the recorded microphone WAV")
+            .and_then(|wav| analyze_microphone_wav(&wav, seconds));
         let _ = mci("close ds5play");
         let playback = (|| -> Result<()> {
             mci(&format!(
@@ -953,8 +1355,126 @@ pub fn record_and_play_microphone(seconds: u32) -> Result<()> {
         })();
         let _ = mci("close ds5play");
         let _ = std::fs::remove_file(&path);
-        playback
+        playback?;
+        analysis
     }
+}
+
+fn analyze_microphone_wav(wav: &[u8], requested_seconds: u32) -> Result<MicrophoneTestMetrics> {
+    if wav.len() < 12 || &wav[..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        bail!("recorded microphone data is not a RIFF/WAVE file");
+    }
+    let mut cursor = 12_usize;
+    let mut format = None;
+    let mut pcm_data = None;
+    while cursor.checked_add(8).is_some_and(|end| end <= wav.len()) {
+        let id = &wav[cursor..cursor + 4];
+        let length = u32::from_le_bytes(wav[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        let data_start = cursor + 8;
+        let Some(data_end) = data_start.checked_add(length) else {
+            bail!("recorded microphone WAV contains an overflowing chunk");
+        };
+        if data_end > wav.len() {
+            bail!("recorded microphone WAV contains a truncated chunk");
+        }
+        if id == b"fmt " && length >= 16 {
+            format = Some((
+                u16::from_le_bytes(wav[data_start..data_start + 2].try_into().unwrap()),
+                u16::from_le_bytes(wav[data_start + 2..data_start + 4].try_into().unwrap()),
+                u32::from_le_bytes(wav[data_start + 4..data_start + 8].try_into().unwrap()),
+                u16::from_le_bytes(wav[data_start + 14..data_start + 16].try_into().unwrap()),
+            ));
+        } else if id == b"data" {
+            pcm_data = Some(&wav[data_start..data_end]);
+        }
+        cursor = data_end + (length & 1);
+    }
+    let (audio_format, channels, sample_rate_hz, bits_per_sample) =
+        format.context("recorded microphone WAV has no usable format chunk")?;
+    if audio_format != 1 || bits_per_sample != 16 || channels == 0 {
+        bail!(
+            "unsupported microphone WAV format: encoding {audio_format}, {channels} channel(s), {bits_per_sample}-bit"
+        );
+    }
+    let pcm_data = pcm_data.context("recorded microphone WAV has no data chunk")?;
+    let frame_bytes = channels as usize * 2;
+    let frame_count = pcm_data.len() / frame_bytes;
+    if frame_count == 0 || sample_rate_hz == 0 {
+        bail!("recorded microphone WAV contains no PCM frames");
+    }
+
+    let mut mono = Vec::with_capacity(frame_count);
+    let mut stereo_diff_squared = 0.0_f64;
+    for frame in pcm_data[..frame_count * frame_bytes].chunks_exact(frame_bytes) {
+        let left = i16::from_le_bytes([frame[0], frame[1]]) as f64 / i16::MAX as f64;
+        mono.push(left);
+        if channels >= 2 {
+            let right = i16::from_le_bytes([frame[2], frame[3]]) as f64 / i16::MAX as f64;
+            stereo_diff_squared += (left - right).powi(2);
+        }
+    }
+    let rms = |samples: &[f64]| -> f64 {
+        if samples.is_empty() {
+            0.0
+        } else {
+            (samples.iter().map(|sample| sample * sample).sum::<f64>() / samples.len() as f64)
+                .sqrt()
+        }
+    };
+    let total_rms = rms(&mono);
+    let peak = mono
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f64, f64::max);
+    let silence_frames = sample_rate_hz as usize * 5;
+    let guided_split = requested_seconds >= 25 && frame_count > silence_frames;
+    let (speech_rms, silence_rms) = if guided_split {
+        let silence_start = frame_count - silence_frames;
+        let speech_end = (sample_rate_hz as usize * 20).min(silence_start);
+        (
+            Some(rms(&mono[..speech_end])),
+            Some(rms(&mono[silence_start..])),
+        )
+    } else {
+        (None, None)
+    };
+    let activity_threshold = silence_rms
+        .map(|value| (value * 3.0).max(0.01))
+        .unwrap_or(0.01);
+    let activity_source = if guided_split {
+        &mono[..(sample_rate_hz as usize * 20).min(frame_count - silence_frames)]
+    } else {
+        mono.as_slice()
+    };
+    let window_frames = (sample_rate_hz as usize / 20).max(1);
+    let active_windows = activity_source
+        .chunks(window_frames)
+        .filter(|window| rms(window) >= activity_threshold)
+        .count() as u32;
+    let signal_detected = active_windows >= 5 && peak >= 0.02;
+    let signal_to_silence_db = speech_rms.zip(silence_rms).map(|(speech, silence)| {
+        (20.0 * (speech.max(1.0e-9) / silence.max(1.0e-9)).log10()) as f32
+    });
+
+    Ok(MicrophoneTestMetrics {
+        sample_rate_hz,
+        channels,
+        bits_per_sample,
+        duration_ms: frame_count as u64 * 1000 / sample_rate_hz as u64,
+        rms_percent: (total_rms * 100.0) as f32,
+        peak_percent: (peak * 100.0) as f32,
+        active_windows,
+        signal_detected,
+        speech_rms_percent: speech_rms.map(|value| (value * 100.0) as f32),
+        silence_rms_percent: silence_rms.map(|value| (value * 100.0) as f32),
+        signal_to_silence_db,
+        stereo_difference_rms_percent: (channels >= 2)
+            .then_some((stereo_diff_squared / frame_count as f64).sqrt() as f32 * 100.0),
+    })
+}
+
+fn microphone_recording_seconds(requested: u32) -> u32 {
+    requested.clamp(1, 30)
 }
 
 #[cfg(windows)]
@@ -963,7 +1483,22 @@ fn mci(command: &str) -> Result<()> {
     let code =
         unsafe { mciSendStringW(wide.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
     if code != 0 {
-        bail!("Windows audio command failed ({code}): {command}")
+        let mut detail = [0_u16; 256];
+        let described =
+            unsafe { mciGetErrorStringW(code, detail.as_mut_ptr(), detail.len() as u32) } != 0;
+        let detail = if described {
+            String::from_utf16_lossy(
+                &detail[..detail
+                    .iter()
+                    .position(|value| *value == 0)
+                    .unwrap_or(detail.len())],
+            )
+        } else {
+            "unknown Windows multimedia error".to_owned()
+        };
+        bail!(
+            "Windows audio command failed ({code}: {detail}) while running `{command}`; verify the M61 USB audio endpoint is enabled and selected as the Windows default device"
+        )
     }
     Ok(())
 }
@@ -978,6 +1513,7 @@ unsafe extern "system" {
         return_length: u32,
         callback: *mut core::ffi::c_void,
     ) -> u32;
+    fn mciGetErrorStringW(error_code: u32, error_text: *mut u16, error_text_length: u32) -> i32;
 }
 
 #[cfg(test)]
@@ -993,14 +1529,53 @@ mod tests {
         report[9] = 0x81;
         report[10] = 0x07;
         report[16..18].copy_from_slice(&(-123_i16).to_le_bytes());
+        report[18..20].copy_from_slice(&(456_i16).to_le_bytes());
+        report[20..22].copy_from_slice(&(-789_i16).to_le_bytes());
         report[33..37].copy_from_slice(&[0x02, 0x34, 0x12, 0x56]);
         report[53] = 8;
+        report[54] = 0x03;
         let state = parse_input_report(&report).unwrap();
         assert_eq!((state.lx, state.ry, state.l2, state.r2), (1, 4, 5, 6));
         assert!(state.cross && state.l1 && state.r3 && state.ps && state.touchpad_click);
-        assert_eq!(state.gyro_x, -123);
+        assert_eq!(
+            (state.gyro_x, state.gyro_y, state.gyro_z),
+            (-123, 456, -789)
+        );
         assert!(state.touch[0].active);
-        assert_eq!(state.battery_percent, Some(80));
+        assert_eq!(state.battery_percent, Some(85));
+        assert!(!state.battery_charging && !state.battery_cable_connected);
+        assert!(state.headphone_connected && state.headset_microphone_connected);
+        let charging = parse_battery_status(0x18);
+        assert_eq!(charging.percent, Some(85));
+        assert!(charging.charging && charging.cable_connected && !charging.error);
+        assert_eq!(parse_battery_status(0x20).percent, Some(100));
+        assert_eq!(parse_battery_status(0xf0).percent, Some(0));
+        assert!(parse_battery_status(0xb0).error);
+    }
+
+    #[test]
+    fn short_digital_transitions_bypass_the_ui_rate_limit() {
+        let idle = InputState::default();
+        let mut pressed = idle.clone();
+        pressed.cross = true;
+        assert!(input_change_requires_immediate_publish(&idle, &pressed));
+        let mut touched = idle.clone();
+        touched.touch[0].active = true;
+        assert!(input_change_requires_immediate_publish(&idle, &touched));
+        let mut analog_only = idle.clone();
+        analog_only.lx = 255;
+        assert!(!input_change_requires_immediate_publish(
+            &idle,
+            &analog_only
+        ));
+    }
+
+    #[test]
+    fn microphone_recording_duration_supports_guided_test_and_has_a_safe_limit() {
+        assert_eq!(microphone_recording_seconds(0), 1);
+        assert_eq!(microphone_recording_seconds(5), 5);
+        assert_eq!(microphone_recording_seconds(25), 25);
+        assert_eq!(microphone_recording_seconds(300), 30);
     }
 
     #[test]
@@ -1034,6 +1609,14 @@ mod tests {
             u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize,
             wav.len() - 44
         );
+        let metrics = analyze_microphone_wav(&wav, 2).unwrap();
+        assert_eq!((metrics.sample_rate_hz, metrics.channels), (48_000, 2));
+        assert_eq!(metrics.duration_ms, 2_000);
+        assert!(metrics.signal_detected);
+        assert!(metrics.rms_percent > 15.0 && metrics.rms_percent < 16.0);
+        assert!(metrics.peak_percent > 21.0 && metrics.peak_percent < 23.0);
+        assert_eq!(metrics.stereo_difference_rms_percent, Some(0.0));
+        assert!(analyze_microphone_wav(b"not a wave", 2).is_err());
     }
 
     #[test]
@@ -1059,11 +1642,70 @@ mod tests {
         let headphone =
             build_output_report_with_audio(&state, Some(ControllerAudioTarget::Headphone));
         let restored = build_audio_restore_report(&state, (77, 88));
-        assert_eq!(speaker[6], 220);
+        assert_eq!(speaker[6], 85);
         assert_eq!(speaker[8], 48);
-        assert_eq!(headphone[5], 150);
+        assert_eq!(headphone[5], 65);
         assert_eq!((restored[5], restored[6], restored[8]), (88, 77, 0));
         assert_eq!(restored[1] & 0xb0, 0xb0);
+    }
+
+    #[test]
+    fn guided_output_sequences_are_bounded_and_end_released() {
+        let rumble = (0..12)
+            .map(|frame| {
+                guided_demo_frame(GuidedOutputDemo::Rumble, frame)
+                    .unwrap()
+                    .0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!((rumble[0].rumble_left, rumble[0].rumble_right), (89, 0));
+        assert_eq!((rumble[2].rumble_left, rumble[2].rumble_right), (0, 89));
+        assert!(
+            rumble
+                .iter()
+                .all(|state| state.rumble_left <= 89 && state.rumble_right <= 89)
+        );
+        assert_eq!((rumble[11].rumble_left, rumble[11].rumble_right), (0, 0));
+        assert!(guided_demo_frame(GuidedOutputDemo::Rumble, 12).is_none());
+
+        let light_colors = (0..9)
+            .map(|frame| {
+                guided_demo_frame(GuidedOutputDemo::Lights, frame)
+                    .unwrap()
+                    .0
+                    .lightbar_rgb
+            })
+            .collect::<Vec<_>>();
+        assert!(light_colors.contains(&[255, 0, 0]));
+        assert!(light_colors.contains(&[0, 255, 0]));
+        assert!(light_colors.contains(&[0, 0, 255]));
+        let light_release = guided_demo_frame(GuidedOutputDemo::Lights, 9).unwrap().0;
+        assert!(!light_release.lightbar_enabled);
+
+        let trigger_release = guided_demo_frame(GuidedOutputDemo::Triggers, 5).unwrap().0;
+        assert_eq!(trigger_release.left_trigger, TriggerPreset::Off);
+        assert_eq!(trigger_release.right_trigger, TriggerPreset::Off);
+        assert!(guided_demo_frame(GuidedOutputDemo::Triggers, 6).is_none());
+    }
+
+    #[test]
+    fn edge_calibration_uses_the_reference_two_stage_commit_statuses() {
+        assert_eq!(
+            calibration_expected_statuses(CalibrationStep::CenterCommit, true, 0),
+            &[[0x83, 0x01, 0x01, 0x01]]
+        );
+        assert_eq!(
+            calibration_expected_statuses(CalibrationStep::CenterCommit, true, 1),
+            &[[0x83, 0x01, 0x01, 0x03], [0x83, 0x01, 0x03, 0x12]]
+        );
+        assert_eq!(
+            calibration_expected_statuses(CalibrationStep::RangeCommit, true, 1),
+            &[[0x83, 0x01, 0x02, 0x03]]
+        );
+        assert_eq!(
+            calibration_expected_statuses(CalibrationStep::CenterCommit, false, 0),
+            &[[0x83, 0x01, 0x01, 0x02]]
+        );
     }
 
     #[test]

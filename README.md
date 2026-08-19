@@ -28,6 +28,8 @@ Windows 工具发布文件：`DS5Dongle-Flasher-Windows-v1.3.1.exe`。GitHub Rel
 - DualSense / DualSense Edge 输入：按键、摇杆、扳机、触摸板、陀螺仪、加速度计和电量。
 - 输出：灯条、玩家灯、静音灯、左右震动、自适应扳机和手柄声音。
 - USB Audio Class 1.0 双向音频；Opus 1.5.2 固定点低延迟编解码及 E907 位精确优化。
+- High-Speed 首次启动默认实时档（约 750 Hz）；Q15 音频重采样减少热路径浮点运算，USB/BT 输入任务继续优先于音频任务。
+- 快速重连保留 Windows HID/UAC 会话 10 秒；休眠后关闭无用蓝牙扫描，恢复时自动重新启用。
 - Ai-M61 4 MiB PSRAM 只用于显式冷数据；实时队列、Opus 状态和 USB/BT 热数据保留在内部 SRAM/TCM。
 - P-256 签名、A/B 分区、掉电保护、试运行确认和失败回滚的 OTA 基础设施。
 - Windows 原生“DS5Dongle AIM61 工具中心”，中文默认、可切换英文、单一白色高对比主题。
@@ -36,15 +38,21 @@ Windows 工具发布文件：`DS5Dongle-Flasher-Windows-v1.3.1.exe`。GitHub Rel
 
 工具中心包含三个职责明确的页签：
 
-1. **测试中心**：实时输入、灯效、限强度震动、自适应扳机、手柄扬声器/耳机和 M61 USB 麦克风测试。
+1. **测试中心**：实时输入、灯效、限强度震动、自适应扳机、手柄扬声器/耳机、M61 USB 麦克风测试，以及双摇杆中心偏移、范围覆盖和圆度误差分析。
 2. **固件刷写**：读取设备版本/构建配置，校验完整 ZIP，使用 CH340 UART ISP 刷写。
-3. **设备调试**：常用/诊断配置双向 OTA、引导式诊断、M61 内部快照、Windows HID 间隔、10/20/50 Hz 持续负载和 JSON 导出。
+3. **设备调试**：常用/诊断配置双向 OTA、250/500/实时轮询档位、引导式诊断、M61 内部快照、Windows HID 间隔、10/20/50 Hz 持续负载和 JSON 导出。
+
+轮询档位通过固件现有的 `0xF7` 配置读取、`0xF6` 配置写入。工具会保留整份设备配置，只修改轮询字段，然后保存并重启 M61，使 Windows 重新读取 USB `bInterval`。已保存的旧配置不会因为升级固件被强制覆盖；需要最高性能时可在“设备调试”页明确选择实时档。
 
 引导诊断不限时长，可重复按键多次，采样充足后由用户手动进入下一项。固定顺序覆盖端点预检、全部输入、触摸、六轴、灯效、左右震动、左右扳机、声音、麦克风和最终复位。输出强度默认受限；按 `Esc` 可立即停止声音、震动并复位扳机。
 
-声音、震动、灯效和自适应扳机使用冻结在本地的 `ds.evua.cc` 兼容 HID `0x02` / Feature `0x80` 测试向量，不在运行时访问该网站。该网站公开脚本的“麦克风”操作只控制静音灯，因此本工具在保持该行为的同时，额外通过 Windows 的 M61 UAC 输入端点完成实际录音/回放测试。
+声音、震动、灯效和自适应扳机使用冻结在本地的 `ds.evua.cc` 兼容 HID `0x02` / Feature `0x80` 测试向量，不在运行时访问该网站。该网站公开脚本的“麦克风”操作只控制静音灯，因此本工具在保持该行为的同时，额外通过 Windows 的 M61 UAC 输入端点完成实际录音/回放，并计算 RMS、峰值、有效声音窗口、静音底噪和信噪比；回听仍用于确认失真、爆音等纯数值难以判断的问题。
 
-诊断 JSON 使用 `ds5dongle-flasher-diagnostics/v2`，区分 RX、TX、音频输入和音频输出；包含引导阶段、用户确认、原始快照和 Pass/Warning/Fail 结论。旧 v1 快照仍可读取，缺失字段按“不支持”处理而不是填零。默认不导出蓝牙地址、序列号和设备路径。
+摇杆分析原生移植了 `dualshock-tools` 的 48 方向采样和 RMS 圆度误差定义，并结合 `dualsense-tester` 的 DualSense 输入、触摸、六轴与输出测试流程。引导输出采用左右依次震动、RGB/玩家灯动画、三轮扳机阻力/复位以及扬声器/耳机交替测试；普通 DualSense 与 Edge 的永久校准分别遵循上游单阶段和双阶段 `0x82/0x83` 状态序列。工具依据项目经验阈值给出“正常 / 建议复测 / 建议校准”，同时保留中心偏移、X/Y 范围、方向覆盖和圆度误差原值；这不是 Sony 官方检测标准。当前复测阈值为中心偏移超过 3%、圆度误差低于 5% 或超过 12%、任一轴范围不足 95%；其中低于 5% 仅按 `dualshock-tools` 的操控手感提示建议复测，不会建议永久校准。严重阈值分别为中心 5%、圆度 20% 和范围 85%。
+
+只读分析不会改写手柄；只有左右摇杆都完成松手中心采样且方向覆盖达到 75% 后，才可显式确认并分步执行高级永久中心/范围校准。检测结果无需通过即可解锁，避免故障摇杆陷入死锁。固件只对白名单内且长度、命令结构正确的 `0x82` 校准报告开放转发，仍会拦截可能关机或重新配对的其他 Feature SET_REPORT。旧固件可使用全部只读测试，但不支持经 M61 写入永久校准。
+
+“导出完整测试报告 JSON”会把手柄实时输入、引导式按键/触摸/六轴/输出结果、双摇杆分析、校准步骤及校准前后复测、声音与麦克风确认、Windows HID 延迟/抖动、压力负载和 M61 运行快照集中到一个文件。报告使用 `ds5dongle-flasher-diagnostics/v2`，顶部 `summaryZhCn` 提供可直接阅读的中文总体结论、异常项、未测试项、关键指标和处理建议，同时保留机器分析所需的原始字段；未执行或只完成一部分的项目不会被误判为通过。旧 v1 快照仍可读取，缺失字段按“不支持”处理而不是填零。默认不导出蓝牙地址、序列号和设备路径。
 
 ## Ai-M61 接线
 
@@ -133,11 +141,14 @@ git diff --check
 | [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) | 最初的 DualSense 蓝牙 HID 到 USB 项目方向和核心设计，MIT |
 | [ccc007ccc/DS5Dongle](https://github.com/ccc007ccc/DS5Dongle) | BL616/BL618/Ai-M61 移植、实时音频、E907 优化和工程演进；原提交历史保留，MIT |
 | [sqlCRT/ds5dongle-bl618-opensource](https://github.com/sqlCRT/ds5dongle-bl618-opensource) | 本 BL618 固件主线的重要开源基准和后续功能来源，GPL-3.0 |
+| [bibuq0/DSdongle-bl616](https://github.com/bibuq0/DSdongle-bl616) | v3.17 的 Q15 重采样、快速重连 USB 宽限期、Primer 音量重发和休眠 radio 静默作为本次选择性移植参考；未采用 Electron 应用、`silk_stubs` 或 CELT-only 源码裁剪，GPL-3.0 |
 | [bouffalolab/bouffalo_sdk](https://github.com/bouffalolab/bouffalo_sdk) | 官方 SDK 2.3.31 固定基线，Apache-2.0 |
 | [sqlCRT/bouffalo_sdk](https://github.com/sqlCRT/bouffalo_sdk) | AIM61/USB Audio/BR-EDR/PSRAM 修复的补丁来源；已审计为本仓库透明补丁，Apache-2.0 |
 | [xiph/opus](https://github.com/xiph/opus) | Opus 1.5.2 固定点编解码器，BSD-3-Clause |
 | [CherryUSB](https://github.com/cherry-embedded/CherryUSB) | Bouffalo SDK 内使用的 USB 设备栈，Apache-2.0 |
 | [ds.evua.cc](https://ds.evua.cc/) | 手柄输出测试行为的公开参考；兼容测试向量冻结在本地，不构成运行时依赖 |
+| [daidr/dualsense-tester](https://github.com/daidr/dualsense-tester) | DualSense 输入、触摸、六轴、输出与音频测试交互参考；原生 Rust 实现，不嵌入网页，MIT |
+| [dualshock-tools/dualshock-tools.github.io](https://github.com/dualshock-tools/dualshock-tools.github.io) | 48 方向摇杆轨迹、范围覆盖、RMS 圆度误差和 DS5 `0x82/0x83` 分步校准协议参考，MIT |
 
 完整许可证、版本、采用范围和未采用范围见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。如发现遗漏，请提交 Issue 补充，不应删除上游版权或许可证声明。
 

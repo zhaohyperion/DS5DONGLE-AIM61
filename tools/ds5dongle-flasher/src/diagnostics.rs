@@ -15,6 +15,10 @@ const HEADER_SIZE: usize = 16;
 const DATA_SIZE: usize = 43;
 const REQUIRED_PAGES: usize = 6;
 const MAX_PAGES: usize = 16;
+#[cfg(windows)]
+const READ_ATTEMPTS: usize = 4;
+#[cfg(windows)]
+const READ_RETRY_DELAY_MS: u64 = 20;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,19 +130,30 @@ pub fn probe_runtime_diagnostics() -> Result<Vec<DeviceDiagnostic>> {
 
 #[cfg(windows)]
 fn read_firmware_version(device: &hidapi::HidDevice) -> Option<String> {
-    let mut report = [0_u8; 64];
-    report[0] = FIRMWARE_VERSION_REPORT_ID;
-    let length = device.get_feature_report(&mut report).ok()?;
-    decode_firmware_version_report(&report[..length])
+    for attempt in 0..READ_ATTEMPTS {
+        let mut report = [0_u8; 64];
+        report[0] = FIRMWARE_VERSION_REPORT_ID;
+        if let Ok(length) = device.get_feature_report(&mut report)
+            && let Some(version) = decode_firmware_version_report(&report[..length])
+        {
+            return Some(version);
+        }
+        if attempt + 1 < READ_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(READ_RETRY_DELAY_MS));
+        }
+    }
+    None
 }
 
 #[cfg(windows)]
 fn capture_snapshot(device: &hidapi::HidDevice) -> Result<DiagnosticSnapshot> {
     let protocol_version = read_protocol_version(device)?;
     if protocol_version >= 2 {
-        device
-            .send_feature_report(&session_report(protocol_version, true))
-            .context("unable to start the diagnostic session")?;
+        send_feature_report_with_retry(
+            device,
+            &session_report(protocol_version, true),
+            "start the diagnostic session",
+        )?;
         std::thread::sleep(std::time::Duration::from_millis(1100));
     }
     let result = capture_snapshot_with_protocol(device, protocol_version);
@@ -149,13 +164,78 @@ fn capture_snapshot(device: &hidapi::HidDevice) -> Result<DiagnosticSnapshot> {
 }
 
 #[cfg(windows)]
+fn send_feature_report_with_retry(
+    device: &hidapi::HidDevice,
+    report: &[u8],
+    operation: &str,
+) -> Result<()> {
+    let mut last_error = String::new();
+    for attempt in 1..=READ_ATTEMPTS {
+        match device.send_feature_report(report) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = format!("attempt {attempt}: {error}"),
+        }
+        if attempt < READ_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(READ_RETRY_DELAY_MS));
+        }
+    }
+    bail!(
+        "unable to {operation} after {READ_ATTEMPTS} attempts; last error: {last_error}. Close other HID/controller tools and reconnect the normal USB port"
+    )
+}
+
+#[cfg(windows)]
 fn read_protocol_version(device: &hidapi::HidDevice) -> Result<u8> {
-    let mut report = [0_u8; WIRE_REPORT_SIZE];
-    report[0] = REPORT_ID;
-    let length = device
-        .get_feature_report(&mut report)
-        .context("unable to probe diagnostic protocol")?;
-    Ok(decode_page(&report[..length])?.protocol_version)
+    let mut last_error = String::new();
+    for attempt in 1..=READ_ATTEMPTS {
+        let mut report = [0_u8; WIRE_REPORT_SIZE];
+        report[0] = REPORT_ID;
+        match device.get_feature_report(&mut report) {
+            Ok(length) => match decode_page(&report[..length]) {
+                Ok(page) => return Ok(page.protocol_version),
+                Err(error) => last_error = format!("attempt {attempt}: {error:#}"),
+            },
+            Err(error) => last_error = format!("attempt {attempt}: {error}"),
+        }
+        if attempt < READ_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(READ_RETRY_DELAY_MS));
+        }
+    }
+    bail!(
+        "unable to probe diagnostic protocol after {READ_ATTEMPTS} attempts; last error: {last_error}"
+    )
+}
+
+#[cfg(windows)]
+fn read_selected_page(
+    device: &hidapi::HidDevice,
+    protocol_version: u8,
+    page_index: usize,
+) -> Result<DiagnosticPage> {
+    let mut last_error = String::new();
+    for attempt in 1..=READ_ATTEMPTS {
+        let selector = selector_report(protocol_version, page_index as u8);
+        match device.send_feature_report(&selector) {
+            Ok(_) => {
+                let mut report = [0_u8; WIRE_REPORT_SIZE];
+                report[0] = REPORT_ID;
+                match device.get_feature_report(&mut report) {
+                    Ok(length) => match decode_page(&report[..length]) {
+                        Ok(page) => return Ok(page),
+                        Err(error) => last_error = format!("attempt {attempt}: {error:#}"),
+                    },
+                    Err(error) => last_error = format!("attempt {attempt}: {error}"),
+                }
+            }
+            Err(error) => last_error = format!("attempt {attempt}: {error}"),
+        }
+        if attempt < READ_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(READ_RETRY_DELAY_MS));
+        }
+    }
+    bail!(
+        "unable to read diagnostic page {page_index} after {READ_ATTEMPTS} attempts; last error: {last_error}. Close other HID/controller tools and reconnect the normal USB port"
+    )
 }
 
 #[cfg(windows)]
@@ -172,20 +252,7 @@ fn capture_snapshot_with_protocol(
         let mut expected_monotonic = None;
 
         while page_index < page_count {
-            let selector = selector_report(protocol_version, page_index as u8);
-            device
-                .send_feature_report(&selector)
-                .with_context(|| {
-                    format!(
-                        "unable to select diagnostic page {page_index}; Windows rejected the full-length 0xFD Feature Report. Close other HID/controller tools, reconnect the normal USB port, then retry"
-                    )
-                })?;
-            let mut report = [0_u8; WIRE_REPORT_SIZE];
-            report[0] = REPORT_ID;
-            let length = device
-                .get_feature_report(&mut report)
-                .with_context(|| format!("unable to read diagnostic page {page_index}"))?;
-            let page = decode_page(&report[..length])?;
+            let page = read_selected_page(device, protocol_version, page_index)?;
             if page.index != page_index {
                 inconsistent = true;
                 break;
@@ -231,18 +298,26 @@ fn session_report(protocol_version: u8, active: bool) -> [u8; WIRE_REPORT_SIZE] 
 }
 
 fn decode_page(source: &[u8]) -> Result<DiagnosticPage> {
-    let frame = if source.len() == REPORT_SIZE + 1 && source[0] == REPORT_ID {
-        &source[1..]
-    } else {
-        source
+    let frame = match source {
+        [REPORT_ID, payload @ ..] if payload.len() == REPORT_SIZE => payload,
+        [b'D', b'G', ..] if source.len() == WIRE_REPORT_SIZE => &source[..REPORT_SIZE],
+        _ if source.len() == REPORT_SIZE => source,
+        _ => {
+            let head = hex::encode(&source[..source.len().min(16)]);
+            bail!(
+                "diagnostic report length/layout is invalid: wire_length={}, expected_payload={REPORT_SIZE}, head={head}",
+                source.len()
+            );
+        }
     };
-    if frame.len() != REPORT_SIZE {
-        bail!("diagnostic report length is {}/{REPORT_SIZE}", frame.len());
-    }
     let expected_crc = read_u32(frame, CRC_OFFSET);
     let actual_crc = crc32fast::hash(&frame[..CRC_OFFSET]);
     if expected_crc != actual_crc {
-        bail!("diagnostic report CRC32 mismatch");
+        let head = hex::encode(&frame[..16]);
+        bail!(
+            "diagnostic report CRC32 mismatch: wire_length={}, expected=0x{expected_crc:08x}, actual=0x{actual_crc:08x}, head={head}",
+            source.len()
+        );
     }
     if frame[0..2] != *b"DG" {
         bail!("device does not support the DG diagnostic protocol");
@@ -409,9 +484,38 @@ mod tests {
         assert_eq!(decoded.monotonic_ms, 123_456);
         assert_eq!(decoded.data, [1, 2, 3]);
 
+        let mut trailing = page.clone();
+        trailing.push(0);
+        assert_eq!(decode_page(&trailing).unwrap().snapshot_seq, 42);
+
         let mut corrupt = page;
         corrupt[16] ^= 1;
-        assert!(decode_page(&corrupt).is_err());
+        let error = decode_page(&corrupt).unwrap_err().to_string();
+        assert!(error.contains("CRC32 mismatch"));
+        assert!(error.contains("expected=0x"));
+        assert!(error.contains("actual=0x"));
+        assert!(error.contains("head=4447"));
+    }
+
+    #[test]
+    fn rejects_truncated_or_oversized_diagnostic_frames() {
+        let page = make_page(0, 6, 42, 123_456, &[1, 2, 3]);
+        let truncated = &page[..REPORT_SIZE - 1];
+        assert!(
+            decode_page(truncated)
+                .unwrap_err()
+                .to_string()
+                .contains("wire_length=62")
+        );
+
+        let mut oversized = page;
+        oversized.extend_from_slice(&[0, 0]);
+        assert!(
+            decode_page(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("wire_length=65")
+        );
     }
 
     #[test]

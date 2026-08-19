@@ -3,6 +3,8 @@
     windows_subsystem = "windows"
 )]
 
+mod controller_analyzer;
+mod device_config;
 mod device_test;
 mod diagnostics;
 mod guided_test;
@@ -1341,14 +1343,7 @@ fn probe_firmware_devices() -> Result<Vec<FirmwareDeviceInfo>> {
         let Ok(device) = info.open_device(&api) else {
             continue;
         };
-        let mut report = [0_u8; 64];
-        report[0] = FIRMWARE_VERSION_REPORT_ID;
-        let Ok(length) = device.get_feature_report(&mut report) else {
-            continue;
-        };
-        let Some((firmware_version, build_profile)) =
-            decode_firmware_identity_report(&report[..length])
-        else {
+        let Some((firmware_version, build_profile)) = read_firmware_identity(&device) else {
             continue;
         };
         devices.push(FirmwareDeviceInfo {
@@ -1372,6 +1367,23 @@ fn probe_firmware_devices() -> Result<Vec<FirmwareDeviceInfo>> {
     });
     devices.dedup();
     Ok(devices)
+}
+
+#[cfg(windows)]
+fn read_firmware_identity(device: &hidapi::HidDevice) -> Option<(String, String)> {
+    for attempt in 0..3 {
+        let mut report = [0_u8; 64];
+        report[0] = FIRMWARE_VERSION_REPORT_ID;
+        if let Ok(length) = device.get_feature_report(&mut report)
+            && let Some(identity) = decode_firmware_identity_report(&report[..length])
+        {
+            return Some(identity);
+        }
+        if attempt < 2 {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    None
 }
 
 #[cfg(not(windows))]
@@ -1722,8 +1734,11 @@ enum GuiEvent {
     Releases(std::result::Result<Vec<FlashRelease>, String>),
     Devices(std::result::Result<Vec<Ch340Device>, String>),
     FirmwareDevices(std::result::Result<Vec<FirmwareDeviceInfo>, String>),
+    PollingRate(std::result::Result<device_config::PollingRate, String>),
+    PollingRateApplied(std::result::Result<device_config::ApplyResult, String>),
     Diagnostics(std::result::Result<Vec<diagnostics::DeviceDiagnostic>, String>),
     AudioTestDone(std::result::Result<(), String>),
+    MicrophoneTestDone(std::result::Result<device_test::MicrophoneTestMetrics, String>),
     OtaDone {
         profile: BuildProfile,
         result: std::result::Result<(), String>,
@@ -1829,20 +1844,36 @@ struct FlasherApp {
     releases: Vec<FlashRelease>,
     devices: Vec<Ch340Device>,
     firmware_devices: Vec<FirmwareDeviceInfo>,
+    device_polling_rate: Option<device_config::PollingRate>,
+    selected_polling_rate: device_config::PollingRate,
+    loading_polling_rate: bool,
+    applying_polling_rate: bool,
+    polling_rate_error: Option<String>,
     runtime_diagnostics: Vec<diagnostics::DeviceDiagnostic>,
     device_test_session: Option<device_test::TestSession>,
     device_test_input: device_test::InputState,
     device_test_output: device_test::OutputState,
     device_test_status: String,
     device_test_audio_busy: bool,
+    last_microphone_metrics: Option<device_test::MicrophoneTestMetrics>,
     device_test_controller_tone: Option<device_test::ControllerAudioTarget>,
     device_test_connected: bool,
+    controller_analyzer: controller_analyzer::ControllerAnalyzer,
+    calibration_confirmed: bool,
+    calibration_busy: bool,
+    calibration_state: CalibrationUiState,
+    calibration_status: String,
+    controller_analysis_checkpoints: Vec<ControllerAnalysisCheckpoint>,
+    calibration_events: Vec<CalibrationEventRecord>,
+    calibration_postcheck_pending: bool,
     device_debug_metrics: device_test::DebugMetrics,
     device_debug_duration_secs: u32,
     device_debug_stress_enabled: bool,
     device_debug_stress_rate_hz: u32,
     device_debug_started: Option<Instant>,
     device_debug_complete: bool,
+    device_debug_final_snapshot_pending: bool,
+    device_debug_final_snapshot_attempts: u8,
     device_debug_baseline: Option<diagnostics::DiagnosticSnapshot>,
     device_debug_final: Option<diagnostics::DiagnosticSnapshot>,
     device_debug_runtime_samples: Vec<diagnostics::DiagnosticSnapshot>,
@@ -1872,6 +1903,44 @@ struct FlasherApp {
     language: Language,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CalibrationUiState {
+    #[default]
+    Idle,
+    Center,
+    Range,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ControllerAnalysisCheckpoint {
+    captured_at_unix_ms: u64,
+    stage: &'static str,
+    analysis: controller_analyzer::ControllerAnalysisReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CalibrationEventRecord {
+    created_at_unix_ms: u64,
+    step: &'static str,
+    result: &'static str,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnifiedReportSummaryZhCn {
+    machine_result: &'static str,
+    overall_result: &'static str,
+    conclusion: &'static str,
+    completed_items: Vec<String>,
+    abnormal_items: Vec<String>,
+    untested_items: Vec<String>,
+    recommendations: Vec<String>,
+    key_metrics: serde_json::Value,
+}
+
 impl FlasherApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
@@ -1884,6 +1953,11 @@ impl FlasherApp {
             releases: Vec::new(),
             devices: Vec::new(),
             firmware_devices: Vec::new(),
+            device_polling_rate: None,
+            selected_polling_rate: device_config::PollingRate::Realtime,
+            loading_polling_rate: false,
+            applying_polling_rate: false,
+            polling_rate_error: None,
             runtime_diagnostics: Vec::new(),
             device_test_session: None,
             device_test_input: device_test::InputState::default(),
@@ -1892,14 +1966,30 @@ impl FlasherApp {
                 .tr("尚未连接测试设备", "Test device is not connected")
                 .to_owned(),
             device_test_audio_busy: false,
+            last_microphone_metrics: None,
             device_test_controller_tone: None,
             device_test_connected: false,
+            controller_analyzer: controller_analyzer::ControllerAnalyzer::default(),
+            calibration_confirmed: false,
+            calibration_busy: false,
+            calibration_state: CalibrationUiState::Idle,
+            calibration_status: language
+                .tr(
+                    "永久校准未启动；日常检测不需要执行此操作",
+                    "Permanent calibration is idle; normal testing does not require it",
+                )
+                .to_owned(),
+            controller_analysis_checkpoints: Vec::new(),
+            calibration_events: Vec::new(),
+            calibration_postcheck_pending: false,
             device_debug_metrics: device_test::DebugMetrics::default(),
             device_debug_duration_secs: 300,
             device_debug_stress_enabled: true,
-            device_debug_stress_rate_hz: 50,
+            device_debug_stress_rate_hz: 20,
             device_debug_started: None,
             device_debug_complete: false,
+            device_debug_final_snapshot_pending: false,
+            device_debug_final_snapshot_attempts: 0,
             device_debug_baseline: None,
             device_debug_final: None,
             device_debug_runtime_samples: Vec::new(),
@@ -1932,6 +2022,7 @@ impl FlasherApp {
         app.refresh_releases();
         app.refresh_devices();
         app.refresh_firmware_devices();
+        app.refresh_polling_rate();
         app
     }
 
@@ -1991,6 +2082,37 @@ impl FlasherApp {
         });
     }
 
+    fn refresh_polling_rate(&mut self) {
+        if self.loading_polling_rate || self.applying_polling_rate {
+            return;
+        }
+        self.loading_polling_rate = true;
+        self.polling_rate_error = None;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = device_config::read_polling_rate().map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::PollingRate(result));
+        });
+    }
+
+    fn apply_polling_rate(&mut self, mode: device_config::PollingRate) {
+        if self.loading_polling_rate || self.applying_polling_rate || self.busy.is_some() {
+            return;
+        }
+        self.applying_polling_rate = true;
+        self.polling_rate_error = None;
+        self.status = match self.language {
+            Language::ZhCn => format!("正在应用 {} 并重启设备...", mode.label()),
+            Language::En => format!("Applying {} and restarting the device...", mode.label()),
+        };
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result =
+                device_config::apply_polling_rate(mode).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::PollingRateApplied(result));
+        });
+    }
+
     fn start_diagnostics(&mut self) {
         if self.loading_diagnostics || self.busy.is_some() {
             return;
@@ -2043,6 +2165,7 @@ impl FlasherApp {
             match event {
                 device_test::TestEvent::Connected(name) => {
                     self.device_test_connected = true;
+                    self.guided_test.require_input_resync();
                     self.device_test_status = match self.language {
                         Language::ZhCn => format!("已连接：{name}；正在实时读取输入"),
                         Language::En => format!("Connected: {name}; reading live input"),
@@ -2050,6 +2173,25 @@ impl FlasherApp {
                 }
                 device_test::TestEvent::Input(input) => {
                     self.guided_test.observe(&input);
+                    self.controller_analyzer.observe(&input);
+                    if self.calibration_postcheck_pending
+                        && self.controller_analyzer.read_only_analysis_complete()
+                    {
+                        self.controller_analysis_checkpoints
+                            .push(ControllerAnalysisCheckpoint {
+                                captured_at_unix_ms: diagnostics::now_unix_ms(),
+                                stage: "afterCalibration",
+                                analysis: self.controller_analyzer.report(),
+                            });
+                        self.calibration_postcheck_pending = false;
+                        self.calibration_status = self
+                            .language
+                            .tr(
+                                "校准后复测已完成，前后结果已加入统一测试报告",
+                                "Post-calibration retest completed; before/after results were added to the unified report",
+                            )
+                            .to_owned();
+                    }
                     self.device_test_input = input;
                 }
                 device_test::TestEvent::Metrics(metrics) => {
@@ -2081,6 +2223,86 @@ impl FlasherApp {
                         (Language::En, None) => "Controller 1 kHz audio test stopped".to_owned(),
                     };
                 }
+                device_test::TestEvent::CalibrationCompleted(step) => {
+                    self.calibration_busy = false;
+                    self.calibration_events.push(CalibrationEventRecord {
+                        created_at_unix_ms: diagnostics::now_unix_ms(),
+                        step: step.id(),
+                        result: "success",
+                        error: None,
+                    });
+                    self.calibration_state = match step {
+                        device_test::CalibrationStep::CenterBegin
+                        | device_test::CalibrationStep::CenterSample => CalibrationUiState::Center,
+                        device_test::CalibrationStep::RangeBegin => CalibrationUiState::Range,
+                        device_test::CalibrationStep::CenterCommit
+                        | device_test::CalibrationStep::RangeCommit => CalibrationUiState::Idle,
+                    };
+                    self.calibration_status = match (self.language, step) {
+                        (Language::ZhCn, device_test::CalibrationStep::CenterBegin) => {
+                            "中心校准已开始；松开摇杆后可多次采样".to_owned()
+                        }
+                        (Language::ZhCn, device_test::CalibrationStep::CenterSample) => {
+                            "中心样本已接受；可继续采样或写入完成".to_owned()
+                        }
+                        (Language::ZhCn, device_test::CalibrationStep::CenterCommit) => {
+                            "中心校准已写入手柄".to_owned()
+                        }
+                        (Language::ZhCn, device_test::CalibrationStep::RangeBegin) => {
+                            "范围校准已开始；请缓慢转动两个摇杆多圈".to_owned()
+                        }
+                        (Language::ZhCn, device_test::CalibrationStep::RangeCommit) => {
+                            "范围校准已写入手柄".to_owned()
+                        }
+                        (Language::En, device_test::CalibrationStep::CenterBegin) => {
+                            "Center calibration started; release both sticks and sample repeatedly"
+                                .to_owned()
+                        }
+                        (Language::En, device_test::CalibrationStep::CenterSample) => {
+                            "Center sample accepted; sample again or commit".to_owned()
+                        }
+                        (Language::En, device_test::CalibrationStep::CenterCommit) => {
+                            "Center calibration committed to the controller".to_owned()
+                        }
+                        (Language::En, device_test::CalibrationStep::RangeBegin) => {
+                            "Range calibration started; slowly rotate both sticks several times"
+                                .to_owned()
+                        }
+                        (Language::En, device_test::CalibrationStep::RangeCommit) => {
+                            "Range calibration committed to the controller".to_owned()
+                        }
+                    };
+                    if matches!(
+                        step,
+                        device_test::CalibrationStep::CenterCommit
+                            | device_test::CalibrationStep::RangeCommit
+                    ) {
+                        self.calibration_postcheck_pending = true;
+                        self.controller_analyzer.active = true;
+                        self.controller_analyzer.reset();
+                        self.calibration_confirmed = false;
+                        self.calibration_status = self
+                            .language
+                            .tr(
+                                "校准已写入。请重新采集松手中心并旋转双摇杆，完成后会自动保存校准后结果。",
+                                "Calibration was committed. Capture released center and rotate both sticks again; the post-calibration result will be saved automatically.",
+                            )
+                            .to_owned();
+                    }
+                }
+                device_test::TestEvent::CalibrationFailed(step, error) => {
+                    self.calibration_busy = false;
+                    self.calibration_events.push(CalibrationEventRecord {
+                        created_at_unix_ms: diagnostics::now_unix_ms(),
+                        step: step.id(),
+                        result: "failed",
+                        error: Some(error.clone()),
+                    });
+                    self.calibration_status = match self.language {
+                        Language::ZhCn => format!("校准步骤 {step:?} 失败：{error}"),
+                        Language::En => format!("Calibration step {step:?} failed: {error}"),
+                    };
+                }
                 device_test::TestEvent::Error(error) => {
                     self.device_test_connected = false;
                     self.device_test_controller_tone = None;
@@ -2092,12 +2314,22 @@ impl FlasherApp {
                     self.device_test_session = None;
                     self.device_debug_started = None;
                     self.device_debug_complete = false;
+                    self.device_debug_final_snapshot_pending = false;
                     self.device_debug_next_snapshot = None;
                     self.device_debug_last_alert_snapshot = None;
+                    self.guided_test.require_input_resync();
+                    self.calibration_busy = false;
+                    self.calibration_state = CalibrationUiState::Idle;
                 }
                 device_test::TestEvent::Stopped => {
                     self.device_test_connected = false;
                     self.device_test_controller_tone = None;
+                    self.device_debug_started = None;
+                    self.device_debug_complete = false;
+                    self.device_debug_final_snapshot_pending = false;
+                    self.device_debug_next_snapshot = None;
+                    self.device_debug_last_alert_snapshot = None;
+                    self.guided_test.require_input_resync();
                     self.device_test_status = self
                         .language
                         .tr("测试设备已断开", "Test device disconnected")
@@ -2123,61 +2355,216 @@ impl FlasherApp {
         });
     }
 
-    fn start_microphone_test(&mut self) {
+    fn start_microphone_test(&mut self, seconds: u32) {
         if self.device_test_audio_busy {
             return;
         }
         self.device_test_audio_busy = true;
-        self.device_test_status = self
-            .language
-            .tr(
-                "正在录制麦克风 5 秒，随后自动回放...",
-                "Recording the microphone for 5 seconds, then playing it back...",
-            )
-            .to_owned();
+        self.device_test_status = if seconds >= 25 {
+            self.language
+                .tr(
+                    "正在录音 25 秒：前 20 秒说话，后 5 秒保持安静，随后自动回放...",
+                    "Recording for 25 seconds: speak for 20 seconds, stay quiet for 5, then playback starts...",
+                )
+                .to_owned()
+        } else {
+            match self.language {
+                Language::ZhCn => format!("正在录制麦克风 {seconds} 秒，随后自动回放..."),
+                Language::En => {
+                    format!(
+                        "Recording the microphone for {seconds} seconds, then playing it back..."
+                    )
+                }
+            }
+        };
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result =
-                device_test::record_and_play_microphone(5).map_err(|error| format!("{error:#}"));
-            let _ = tx.send(GuiEvent::AudioTestDone(result));
+            let result = device_test::record_and_play_microphone(seconds)
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::MicrophoneTestDone(result));
         });
     }
 
+    fn reset_test_outputs(&mut self) {
+        self.device_test_output = device_test::OutputState::default();
+        self.device_test_controller_tone = None;
+        if let Some(session) = &self.device_test_session {
+            if let Err(error) = session.stop_all() {
+                self.device_test_status = match self.language {
+                    Language::ZhCn => format!("无法复位测试输出：{error:#}"),
+                    Language::En => format!("Unable to reset test outputs: {error:#}"),
+                };
+                self.append_log(self.device_test_status.clone());
+            }
+        }
+    }
+
+    fn generate_guided_test_signal(&mut self) {
+        if !self.device_test_connected {
+            self.device_test_status = self
+                .language
+                .tr(
+                    "设备未连接，无法生成测试信号。",
+                    "The device is disconnected; the test signal was not generated.",
+                )
+                .to_owned();
+            return;
+        }
+        let phase_id = self.guided_test.phase().id;
+        let result = match phase_id {
+            "leds" => self
+                .device_test_session
+                .as_ref()
+                .context("device test session is unavailable")
+                .and_then(|session| {
+                    session.start_guided_output_demo(device_test::GuidedOutputDemo::Lights)
+                }),
+            "rumble" => self
+                .device_test_session
+                .as_ref()
+                .context("device test session is unavailable")
+                .and_then(|session| {
+                    session.start_guided_output_demo(device_test::GuidedOutputDemo::Rumble)
+                }),
+            "triggers_output" => self
+                .device_test_session
+                .as_ref()
+                .context("device test session is unavailable")
+                .and_then(|session| {
+                    session.start_guided_output_demo(device_test::GuidedOutputDemo::Triggers)
+                }),
+            "sound" => self
+                .device_test_session
+                .as_ref()
+                .context("device test session is unavailable")
+                .and_then(|session| {
+                    let target = if self.device_test_controller_tone
+                        == Some(device_test::ControllerAudioTarget::Speaker)
+                    {
+                        device_test::ControllerAudioTarget::Headphone
+                    } else {
+                        device_test::ControllerAudioTarget::Speaker
+                    };
+                    session.start_controller_tone(target)
+                }),
+            "microphone" => {
+                self.start_microphone_test(25);
+                Ok(())
+            }
+            "summary" => {
+                self.reset_test_outputs();
+                self.capture_debug_snapshot();
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            self.device_test_status = match self.language {
+                Language::ZhCn => format!("生成引导测试信号失败：{error:#}"),
+                Language::En => format!("Unable to generate the guided test signal: {error:#}"),
+            };
+            self.append_log(self.device_test_status.clone());
+        }
+    }
+
     fn start_debug_benchmark(&mut self) {
+        if self.loading_diagnostics {
+            self.status = self
+                .language
+                .tr(
+                    "正在采集运行快照，请完成后再启动压力测试。",
+                    "A runtime snapshot is in progress; start the stress test after it finishes.",
+                )
+                .to_owned();
+            return;
+        }
         self.ensure_device_session();
         let Some(session) = &self.device_test_session else {
             return;
         };
-        if session.reset_metrics().is_ok() && session.set_metrics_active(true).is_ok() {
-            let _ = session.set_stress_active(
-                self.device_debug_stress_enabled,
-                self.device_debug_stress_rate_hz,
-            );
-            self.device_debug_metrics = device_test::DebugMetrics::default();
-            self.device_debug_started = Some(Instant::now());
-            self.device_debug_complete = false;
-            self.device_debug_baseline = None;
-            self.device_debug_final = None;
-            self.device_debug_runtime_samples.clear();
-            self.device_debug_next_snapshot = Some(Instant::now() + Duration::from_secs(5));
-            self.device_debug_alert_snapshot_max_ms = 0.0;
-            self.device_debug_last_alert_snapshot = None;
-            self.capture_debug_snapshot();
+        let start_result = session
+            .stop_all()
+            .and_then(|()| session.reset_metrics())
+            .and_then(|()| session.set_metrics_active(true))
+            .and_then(|()| {
+                session.set_stress_active(
+                    self.device_debug_stress_enabled,
+                    self.device_debug_stress_rate_hz,
+                )
+            });
+        match start_result {
+            Ok(()) => {
+                self.device_debug_metrics = device_test::DebugMetrics::default();
+                self.device_debug_started = Some(Instant::now());
+                self.device_debug_complete = false;
+                self.device_debug_final_snapshot_pending = false;
+                self.device_debug_final_snapshot_attempts = 0;
+                self.device_debug_baseline = None;
+                self.device_debug_final = None;
+                self.device_debug_runtime_samples.clear();
+                self.device_debug_next_snapshot = Some(Instant::now() + Duration::from_secs(5));
+                self.device_debug_alert_snapshot_max_ms = 0.0;
+                self.device_debug_last_alert_snapshot = None;
+                self.capture_debug_snapshot();
+            }
+            Err(error) => {
+                self.device_debug_started = None;
+                self.device_debug_complete = false;
+                self.device_debug_final_snapshot_pending = false;
+                self.status = match self.language {
+                    Language::ZhCn => format!("无法启动压力测试：{error:#}"),
+                    Language::En => format!("Unable to start the stress test: {error:#}"),
+                };
+                self.append_log(self.status.clone());
+            }
         }
     }
 
-    fn stop_debug_benchmark(&mut self, complete: bool) {
+    fn stop_debug_benchmark(&mut self, reached_configured_duration: bool) {
+        let was_running = self.device_debug_started.is_some();
+        let mut stop_error = None;
         if let Some(session) = &self.device_test_session {
-            let _ = session.set_metrics_active(false);
-            let _ = session.set_stress_active(false, self.device_debug_stress_rate_hz);
+            if let Err(error) = session.set_metrics_active(false) {
+                stop_error = Some(format!("{error:#}"));
+            }
+            if let Err(error) = session.set_stress_active(false, self.device_debug_stress_rate_hz) {
+                stop_error.get_or_insert_with(|| format!("{error:#}"));
+            }
         }
         self.device_debug_started = None;
         self.device_debug_next_snapshot = None;
         self.device_debug_last_alert_snapshot = None;
-        self.device_debug_complete = complete && self.device_debug_metrics.sample_count > 0;
-        if complete {
-            self.capture_debug_snapshot();
+        self.device_debug_complete = reached_configured_duration
+            && self.device_debug_metrics.sample_count > 0
+            && stop_error.is_none();
+        if was_running && self.device_debug_metrics.sample_count > 0 {
+            self.device_debug_final_snapshot_pending = true;
+            self.device_debug_final_snapshot_attempts = 0;
+            self.try_capture_final_debug_snapshot();
+        } else {
+            self.device_debug_final_snapshot_pending = false;
         }
+        if let Some(error) = stop_error {
+            self.status = match self.language {
+                Language::ZhCn => format!("停止压力测试时设备线程已不可用：{error}"),
+                Language::En => {
+                    format!("The device worker stopped while ending the stress test: {error}")
+                }
+            };
+            self.append_log(self.status.clone());
+        }
+    }
+
+    fn try_capture_final_debug_snapshot(&mut self) {
+        if !self.device_debug_final_snapshot_pending || self.loading_diagnostics {
+            return;
+        }
+        if self.device_debug_final_snapshot_attempts >= 3 {
+            self.device_debug_final_snapshot_pending = false;
+            return;
+        }
+        self.device_debug_final_snapshot_attempts += 1;
+        self.capture_debug_snapshot();
     }
 
     fn capture_debug_snapshot(&mut self) {
@@ -2195,11 +2582,11 @@ impl FlasherApp {
     }
 
     fn export_debug_report(&mut self) {
-        let filename = format!("DS5Dongle-performance-{}.json", diagnostics::now_unix_ms());
+        let filename = format!("DS5Dongle-test-report-{}.json", diagnostics::now_unix_ms());
         let Some(path) = rfd::FileDialog::new()
             .set_title(
                 self.language
-                    .tr("保存设备性能报告", "Save device performance report"),
+                    .tr("保存完整测试报告", "Save complete test report"),
             )
             .add_filter("JSON", &["json"])
             .set_file_name(&filename)
@@ -2207,12 +2594,177 @@ impl FlasherApp {
         else {
             return;
         };
+        let runtime_snapshot_available = self.device_debug_baseline.is_some()
+            || self.device_debug_final.is_some()
+            || self
+                .runtime_diagnostics
+                .iter()
+                .any(|report| report.snapshot.is_some());
+        let runtime_diagnostic_error = self.diagnostics_error.is_some()
+            || self
+                .runtime_diagnostics
+                .iter()
+                .any(|report| report.error.is_some());
+        let assessment = assess_debug_report(
+            &self.guided_test.phases,
+            self.guided_test.active,
+            self.device_debug_started.is_some(),
+            self.device_debug_complete,
+            self.device_debug_metrics.sample_count,
+            self.device_debug_baseline.is_some(),
+            self.device_debug_final.is_some(),
+            runtime_snapshot_available,
+            runtime_diagnostic_error,
+        );
+        let stick_analysis = self.controller_analyzer.report();
+        let mut result = assessment.result;
+        let mut result_reasons = assessment.reasons;
+        let left_stick_grade = stick_analysis.left.assessment.grade;
+        let right_stick_grade = stick_analysis.right.assessment.grade;
+        if !stick_analysis.complete {
+            result_reasons.push("stick_analysis_incomplete");
+        }
+        if left_stick_grade == controller_analyzer::QualityGrade::Calibrate
+            || right_stick_grade == controller_analyzer::QualityGrade::Calibrate
+        {
+            result = "fail";
+            result_reasons.push("stick_calibration_recommended");
+        } else if matches!(
+            (left_stick_grade, right_stick_grade),
+            (controller_analyzer::QualityGrade::Retest, _)
+                | (_, controller_analyzer::QualityGrade::Retest)
+        ) {
+            if result == "pass" {
+                result = "warning";
+            }
+            result_reasons.push("stick_retest_recommended");
+        }
+        if self.calibration_postcheck_pending {
+            if result == "pass" {
+                result = "warning";
+            }
+            result_reasons.push("calibration_postcheck_pending");
+        }
+        if self
+            .last_microphone_metrics
+            .as_ref()
+            .is_some_and(|metrics| !metrics.signal_detected)
+        {
+            if result == "pass" {
+                result = "warning";
+            }
+            result_reasons.push("microphone_signal_insufficient");
+        }
+        let guided_has_results = self
+            .guided_test
+            .phases
+            .iter()
+            .any(|phase| phase.result != guided_test::PhaseResult::Pending);
+        let phase_status = |id: &str| {
+            self.guided_test
+                .phases
+                .iter()
+                .find(|phase| phase.id == id)
+                .map(|phase| phase.result)
+        };
+        let serial_devices = self
+            .devices
+            .iter()
+            .map(|device| {
+                serde_json::json!({
+                    "name": device.name,
+                    "port": device.port,
+                    "targetCh340": is_ch340_device(device),
+                    "usable": is_ch340_device(device) && device.error_code == 0,
+                    "pnpErrorCode": device.error_code,
+                    "status": device.status,
+                })
+            })
+            .collect::<Vec<_>>();
+        let firmware_devices = self
+            .firmware_devices
+            .iter()
+            .map(|device| {
+                serde_json::json!({
+                    "productName": device.product_name,
+                    "vendorId": device.vendor_id,
+                    "productId": device.product_id,
+                    "firmwareVersion": device.firmware_version,
+                    "buildProfile": device.build_profile,
+                })
+            })
+            .collect::<Vec<_>>();
+        let summary_zh_cn = build_unified_report_summary_zh_cn(
+            result,
+            &result_reasons,
+            &self.guided_test.phases,
+            &stick_analysis,
+            &self.device_debug_metrics,
+            self.device_debug_complete,
+            runtime_snapshot_available,
+            &self.calibration_events,
+            self.calibration_postcheck_pending,
+            self.last_microphone_metrics.as_ref(),
+        );
         let report = serde_json::json!({
             "schema": "ds5dongle-flasher-diagnostics/v2",
+            "reportKind": "unifiedControllerAndDongleTest",
             "createdAtUnixMs": diagnostics::now_unix_ms(),
             "flasherVersion": FLASHER_VERSION,
+            "summaryZhCn": summary_zh_cn,
+            "privacy": {
+                "devicePathsIncluded": false,
+                "serialNumbersIncluded": false,
+                "bluetoothAddressesIncluded": false,
+            },
+            "deviceInventory": {
+                "serialDevices": serial_devices,
+                "firmwareDevices": firmware_devices,
+            },
+            "testCoverage": {
+                "guidedControllerTest": if self.guided_test.active { "running" } else if guided_has_results { "completeOrPartial" } else { "notTested" },
+                "stickAnalysis": if stick_analysis.complete { "complete" } else if stick_analysis.left.samples > 0 || stick_analysis.right.samples > 0 { "partial" } else { "notTested" },
+                "performanceBenchmark": if self.device_debug_started.is_some() { "running" } else if self.device_debug_complete { "complete" } else if self.device_debug_metrics.sample_count > 0 { "partial" } else { "notTested" },
+                "runtimeSnapshots": if runtime_snapshot_available { "available" } else { "notAvailable" },
+                "speakerOutput": phase_status("sound"),
+                "microphoneInput": if let Some(metrics) = &self.last_microphone_metrics {
+                    if metrics.signal_detected { "signalDetected" } else { "signalInsufficient" }
+                } else if phase_status("microphone") == Some(guided_test::PhaseResult::Pass) {
+                    "userConfirmed"
+                } else {
+                    "notTestedOrUnconfirmed"
+                },
+                "calibration": if self.calibration_events.is_empty() { "notPerformed" } else if self.calibration_postcheck_pending { "postcheckPending" } else { "performed" },
+            },
+            "controllerTests": {
+                "liveInputSnapshot": &self.device_test_input,
+                "guidedPhases": &self.guided_test.phases,
+                "stickAnalysis": &stick_analysis,
+                "stickAnalysisCheckpoints": &self.controller_analysis_checkpoints,
+                "calibrationEvents": &self.calibration_events,
+                "calibrationPostcheckPending": self.calibration_postcheck_pending,
+            },
+            "performanceTests": {
+                "hidMetrics": &self.device_debug_metrics,
+                "runtimeBaseline": &self.device_debug_baseline,
+                "runtimeSamples": &self.device_debug_runtime_samples,
+                "runtimeFinal": &self.device_debug_final,
+                "runtimeDiagnostics": &self.runtime_diagnostics,
+            },
+            "audioTests": {
+                "speakerGuidedPhase": self.guided_test.phases.iter().find(|phase| phase.id == "sound"),
+                "microphoneGuidedPhase": self.guided_test.phases.iter().find(|phase| phase.id == "microphone"),
+                "microphoneSignalMetrics": &self.last_microphone_metrics,
+                "inputMethod": "Windows M61 UAC capture plus user playback confirmation",
+                "outputMethod": "frozen ds.evua.cc-compatible HID 0x02/0x80 vectors",
+            },
             "measurementScope": "Windows HID report arrival intervals; not absolute controller-to-display latency",
-            "configuredDurationSeconds": serde_json::Value::Null,
+            "configuredDurationSeconds": self.device_debug_duration_secs,
+            "actualDurationMs": self.device_debug_metrics.elapsed_ms,
+            "benchmarkRunning": self.device_debug_started.is_some(),
+            "benchmarkComplete": self.device_debug_complete,
+            "runtimeFinalSnapshotPending": self.device_debug_final_snapshot_pending,
+            "runtimeFinalSnapshotAttempts": self.device_debug_final_snapshot_attempts,
             "stressOutputsEnabled": self.device_debug_stress_enabled,
             "stressOutputRateHz": self.device_debug_stress_rate_hz,
             "stressDutyCycle": "15 seconds active / 5 seconds fully released",
@@ -2233,6 +2785,7 @@ impl FlasherApp {
             },
             "audioInputMetrics": {
                 "firmwareSnapshot": &self.device_debug_final,
+                "windowsCapture": &self.last_microphone_metrics,
                 "method": "Windows M61 UAC capture plus user playback confirmation",
             },
             "audioOutputMetrics": {
@@ -2241,29 +2794,25 @@ impl FlasherApp {
             "userConfirmations": self.guided_test.phases.iter().map(|phase| serde_json::json!({
                 "phase": phase.id, "result": phase.result, "note": phase.note,
             })).collect::<Vec<_>>(),
-            "result": if self.guided_test.phases.iter().any(|phase| phase.result == guided_test::PhaseResult::NotEffective) {
-                "fail"
-            } else if self.guided_test.active || self.guided_test.phases.iter().any(|phase| phase.result == guided_test::PhaseResult::Pending) {
-                "warning"
-            } else {
-                "pass"
-            },
+            "result": result,
+            "resultReasons": result_reasons,
             "rawTrace": &self.device_debug_runtime_samples,
         });
         match serde_json::to_vec_pretty(&report)
-            .context("unable to serialize performance report")
-            .and_then(|bytes| fs::write(&path, bytes).context("unable to write performance report"))
-        {
+            .context("unable to serialize complete test report")
+            .and_then(|bytes| {
+                fs::write(&path, bytes).context("unable to write complete test report")
+            }) {
             Ok(()) => {
                 self.status = match self.language {
-                    Language::ZhCn => format!("性能报告已保存：{}", path.display()),
-                    Language::En => format!("Performance report saved: {}", path.display()),
+                    Language::ZhCn => format!("完整测试报告已保存：{}", path.display()),
+                    Language::En => format!("Complete test report saved: {}", path.display()),
                 };
             }
             Err(error) => {
                 self.status = match self.language {
-                    Language::ZhCn => format!("性能报告保存失败：{error:#}"),
-                    Language::En => format!("Failed to save performance report: {error:#}"),
+                    Language::ZhCn => format!("完整测试报告保存失败：{error:#}"),
+                    Language::En => format!("Failed to save complete test report: {error:#}"),
                 };
             }
         }
@@ -2309,7 +2858,21 @@ impl FlasherApp {
     }
 
     fn start_profile_ota(&mut self, profile: BuildProfile) {
-        if self.busy.is_some() {
+        if self.busy.is_some()
+            || self.device_debug_started.is_some()
+            || self.guided_test.active
+            || self.device_test_audio_busy
+            || self.loading_diagnostics
+        {
+            if self.busy.is_none() {
+                self.status = self
+                    .language
+                    .tr(
+                        "请先结束测试、录音和快照采集，再切换固件模式。",
+                        "End tests, recording, and snapshot capture before switching firmware profiles.",
+                    )
+                    .to_owned();
+            }
             return;
         }
         let Some(release) = self.latest_release_for_profile(profile) else {
@@ -2330,6 +2893,11 @@ impl FlasherApp {
         self.device_test_connected = false;
         self.device_test_controller_tone = None;
         self.device_debug_started = None;
+        self.device_debug_complete = false;
+        self.device_debug_final_snapshot_pending = false;
+        self.device_debug_next_snapshot = None;
+        self.device_debug_last_alert_snapshot = None;
+        self.guided_test.require_input_resync();
         self.busy = Some(match (self.language, profile) {
             (Language::ZhCn, BuildProfile::Standard) => "正在 OTA 恢复常用版…".to_owned(),
             (Language::ZhCn, BuildProfile::Diagnostic) => "正在 OTA 进入诊断模式…".to_owned(),
@@ -2888,6 +3456,65 @@ impl FlasherApp {
                         }
                     });
                 }
+                GuiEvent::PollingRate(Ok(mode)) => {
+                    self.loading_polling_rate = false;
+                    self.device_polling_rate = Some(mode);
+                    self.selected_polling_rate = mode;
+                    self.polling_rate_error = None;
+                    self.append_log(match self.language {
+                        Language::ZhCn => format!("已读取设备轮询档位：{}。", mode.label()),
+                        Language::En => format!("Device polling mode: {}.", mode.label()),
+                    });
+                }
+                GuiEvent::PollingRate(Err(error)) => {
+                    self.loading_polling_rate = false;
+                    self.device_polling_rate = None;
+                    self.polling_rate_error = Some(error.clone());
+                    self.append_log(match self.language {
+                        Language::ZhCn => format!("读取轮询档位失败：{error}"),
+                        Language::En => format!("Failed to read polling mode: {error}"),
+                    });
+                }
+                GuiEvent::PollingRateApplied(Ok(result)) => {
+                    self.applying_polling_rate = false;
+                    self.device_polling_rate = Some(result.mode);
+                    self.selected_polling_rate = result.mode;
+                    self.polling_rate_error = None;
+                    self.status = match (self.language, result.reset_requested) {
+                        (Language::ZhCn, true) => {
+                            format!("已应用 {}；设备正在重启并重新枚举。", result.mode.label())
+                        }
+                        (Language::En, true) => format!(
+                            "Applied {}; the device is restarting and re-enumerating.",
+                            result.mode.label()
+                        ),
+                        (Language::ZhCn, false) => format!(
+                            "已保存 {}，但自动重启未确认；请手动重新插拔正常 USB 口。",
+                            result.mode.label()
+                        ),
+                        (Language::En, false) => format!(
+                            "Saved {}, but automatic restart was not confirmed; reconnect the normal USB port manually.",
+                            result.mode.label()
+                        ),
+                    };
+                    self.append_log(self.status.clone());
+                    self.refresh_firmware_devices();
+                }
+                GuiEvent::PollingRateApplied(Err(error)) => {
+                    self.applying_polling_rate = false;
+                    self.polling_rate_error = Some(error.clone());
+                    self.status = self
+                        .language
+                        .tr(
+                            "未能完成轮询档位设置，请查看日志并重新读取设备状态。",
+                            "Polling mode setup did not complete; inspect the log and read the device state again.",
+                        )
+                        .to_owned();
+                    self.append_log(match self.language {
+                        Language::ZhCn => format!("设置轮询档位失败：{error}"),
+                        Language::En => format!("Failed to set polling mode: {error}"),
+                    });
+                }
                 GuiEvent::Diagnostics(Ok(reports)) => {
                     self.loading_diagnostics = false;
                     self.diagnostics_error = None;
@@ -2903,8 +3530,16 @@ impl FlasherApp {
                             self.device_debug_baseline = Some(snapshot);
                         } else if self.device_debug_started.is_some() {
                             self.device_debug_runtime_samples.push(snapshot);
-                        } else if self.device_debug_complete {
-                            self.device_debug_final = Some(snapshot);
+                        } else if self.device_debug_final_snapshot_pending {
+                            if self.device_debug_final_snapshot_attempts > 0 {
+                                self.device_debug_final = Some(snapshot);
+                                self.device_debug_final_snapshot_pending = false;
+                            } else {
+                                // A periodic capture may already be in flight when the
+                                // benchmark stops. Keep it as a periodic sample, then
+                                // start a dedicated post-stop final capture below.
+                                self.device_debug_runtime_samples.push(snapshot);
+                            }
                         }
                     }
                     let captured = self
@@ -2944,6 +3579,7 @@ impl FlasherApp {
                             )
                             .to_owned();
                     }
+                    self.try_capture_final_debug_snapshot();
                 }
                 GuiEvent::Diagnostics(Err(error)) => {
                     self.loading_diagnostics = false;
@@ -2960,6 +3596,7 @@ impl FlasherApp {
                         Language::ZhCn => format!("一键诊断错误：{error}"),
                         Language::En => format!("Diagnostics error: {error}"),
                     });
+                    self.try_capture_final_debug_snapshot();
                 }
                 GuiEvent::AudioTestDone(result) => {
                     self.device_test_audio_busy = false;
@@ -2977,6 +3614,45 @@ impl FlasherApp {
                             self.device_test_status = match self.language {
                                 Language::ZhCn => format!("音频测试失败：{error}"),
                                 Language::En => format!("Audio test failed: {error}"),
+                            };
+                            self.append_log(self.device_test_status.clone());
+                        }
+                    }
+                }
+                GuiEvent::MicrophoneTestDone(result) => {
+                    self.device_test_audio_busy = false;
+                    match result {
+                        Ok(metrics) => {
+                            self.device_test_status = match self.language {
+                                Language::ZhCn => format!(
+                                    "麦克风测试完成：RMS {:.2}%，峰值 {:.2}%，有效声音窗口 {} 个，{}。请回听确认清晰度。",
+                                    metrics.rms_percent,
+                                    metrics.peak_percent,
+                                    metrics.active_windows,
+                                    if metrics.signal_detected {
+                                        "已检测到有效声音"
+                                    } else {
+                                        "未检测到足够的有效声音"
+                                    },
+                                ),
+                                Language::En => format!(
+                                    "Microphone test completed: RMS {:.2}%, peak {:.2}%, {} active windows; {}. Confirm clarity by listening.",
+                                    metrics.rms_percent,
+                                    metrics.peak_percent,
+                                    metrics.active_windows,
+                                    if metrics.signal_detected {
+                                        "signal detected"
+                                    } else {
+                                        "insufficient signal"
+                                    },
+                                ),
+                            };
+                            self.last_microphone_metrics = Some(metrics);
+                        }
+                        Err(error) => {
+                            self.device_test_status = match self.language {
+                                Language::ZhCn => format!("麦克风测试失败：{error}"),
+                                Language::En => format!("Microphone test failed: {error}"),
                             };
                             self.append_log(self.device_test_status.clone());
                         }
@@ -3362,6 +4038,460 @@ fn input_button(ui: &mut eframe::egui::Ui, label: &str, pressed: bool) {
         });
 }
 
+fn stick_analysis_dial(
+    ui: &mut eframe::egui::Ui,
+    label: &str,
+    raw_x: u8,
+    raw_y: u8,
+    analysis: &controller_analyzer::StickAnalysis,
+) {
+    use eframe::egui::{Align2, FontId, Pos2, Sense, Shape, Stroke, Vec2};
+
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(220.0, 230.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let center = Pos2::new(rect.center().x, rect.top() + 105.0);
+    let radius = 82.0;
+    painter.circle_filled(center, radius, COLOR_SURFACE_RAISED);
+    painter.circle_stroke(center, radius, Stroke::new(1.5_f32, COLOR_BORDER));
+    painter.circle_stroke(center, radius * 0.2, Stroke::new(1.0_f32, COLOR_BORDER));
+    painter.line_segment(
+        [
+            center + Vec2::new(-radius, 0.0),
+            center + Vec2::new(radius, 0.0),
+        ],
+        Stroke::new(1.0_f32, COLOR_BORDER),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(0.0, -radius),
+            center + Vec2::new(0.0, radius),
+        ],
+        Stroke::new(1.0_f32, COLOR_BORDER),
+    );
+
+    let bins = analysis.bins();
+    let mut points = Vec::with_capacity(bins.len() + 1);
+    for (index, distance) in bins.iter().enumerate() {
+        if *distance <= 0.02 {
+            continue;
+        }
+        let angle = index as f32 * 2.0 * std::f32::consts::PI / bins.len() as f32;
+        let distance = distance.min(1.35) * radius;
+        points.push(center + Vec2::angled(angle) * distance);
+    }
+    if points.len() > 2 {
+        points.push(points[0]);
+        painter.add(Shape::line(points, Stroke::new(2.0_f32, COLOR_ACCENT)));
+    }
+
+    let (x, y) = controller_analyzer::normalized_stick(raw_x, raw_y);
+    let marker = center + Vec2::new(x * radius, y * radius);
+    painter.line_segment([center, marker], Stroke::new(2.0_f32, COLOR_ACCENT_HOVER));
+    painter.circle_filled(marker, 5.5, COLOR_ACCENT_HOVER);
+    painter.text(
+        Pos2::new(rect.center().x, rect.top() + 2.0),
+        Align2::CENTER_TOP,
+        label,
+        FontId::proportional(17.0),
+        COLOR_TEXT_PRIMARY,
+    );
+    painter.text(
+        Pos2::new(rect.center().x, rect.bottom() - 4.0),
+        Align2::CENTER_BOTTOM,
+        format!("X {x:+.3}   Y {y:+.3}"),
+        FontId::monospace(13.0),
+        COLOR_TEXT_PRIMARY,
+    );
+}
+
+fn stick_analysis_metrics(
+    ui: &mut eframe::egui::Ui,
+    language: Language,
+    stick: &controller_analyzer::StickAnalysis,
+    center: Option<controller_analyzer::StickCenter>,
+    assessment: controller_analyzer::StickAssessment,
+) {
+    let (range_x, range_y) = stick.axis_range_percent();
+    let circularity = stick
+        .circularity_error_percent()
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "--".to_owned());
+    ui.label(format!(
+        "{}: {:.0}%  ·  {}: {circularity}",
+        language.tr("方向覆盖", "Coverage"),
+        stick.coverage_percent(),
+        language.tr("圆度误差", "Circularity error"),
+    ));
+    ui.label(format!(
+        "{} X/Y: {range_x:.1}% / {range_y:.1}%  ·  {}: {}",
+        language.tr("轴范围", "Axis range"),
+        language.tr("样本", "Samples"),
+        stick.samples(),
+    ));
+    ui.label(match center {
+        Some(center) => format!(
+            "{}: {:.2}%  (X {:+.4}, Y {:+.4})",
+            language.tr("中心偏移", "Center offset"),
+            center.offset_percent,
+            center.x,
+            center.y,
+        ),
+        None => language
+            .tr("中心偏移：尚未采集", "Center offset: not captured")
+            .to_owned(),
+    });
+    let (label, color) = match assessment.grade {
+        controller_analyzer::QualityGrade::Incomplete => (
+            language.tr("结论：未完成", "Result: incomplete"),
+            COLOR_TEXT_MUTED,
+        ),
+        controller_analyzer::QualityGrade::Normal => {
+            (language.tr("结论：正常", "Result: normal"), COLOR_SUCCESS)
+        }
+        controller_analyzer::QualityGrade::Retest => (
+            language.tr("结论：建议复测", "Result: retest recommended"),
+            COLOR_WARNING,
+        ),
+        controller_analyzer::QualityGrade::Calibrate => (
+            language.tr("结论：建议校准", "Result: calibration recommended"),
+            COLOR_ERROR,
+        ),
+    };
+    ui.label(eframe::egui::RichText::new(label).color(color).strong());
+    match assessment.grade {
+        controller_analyzer::QualityGrade::Normal => {
+            ui.label(
+                eframe::egui::RichText::new(language.tr(
+                    "中心、圆度和双轴范围均在项目经验阈值内",
+                    "Center, circularity and both axis ranges are within project guidance",
+                ))
+                .color(COLOR_TEXT_MUTED),
+            );
+        }
+        controller_analyzer::QualityGrade::Retest
+        | controller_analyzer::QualityGrade::Calibrate => {
+            let mut reasons = Vec::new();
+            if assessment.center_offset_percent.unwrap_or_default() > 3.0 {
+                reasons.push(language.tr("中心偏移偏高", "elevated center offset"));
+            }
+            let circularity = assessment.circularity_error_percent.unwrap_or_default();
+            if circularity < 5.0 {
+                reasons.push(language.tr(
+                    "圆度误差低于上游建议范围",
+                    "circularity error below upstream guidance",
+                ));
+            } else if circularity > 12.0 {
+                reasons.push(language.tr("圆度误差偏高", "elevated circularity error"));
+            }
+            if assessment.range_x_percent < 95.0 || assessment.range_y_percent < 95.0 {
+                reasons.push(language.tr("轴范围不足", "insufficient axis range"));
+            }
+            ui.label(
+                eframe::egui::RichText::new(format!(
+                    "{}：{}",
+                    language.tr("原因", "Reason"),
+                    reasons.join(language.tr("、", ", ")),
+                ))
+                .color(COLOR_TEXT_PRIMARY),
+            );
+            ui.label(
+                eframe::egui::RichText::new(language.tr(
+                    "请先清空数据并完整复测；异常持续存在时再执行永久校准",
+                    "Clear the data and repeat a complete test first; use permanent calibration only if the issue persists",
+                ))
+                .color(COLOR_TEXT_MUTED),
+            );
+        }
+        controller_analyzer::QualityGrade::Incomplete => {}
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DebugReportAssessment {
+    result: &'static str,
+    reasons: Vec<&'static str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_unified_report_summary_zh_cn(
+    result: &'static str,
+    reasons: &[&str],
+    phases: &[guided_test::PhaseRecord],
+    stick_analysis: &controller_analyzer::ControllerAnalysisReport,
+    metrics: &device_test::DebugMetrics,
+    benchmark_complete: bool,
+    runtime_snapshot_available: bool,
+    calibration_events: &[CalibrationEventRecord],
+    calibration_postcheck_pending: bool,
+    microphone_metrics: Option<&device_test::MicrophoneTestMetrics>,
+) -> UnifiedReportSummaryZhCn {
+    fn push_unique(items: &mut Vec<String>, value: impl Into<String>) {
+        let value = value.into();
+        if !items.contains(&value) {
+            items.push(value);
+        }
+    }
+
+    fn grade_zh_cn(grade: controller_analyzer::QualityGrade) -> &'static str {
+        match grade {
+            controller_analyzer::QualityGrade::Incomplete => "未完成",
+            controller_analyzer::QualityGrade::Normal => "正常",
+            controller_analyzer::QualityGrade::Retest => "建议复测",
+            controller_analyzer::QualityGrade::Calibrate => "建议校准",
+        }
+    }
+
+    let mut completed_items = Vec::new();
+    let mut abnormal_items = Vec::new();
+    let mut untested_items = Vec::new();
+    let mut recommendations = Vec::new();
+
+    let guided_started = phases
+        .iter()
+        .any(|phase| phase.result != guided_test::PhaseResult::Pending);
+    let guided_finished = phases
+        .iter()
+        .all(|phase| phase.result != guided_test::PhaseResult::Pending);
+    if guided_finished {
+        push_unique(&mut completed_items, "引导式手柄功能测试");
+    } else if !guided_started {
+        push_unique(&mut untested_items, "引导式手柄功能测试");
+    }
+    for phase in phases {
+        match phase.result {
+            guided_test::PhaseResult::NotEffective => push_unique(
+                &mut abnormal_items,
+                format!("引导项目“{}”未生效", phase.title_zh),
+            ),
+            guided_test::PhaseResult::Skipped => push_unique(
+                &mut untested_items,
+                format!("引导项目“{}”已跳过", phase.title_zh),
+            ),
+            guided_test::PhaseResult::Pending if guided_started => push_unique(
+                &mut untested_items,
+                format!("引导项目“{}”尚未完成", phase.title_zh),
+            ),
+            _ => {}
+        }
+    }
+
+    if stick_analysis.complete {
+        push_unique(&mut completed_items, "双摇杆中心、范围和圆度分析");
+    } else if stick_analysis.left.samples > 0 || stick_analysis.right.samples > 0 {
+        push_unique(&mut untested_items, "双摇杆质量分析采样不完整");
+    } else {
+        push_unique(&mut untested_items, "双摇杆质量分析");
+    }
+    for (name, grade) in [
+        ("左摇杆", stick_analysis.left.assessment.grade),
+        ("右摇杆", stick_analysis.right.assessment.grade),
+    ] {
+        match grade {
+            controller_analyzer::QualityGrade::Retest => {
+                push_unique(&mut abnormal_items, format!("{name}建议复测"));
+                push_unique(
+                    &mut recommendations,
+                    format!("清空{name}数据并重新采集松手中心和完整外圈轨迹"),
+                );
+            }
+            controller_analyzer::QualityGrade::Calibrate => {
+                push_unique(&mut abnormal_items, format!("{name}达到建议校准阈值"));
+                push_unique(
+                    &mut recommendations,
+                    format!("先复测{name}；异常稳定复现后再考虑永久校准"),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if benchmark_complete {
+        push_unique(&mut completed_items, "HID 延迟、抖动和压力测试");
+    } else if metrics.sample_count > 0 {
+        push_unique(&mut untested_items, "HID 性能测试仅采集到部分数据");
+    } else {
+        push_unique(&mut untested_items, "HID 延迟、抖动和压力测试");
+    }
+    if runtime_snapshot_available {
+        push_unique(&mut completed_items, "M61 固件运行快照");
+    } else {
+        push_unique(&mut untested_items, "M61 固件运行快照");
+    }
+
+    if !calibration_events.is_empty() {
+        push_unique(&mut completed_items, "永久校准命令记录");
+    }
+    for event in calibration_events {
+        if event.result == "failed" {
+            push_unique(
+                &mut abnormal_items,
+                format!("校准步骤 {} 执行失败", event.step),
+            );
+        }
+    }
+    if calibration_postcheck_pending {
+        push_unique(&mut untested_items, "校准后摇杆复测");
+        push_unique(
+            &mut recommendations,
+            "重新采集松手中心并旋转双摇杆，完成校准后复测",
+        );
+    }
+
+    match microphone_metrics {
+        Some(metrics) if metrics.signal_detected => {
+            push_unique(&mut completed_items, "Windows M61 UAC 麦克风信号检测");
+        }
+        Some(_) => {
+            push_unique(&mut abnormal_items, "麦克风录音未检测到足够的有效声音");
+            push_unique(
+                &mut recommendations,
+                "确认 Windows 默认输入设备为 M61，并靠近手柄麦克风重新录制",
+            );
+        }
+        None => push_unique(&mut untested_items, "Windows M61 UAC 麦克风信号检测"),
+    }
+
+    for reason in reasons {
+        match *reason {
+            "guided_test_incomplete" => {
+                push_unique(&mut recommendations, "完成所有引导式测试项目后重新导出报告")
+            }
+            "guided_phase_not_effective" => push_unique(
+                &mut recommendations,
+                "关闭可能占用手柄的程序并复测未生效项目",
+            ),
+            "guided_phase_skipped" => push_unique(&mut recommendations, "补测已跳过的引导项目"),
+            "hid_metrics_missing" | "benchmark_incomplete" | "benchmark_still_running" => {
+                push_unique(&mut recommendations, "完成一次完整的设备性能压力测试")
+            }
+            "runtime_baseline_missing"
+            | "runtime_final_missing"
+            | "runtime_snapshot_unavailable" => {
+                push_unique(&mut recommendations, "使用诊断固件重新采集 M61 运行快照")
+            }
+            "runtime_diagnostic_error" => push_unique(
+                &mut recommendations,
+                "检查 USB 连接和诊断固件状态后重新采集运行快照",
+            ),
+            _ => {}
+        }
+    }
+    if result == "pass" {
+        push_unique(&mut recommendations, "保存本报告作为当前设备的正常基线");
+    }
+
+    let (overall_result, conclusion) = match result {
+        "pass" => ("通过", "要求的测试数据完整，已执行项目未发现明确异常。"),
+        "fail" => (
+            "未通过",
+            "检测到明确异常或摇杆达到建议校准阈值，请按建议复测并处理。",
+        ),
+        _ => (
+            "警告",
+            "报告包含未测试、未完成或建议复测项目，当前结果不能视为全部通过。",
+        ),
+    };
+
+    UnifiedReportSummaryZhCn {
+        machine_result: result,
+        overall_result,
+        conclusion,
+        completed_items,
+        abnormal_items,
+        untested_items,
+        recommendations,
+        key_metrics: serde_json::json!({
+            "hidSamples": metrics.sample_count,
+            "hidReportRateHz": metrics.report_rate_hz,
+            "averageIntervalMs": metrics.average_interval_ms,
+            "p95IntervalMs": metrics.p95_interval_ms,
+            "p99IntervalMs": metrics.p99_interval_ms,
+            "maximumIntervalMs": metrics.maximum_interval_ms,
+            "jitterStddevMs": metrics.jitter_stddev_ms,
+            "leftStick": {
+                "result": grade_zh_cn(stick_analysis.left.assessment.grade),
+                "centerOffsetPercent": stick_analysis.left.assessment.center_offset_percent,
+                "circularityErrorPercent": stick_analysis.left.assessment.circularity_error_percent,
+                "rangeXPercent": stick_analysis.left.assessment.range_x_percent,
+                "rangeYPercent": stick_analysis.left.assessment.range_y_percent,
+            },
+            "rightStick": {
+                "result": grade_zh_cn(stick_analysis.right.assessment.grade),
+                "centerOffsetPercent": stick_analysis.right.assessment.center_offset_percent,
+                "circularityErrorPercent": stick_analysis.right.assessment.circularity_error_percent,
+                "rangeXPercent": stick_analysis.right.assessment.range_x_percent,
+                "rangeYPercent": stick_analysis.right.assessment.range_y_percent,
+            },
+            "microphone": microphone_metrics,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assess_debug_report(
+    phases: &[guided_test::PhaseRecord],
+    guided_active: bool,
+    benchmark_running: bool,
+    benchmark_complete: bool,
+    hid_sample_count: u64,
+    has_runtime_baseline: bool,
+    has_runtime_final: bool,
+    runtime_snapshot_available: bool,
+    runtime_diagnostic_error: bool,
+) -> DebugReportAssessment {
+    let mut reasons = Vec::new();
+    let failed = phases
+        .iter()
+        .any(|phase| phase.result == guided_test::PhaseResult::NotEffective);
+    if failed {
+        reasons.push("guided_phase_not_effective");
+    }
+    if guided_active
+        || phases
+            .iter()
+            .any(|phase| phase.result == guided_test::PhaseResult::Pending)
+    {
+        reasons.push("guided_test_incomplete");
+    }
+    if phases
+        .iter()
+        .any(|phase| phase.result == guided_test::PhaseResult::Skipped)
+    {
+        reasons.push("guided_phase_skipped");
+    }
+    if hid_sample_count == 0 {
+        reasons.push("hid_metrics_missing");
+    }
+    if benchmark_running {
+        reasons.push("benchmark_still_running");
+    } else if !benchmark_complete {
+        reasons.push("benchmark_incomplete");
+    }
+    if !has_runtime_baseline {
+        reasons.push("runtime_baseline_missing");
+    }
+    if !has_runtime_final {
+        reasons.push("runtime_final_missing");
+    }
+    if !runtime_snapshot_available {
+        reasons.push("runtime_snapshot_unavailable");
+    }
+    if runtime_diagnostic_error {
+        reasons.push("runtime_diagnostic_error");
+    }
+
+    DebugReportAssessment {
+        result: if failed {
+            "fail"
+        } else if reasons.is_empty() {
+            "pass"
+        } else {
+            "warning"
+        },
+        reasons,
+    }
+}
+
 const COLOR_APP_BG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(244, 247, 251);
 const COLOR_HEADER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 255, 255);
 const COLOR_SURFACE: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 255, 255);
@@ -3554,6 +4684,28 @@ impl eframe::App for FlasherApp {
                 .to_owned();
         }
         let debug_now = Instant::now();
+        let benchmark_due = self.device_debug_started.is_some_and(|started| {
+            debug_now.duration_since(started)
+                >= Duration::from_secs(self.device_debug_duration_secs as u64)
+        });
+        if benchmark_due {
+            self.stop_debug_benchmark(true);
+            self.status = if self.device_debug_complete {
+                self.language
+                    .tr(
+                        "压力测试已达到设定时长，正在采集最终 M61 快照。",
+                        "The stress test reached its configured duration; capturing the final M61 snapshot.",
+                    )
+                    .to_owned()
+            } else {
+                self.language
+                    .tr(
+                        "压力测试已结束，但未产生完整结果，请查看日志。",
+                        "The stress test ended without a complete result; see the log for details.",
+                    )
+                    .to_owned()
+            };
+        }
         let new_severe_gap = self.device_debug_metrics.maximum_interval_ms >= 20.0
             && (self.device_debug_alert_snapshot_max_ms < 20.0
                 || self.device_debug_metrics.maximum_interval_ms
@@ -3689,6 +4841,7 @@ impl eframe::App for FlasherApp {
             self.open_device_test();
         } else if previous_tab != self.current_tab && self.current_tab == AppTab::DeviceDebug {
             self.ensure_device_session();
+            self.refresh_polling_rate();
         }
 
         eframe::egui::TopBottomPanel::bottom("footer")
@@ -4050,6 +5203,8 @@ impl eframe::App for FlasherApp {
             let mut mic_test = false;
             let mut start_controller_tone = None;
             let mut stop_controller_tone = false;
+            let mut calibration_step = None;
+            let mut export_complete_report = false;
             let input = self.device_test_input.clone();
             eframe::egui::CentralPanel::default()
                 .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
@@ -4068,6 +5223,7 @@ impl eframe::App for FlasherApp {
                 ui.add_space(8.0);
                 let connected = self.device_test_connected;
                 let worker_active = self.device_test_session.is_some();
+                let benchmark_running = self.device_debug_started.is_some();
                 notice(
                     ui,
                     if connected {
@@ -4086,6 +5242,18 @@ impl eframe::App for FlasherApp {
                     },
                     &self.device_test_status,
                 );
+                if benchmark_running {
+                    ui.add_space(8.0);
+                    notice(
+                        ui,
+                        NoticeTone::Warning,
+                        language.tr("压力测试正在运行", "Stress test is running"),
+                        language.tr(
+                            "手动震动、灯效、扳机和 1 kHz 声音控制已锁定。点击“全部停止并复位”会同时提前结束压力测试。",
+                            "Manual rumble, light, trigger and 1 kHz controls are locked. Stop all and reset also ends the stress test early.",
+                        ),
+                    );
+                }
                 if !worker_active
                     && ui
                         .add(primary_button(language.tr("重新连接", "Reconnect")))
@@ -4175,9 +5343,38 @@ impl eframe::App for FlasherApp {
                         ui.group(|ui| {
                             ui.strong(language.tr("状态", "Status"));
                             ui.label(match input.battery_percent {
-                                Some(value) => format!("{}: {value}%", language.tr("电量", "Battery")),
+                                Some(value) => format!(
+                                    "{}: {value}%{}",
+                                    language.tr("电量", "Battery"),
+                                    if input.battery_charging {
+                                        language.tr("（充电中）", " (charging)")
+                                    } else if input.battery_cable_connected {
+                                        language.tr("（已接电源）", " (external power)")
+                                    } else {
+                                        ""
+                                    },
+                                ),
                                 None => language.tr("电量：未知", "Battery: unknown").to_owned(),
                             });
+                            if input.battery_error {
+                                ui.colored_label(
+                                    COLOR_WARNING,
+                                    language.tr("电池状态异常", "Battery status error"),
+                                );
+                            }
+                            ui.label(format!(
+                                "{}: {} · {}: {}",
+                                language.tr("3.5 mm 耳机", "3.5 mm headphone"),
+                                language.tr(
+                                    if input.headphone_connected { "已连接" } else { "未连接" },
+                                    if input.headphone_connected { "connected" } else { "not connected" },
+                                ),
+                                language.tr("耳麦麦克风", "Headset microphone"),
+                                language.tr(
+                                    if input.headset_microphone_connected { "已连接" } else { "未连接" },
+                                    if input.headset_microphone_connected { "connected" } else { "not connected" },
+                                ),
+                            ));
                             ui.label(format!("{}: {}", language.tr("报告数", "Reports"), input.report_count));
                             ui.label(format!(
                                 "{}: {:.1} Hz",
@@ -4186,6 +5383,231 @@ impl eframe::App for FlasherApp {
                             ));
                         });
                     });
+                    });
+
+                    ui.add_space(12.0);
+                    surface_frame().show(ui, |ui| {
+                        ui.heading(language.tr(
+                            "摇杆质量分析",
+                            "Stick quality analyzer",
+                        ));
+                        ui.label(
+                            eframe::egui::RichText::new(language.tr(
+                                "松开摇杆采集中心，然后开启轨迹采集并将两个摇杆沿外圈缓慢转动 3–5 圈。圆度误差采用 dualshock-tools 的 48 方向 RMS 定义。",
+                                "Capture center with both sticks released, then record while rotating both sticks slowly around the rim 3–5 times. Circularity uses dualshock-tools' 48-direction RMS definition.",
+                            ))
+                            .color(COLOR_TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let capture_label = if self.controller_analyzer.active {
+                                language.tr("暂停轨迹采集", "Pause recording")
+                            } else {
+                                language.tr("开始轨迹采集", "Start recording")
+                            };
+                            if ui
+                                .add_enabled(connected, primary_button(capture_label))
+                                .clicked()
+                            {
+                                self.controller_analyzer.active = !self.controller_analyzer.active;
+                            }
+                            if ui
+                                .add_enabled(
+                                    connected,
+                                    eframe::egui::Button::new(language.tr(
+                                        "采集松手中心",
+                                        "Capture released center",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.controller_analyzer.begin_center_capture();
+                            }
+                            if ui
+                                .button(language.tr("清空分析", "Reset analysis"))
+                                .clicked()
+                            {
+                                self.controller_analyzer.reset();
+                            }
+                            ui.label(if self.controller_analyzer.active {
+                                language.tr("● 正在采集", "● Recording")
+                            } else {
+                                language.tr("○ 已暂停", "○ Paused")
+                            });
+                        });
+                        if let Some(progress) = self.controller_analyzer.center_capture_progress() {
+                            ui.add(
+                                eframe::egui::ProgressBar::new(progress)
+                                    .desired_width(320.0)
+                                    .text(language.tr(
+                                        "保持双摇杆松手不动",
+                                        "Keep both sticks released",
+                                    )),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.columns(2, |columns| {
+                            stick_analysis_dial(
+                                &mut columns[0],
+                                language.tr("左摇杆", "Left stick"),
+                                input.lx,
+                                input.ly,
+                                &self.controller_analyzer.left,
+                            );
+                            stick_analysis_dial(
+                                &mut columns[1],
+                                language.tr("右摇杆", "Right stick"),
+                                input.rx,
+                                input.ry,
+                                &self.controller_analyzer.right,
+                            );
+                        });
+                        ui.columns(2, |columns| {
+                            stick_analysis_metrics(
+                                &mut columns[0],
+                                language,
+                                &self.controller_analyzer.left,
+                                self.controller_analyzer.left_center,
+                                self.controller_analyzer.left_assessment(),
+                            );
+                            stick_analysis_metrics(
+                                &mut columns[1],
+                                language,
+                                &self.controller_analyzer.right,
+                                self.controller_analyzer.right_center,
+                                self.controller_analyzer.right_assessment(),
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                        ui.collapsing(
+                            language.tr(
+                                "高级：写入手柄永久摇杆校准",
+                                "Advanced: permanent controller stick calibration",
+                            ),
+                            |ui| {
+                                let analysis_complete =
+                                    self.controller_analyzer.read_only_analysis_complete();
+                                notice(
+                                    ui,
+                                    NoticeTone::Warning,
+                                    language.tr("会修改手柄", "Writes to the controller"),
+                                    language.tr(
+                                        "此操作会把中心或范围参数永久写入已连接的 DualSense。开始校准时会自动停止声音、震动、灯效和扳机输出。请先完成上方只读分析；校准过程中保持 USB 和蓝牙供电，不要关闭程序。旧版 M61 固件不支持此通道。",
+                                        "This permanently writes center or range data to the connected DualSense. Audio, rumble, light and trigger outputs stop automatically before calibration. Run the read-only analyzer first; keep USB and Bluetooth powered and do not close the app during calibration. Older M61 firmware does not support this bridge.",
+                                    ),
+                                );
+                                if !analysis_complete {
+                                    notice(
+                                        ui,
+                                        NoticeTone::Info,
+                                        language.tr(
+                                            "先完成只读分析",
+                                            "Complete read-only analysis first",
+                                        ),
+                                        &match self.language {
+                                            Language::ZhCn => format!(
+                                                "请先采集松手中心，并让左右摇杆的方向覆盖都达到至少 {:.0}%。检测无需通过，只需取得足够样本。",
+                                                self.controller_analyzer.required_coverage_percent(),
+                                            ),
+                                            Language::En => format!(
+                                                "Capture released center and reach at least {:.0}% direction coverage on both sticks. The result need not pass; it only needs enough samples.",
+                                                self.controller_analyzer.required_coverage_percent(),
+                                            ),
+                                        },
+                                    );
+                                }
+                                ui.add_enabled_ui(analysis_complete, |ui| {
+                                    ui.checkbox(
+                                        &mut self.calibration_confirmed,
+                                        language.tr(
+                                            "我确认已了解风险，并只对确有漂移或范围异常的手柄执行",
+                                            "I understand the risk and will use this only for a controller with verified drift or range errors",
+                                        ),
+                                    );
+                                });
+                                ui.label(
+                                    eframe::egui::RichText::new(&self.calibration_status)
+                                        .color(if self.calibration_busy {
+                                            COLOR_ACCENT_HOVER
+                                        } else {
+                                            COLOR_TEXT_PRIMARY
+                                        }),
+                                );
+                                let ready = connected
+                                    && analysis_complete
+                                    && self.calibration_confirmed
+                                    && !self.calibration_busy;
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            ready && self.calibration_state == CalibrationUiState::Idle,
+                                            eframe::egui::Button::new(language.tr(
+                                                "1. 开始中心校准",
+                                                "1. Begin center calibration",
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        calibration_step = Some(device_test::CalibrationStep::CenterBegin);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            ready && self.calibration_state == CalibrationUiState::Center,
+                                            eframe::egui::Button::new(language.tr(
+                                                "2. 松手采样（可多次）",
+                                                "2. Sample released sticks (repeatable)",
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        calibration_step = Some(device_test::CalibrationStep::CenterSample);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            ready && self.calibration_state == CalibrationUiState::Center,
+                                            eframe::egui::Button::new(language.tr(
+                                                "3. 写入中心校准",
+                                                "3. Commit center calibration",
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        calibration_step = Some(device_test::CalibrationStep::CenterCommit);
+                                    }
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            ready && self.calibration_state == CalibrationUiState::Idle,
+                                            eframe::egui::Button::new(language.tr(
+                                                "1. 开始范围校准",
+                                                "1. Begin range calibration",
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        calibration_step = Some(device_test::CalibrationStep::RangeBegin);
+                                    }
+                                    ui.label(language.tr(
+                                        "开始后将两个摇杆贴外圈缓慢旋转 3–5 圈",
+                                        "After beginning, rotate both sticks along the rim 3–5 times",
+                                    ));
+                                    if ui
+                                        .add_enabled(
+                                            ready && self.calibration_state == CalibrationUiState::Range,
+                                            eframe::egui::Button::new(language.tr(
+                                                "2. 写入范围校准",
+                                                "2. Commit range calibration",
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        calibration_step = Some(device_test::CalibrationStep::RangeCommit);
+                                    }
+                                });
+                            },
+                        );
                     });
 
                     ui.add_space(12.0);
@@ -4268,7 +5690,10 @@ impl eframe::App for FlasherApp {
                         });
                     });
                     ui.horizontal(|ui| {
-                        if ui.add(primary_button(language.tr("应用输出测试", "Apply output test"))).clicked() {
+                        if ui.add_enabled(
+                            connected && !benchmark_running,
+                            primary_button(language.tr("应用输出测试", "Apply output test")),
+                        ).clicked() {
                             apply_output = true;
                         }
                         if ui.add(
@@ -4306,7 +5731,7 @@ impl eframe::App for FlasherApp {
                         let headphone_active = self.device_test_controller_tone
                             == Some(device_test::ControllerAudioTarget::Headphone);
                         if ui.add_enabled(
-                            connected,
+                            connected && !benchmark_running,
                             eframe::egui::Button::new(if speaker_active {
                                 language.tr("停止扬声器", "Stop speaker")
                             } else {
@@ -4320,7 +5745,7 @@ impl eframe::App for FlasherApp {
                             }
                         }
                         if ui.add_enabled(
-                            connected,
+                            connected && !benchmark_running,
                             eframe::egui::Button::new(if headphone_active {
                                 language.tr("停止耳机", "Stop headphone")
                             } else {
@@ -4334,7 +5759,9 @@ impl eframe::App for FlasherApp {
                             }
                         }
                         if ui.add_enabled(
-                            connected && self.device_test_controller_tone.is_some(),
+                            connected
+                                && !benchmark_running
+                                && self.device_test_controller_tone.is_some(),
                             eframe::egui::Button::new(language.tr("停止 1 kHz", "Stop 1 kHz")),
                         ).clicked() {
                             stop_controller_tone = true;
@@ -4371,14 +5798,93 @@ impl eframe::App for FlasherApp {
                             mic_test = true;
                         }
                     });
+                    if let Some(metrics) = &self.last_microphone_metrics {
+                        ui.add_space(8.0);
+                        notice(
+                            ui,
+                            if metrics.signal_detected {
+                                NoticeTone::Success
+                            } else {
+                                NoticeTone::Warning
+                            },
+                            language.tr("最近一次麦克风信号分析", "Latest microphone signal analysis"),
+                            &match self.language {
+                                Language::ZhCn => format!(
+                                    "RMS {:.2}% · 峰值 {:.2}% · 有效窗口 {} · {}{}",
+                                    metrics.rms_percent,
+                                    metrics.peak_percent,
+                                    metrics.active_windows,
+                                    if metrics.signal_detected { "检测到有效声音" } else { "信号不足" },
+                                    metrics.signal_to_silence_db.map(|value| format!(" · 信噪比 {:.1} dB", value)).unwrap_or_default(),
+                                ),
+                                Language::En => format!(
+                                    "RMS {:.2}% · peak {:.2}% · {} active windows · {}{}",
+                                    metrics.rms_percent,
+                                    metrics.peak_percent,
+                                    metrics.active_windows,
+                                    if metrics.signal_detected { "signal detected" } else { "insufficient signal" },
+                                    metrics.signal_to_silence_db.map(|value| format!(" · SNR {:.1} dB", value)).unwrap_or_default(),
+                                ),
+                            },
+                        );
+                    }
+                    });
+
+                    ui.add_space(12.0);
+                    surface_frame().show(ui, |ui| {
+                        ui.heading(language.tr("完整测试报告", "Complete test report"));
+                        ui.label(
+                            eframe::egui::RichText::new(language.tr(
+                                "将本页输入、摇杆与校准结果，连同设备调试页的引导测试、延迟、压力负载和 M61 快照集中导出为一个 JSON。未测试项目会明确标记。",
+                                "Export this page's input, stick and calibration results together with guided tests, latency, stress load and M61 snapshots from Device Debug as one JSON. Untested items are marked explicitly.",
+                            ))
+                            .color(COLOR_TEXT_MUTED),
+                        );
+                        let report_has_data = input.report_count > 0
+                            || self.controller_analyzer.left.samples() > 0
+                            || self.controller_analyzer.right.samples() > 0
+                            || !self.calibration_events.is_empty()
+                            || self.last_microphone_metrics.is_some()
+                            || self.device_debug_metrics.sample_count > 0
+                            || self.guided_test.phases.iter().any(|phase| {
+                                phase.result != guided_test::PhaseResult::Pending
+                            })
+                            || self
+                                .runtime_diagnostics
+                                .iter()
+                                .any(|report| report.snapshot.is_some());
+                        let report_waiting = self.loading_diagnostics
+                            || self.device_debug_final_snapshot_pending;
+                        if report_waiting {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(language.tr(
+                                    "正在完成运行快照，请稍候。",
+                                    "Finishing the runtime snapshot; please wait.",
+                                ));
+                            });
+                        }
+                        if ui
+                            .add_enabled(
+                                report_has_data && !report_waiting,
+                                primary_button(language.tr(
+                                    "导出完整测试报告 JSON",
+                                    "Export complete test report JSON",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            export_complete_report = true;
+                        }
                     });
                 });
             });
 
+            if export_complete_report {
+                self.export_debug_report();
+            }
             if reconnect {
-                self.device_test_connected = false;
-                self.device_test_controller_tone = None;
-                self.device_test_session = Some(device_test::TestSession::start());
+                self.ensure_device_session();
             }
             if apply_output {
                 if let Some(session) = &self.device_test_session {
@@ -4388,10 +5894,10 @@ impl eframe::App for FlasherApp {
                 }
             }
             if stop_output {
-                self.device_test_output = device_test::OutputState::default();
-                if let Some(session) = &self.device_test_session {
-                    let _ = session.stop_all();
+                if self.device_debug_started.is_some() {
+                    self.stop_debug_benchmark(false);
                 }
+                self.reset_test_outputs();
             }
             if let Some(target) = start_controller_tone {
                 if let Some(session) = &self.device_test_session {
@@ -4406,11 +5912,44 @@ impl eframe::App for FlasherApp {
                     }
                 }
             }
+            if let Some(step) = calibration_step {
+                if let Some(session) = &self.device_test_session {
+                    match session.calibrate(step) {
+                        Ok(()) => {
+                            if matches!(
+                                step,
+                                device_test::CalibrationStep::CenterBegin
+                                    | device_test::CalibrationStep::RangeBegin
+                            ) {
+                                self.controller_analysis_checkpoints.push(
+                                    ControllerAnalysisCheckpoint {
+                                        captured_at_unix_ms: diagnostics::now_unix_ms(),
+                                        stage: "beforeCalibration",
+                                        analysis: self.controller_analyzer.report(),
+                                    },
+                                );
+                            }
+                            self.calibration_busy = true;
+                            self.calibration_status = self
+                                .language
+                                .tr(
+                                    "正在等待手柄确认校准命令...",
+                                    "Waiting for the controller to acknowledge calibration...",
+                                )
+                                .to_owned();
+                        }
+                        Err(error) => {
+                            self.calibration_busy = false;
+                            self.calibration_status = format!("{error:#}");
+                        }
+                    }
+                }
+            }
             if let Some(channel) = tone {
                 self.start_audio_test(channel);
             }
             if mic_test {
-                self.start_microphone_test();
+                self.start_microphone_test(5);
             }
         }
 
@@ -4421,10 +5960,13 @@ impl eframe::App for FlasherApp {
             let mut capture_snapshot = false;
             let mut export_report = false;
             let mut guide_start = false;
+            let mut guide_cancel = false;
             let mut guide_signal = false;
             let mut guide_retest = false;
             let mut guide_result = None;
             let mut ota_switch = None;
+            let mut refresh_polling_rate = false;
+            let mut apply_polling_rate = None;
             let metrics = self.device_debug_metrics.clone();
             let running = self.device_debug_started.is_some();
             let extreme_duration_blocked = self.device_debug_stress_enabled
@@ -4496,6 +6038,10 @@ impl eframe::App for FlasherApp {
                             if ui
                                 .add_enabled(
                                     self.busy.is_none()
+                                        && !running
+                                        && !self.guided_test.active
+                                        && !self.device_test_audio_busy
+                                        && !self.loading_diagnostics
                                         && current != Some(BuildProfile::Diagnostic)
                                         && self.latest_release_for_profile(BuildProfile::Diagnostic).is_some(),
                                     primary_button(language.tr(
@@ -4510,6 +6056,10 @@ impl eframe::App for FlasherApp {
                             if ui
                                 .add_enabled(
                                     self.busy.is_none()
+                                        && !running
+                                        && !self.guided_test.active
+                                        && !self.device_test_audio_busy
+                                        && !self.loading_diagnostics
                                         && current == Some(BuildProfile::Diagnostic)
                                         && self.latest_release_for_profile(BuildProfile::Standard).is_some(),
                                     eframe::egui::Button::new(language.tr(
@@ -4540,6 +6090,103 @@ impl eframe::App for FlasherApp {
 
                     surface_frame().show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            ui.heading(language.tr("USB 轮询性能", "USB polling performance"));
+                            ui.with_layout(
+                                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                                |ui| {
+                                    if self.loading_polling_rate || self.applying_polling_rate {
+                                        ui.spinner();
+                                    }
+                                    ui.monospace(
+                                        self.device_polling_rate
+                                            .map(device_config::PollingRate::label)
+                                            .unwrap_or(language.tr("未读取", "Not read")),
+                                    );
+                                },
+                            );
+                        });
+                        ui.label(
+                            eframe::egui::RichText::new(language.tr(
+                                "常用版首次启动默认使用实时档（约 750 Hz）。修改后工具会保留其余设备配置并重启 M61，让 Windows 重新读取 USB 端点间隔。",
+                                "A fresh Standard profile defaults to Realtime (~750 Hz). Applying a change preserves all other settings and restarts M61 so Windows reloads the USB endpoint interval.",
+                            ))
+                            .color(COLOR_TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(language.tr("目标档位", "Target mode"));
+                            eframe::egui::ComboBox::from_id_salt("device_polling_rate")
+                                .selected_text(self.selected_polling_rate.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in device_config::PollingRate::ALL {
+                                        ui.selectable_value(
+                                            &mut self.selected_polling_rate,
+                                            mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+                            if ui
+                                .add_enabled(
+                                    self.device_polling_rate.is_some()
+                                        && self.device_polling_rate
+                                            != Some(self.selected_polling_rate)
+                                        && !self.loading_polling_rate
+                                        && !self.applying_polling_rate
+                                        && self.busy.is_none()
+                                        && !running
+                                        && !self.guided_test.active
+                                        && !self.device_test_audio_busy,
+                                    primary_button(language.tr(
+                                        "应用并重启",
+                                        "Apply and restart",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                apply_polling_rate = Some(self.selected_polling_rate);
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.loading_polling_rate && !self.applying_polling_rate,
+                                    eframe::egui::Button::new(language.tr(
+                                        "重新读取",
+                                        "Read again",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                refresh_polling_rate = true;
+                            }
+                        });
+                        if let Some(error) = &self.polling_rate_error {
+                            ui.add_space(8.0);
+                            notice(
+                                ui,
+                                NoticeTone::Warning,
+                                language.tr("无法读取轮询档位", "Polling mode unavailable"),
+                                error,
+                            );
+                        } else if self.device_polling_rate
+                            == Some(device_config::PollingRate::Realtime)
+                        {
+                            ui.add_space(8.0);
+                            notice(
+                                ui,
+                                NoticeTone::Success,
+                                language.tr("实时档已启用", "Realtime mode enabled"),
+                                language.tr(
+                                    "USB 以 0.5 ms 服务间隔请求报告；实际输入上限仍受蓝牙报告到达速率影响，通常约 750 Hz。",
+                                    "USB requests reports at a 0.5 ms service interval; actual input remains limited by Bluetooth report arrival, typically around 750 Hz.",
+                                ),
+                            );
+                        }
+                    });
+
+                    ui.add_space(12.0);
+
+                    surface_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
                             ui.heading(language.tr("引导式设备诊断", "Guided device diagnostics"));
                             ui.with_layout(
                                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
@@ -4560,10 +6207,46 @@ impl eframe::App for FlasherApp {
                             .color(COLOR_TEXT_MUTED),
                         );
                         if !self.guided_test.active {
+                            let completed = self
+                                .guided_test
+                                .phases
+                                .iter()
+                                .filter(|phase| phase.result != guided_test::PhaseResult::Pending)
+                                .count();
+                            if completed > 0 {
+                                let failed = self.guided_test.phases.iter().filter(|phase| {
+                                    phase.result == guided_test::PhaseResult::NotEffective
+                                }).count();
+                                notice(
+                                    ui,
+                                    if failed == 0 && completed == self.guided_test.phases.len() {
+                                        NoticeTone::Success
+                                    } else {
+                                        NoticeTone::Warning
+                                    },
+                                    language.tr("上次引导测试", "Previous guided test"),
+                                    &match self.language {
+                                        Language::ZhCn => format!(
+                                            "已记录 {completed}/{} 项，其中 {failed} 项未生效；可直接导出报告或重新开始。",
+                                            self.guided_test.phases.len()
+                                        ),
+                                        Language::En => format!(
+                                            "Recorded {completed}/{} phases with {failed} not effective; export the report or restart.",
+                                            self.guided_test.phases.len()
+                                        ),
+                                    },
+                                );
+                            }
                             if ui
                                 .add_enabled(
-                                    self.device_test_connected,
-                                    primary_button(language.tr("开始引导测试", "Start guided test")),
+                                    self.device_test_connected
+                                        && !running
+                                        && !self.loading_diagnostics,
+                                    primary_button(if completed > 0 {
+                                        language.tr("重新开始引导测试", "Restart guided test")
+                                    } else {
+                                        language.tr("开始引导测试", "Start guided test")
+                                    }),
                                 )
                                 .clicked()
                             {
@@ -4589,31 +6272,85 @@ impl eframe::App for FlasherApp {
                                 phase.id,
                                 "leds" | "rumble" | "triggers_output" | "sound" | "microphone" | "summary"
                             );
+                            let signal_label = match phase.id {
+                                "microphone" => language.tr(
+                                    "开始录音：20 秒说话 + 5 秒静音",
+                                    "Record: 20 s voice + 5 s silence",
+                                ),
+                                "summary" => language.tr(
+                                    "停止全部输出并采集快照",
+                                    "Reset outputs and capture snapshot",
+                                ),
+                                _ => language.tr(
+                                    "生成当前测试信号",
+                                    "Generate current test signal",
+                                ),
+                            };
                             if output_phase
                                 && ui
-                                    .add(primary_button(language.tr("生成当前测试信号", "Generate current test signal")))
+                                    .add_enabled(
+                                        self.device_test_connected
+                                            && !self.device_test_audio_busy,
+                                        primary_button(signal_label),
+                                    )
                                     .clicked()
                             {
                                 guide_signal = true;
                             }
+                            ui.label(language.tr(
+                                "备注（可选；未生效时建议填写）",
+                                "Note (optional; recommended when not effective)",
+                            ));
+                            ui.text_edit_singleline(&mut self.guided_test.phase_mut().note);
+                            let phase_busy = self.guided_test.phase().id == "microphone"
+                                && self.device_test_audio_busy;
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button(language.tr("通过并下一项", "Pass and next")).clicked() {
+                                if ui.add_enabled(
+                                    self.device_test_connected && !phase_busy,
+                                    eframe::egui::Button::new(language.tr(
+                                        "通过并下一项",
+                                        "Pass and next",
+                                    )),
+                                ).clicked() {
                                     guide_result = Some(guided_test::PhaseResult::Pass);
                                 }
-                                if ui.button(language.tr("未生效", "Not effective")).clicked() {
+                                if ui.add_enabled(
+                                    !phase_busy,
+                                    eframe::egui::Button::new(language.tr(
+                                        "未生效并下一项",
+                                        "Not effective and next",
+                                    )),
+                                ).clicked() {
                                     guide_result = Some(guided_test::PhaseResult::NotEffective);
                                 }
-                                if ui.button(language.tr("跳过", "Skip")).clicked() {
+                                if ui.add_enabled(
+                                    !phase_busy,
+                                    eframe::egui::Button::new(language.tr("跳过", "Skip")),
+                                ).clicked() {
                                     guide_result = Some(guided_test::PhaseResult::Skipped);
                                 }
-                                if ui.button(language.tr("重新测试本项", "Retest phase")).clicked() {
+                                if ui.add_enabled(
+                                    !phase_busy,
+                                    eframe::egui::Button::new(language.tr(
+                                        "重新测试本项",
+                                        "Retest phase",
+                                    )),
+                                ).clicked() {
                                     guide_retest = true;
                                 }
+                                if ui
+                                    .add_enabled(
+                                        !phase_busy,
+                                        eframe::egui::Button::new(language.tr(
+                                            "结束引导",
+                                            "End guide",
+                                        )),
+                                    )
+                                    .clicked()
+                                {
+                                    guide_cancel = true;
+                                }
                             });
-                            if self.guided_test.phase().result == guided_test::PhaseResult::NotEffective {
-                                ui.label(language.tr("失败备注（可选）", "Failure note (optional)"));
-                                ui.text_edit_singleline(&mut self.guided_test.phase_mut().note);
-                            }
                         }
                     });
 
@@ -4640,7 +6377,12 @@ impl eframe::App for FlasherApp {
                             if !running {
                                 if ui
                                     .add_enabled(
-                                        self.device_test_connected && !extreme_duration_blocked,
+                                        self.device_test_connected
+                                            && !extreme_duration_blocked
+                                            && !self.guided_test.active
+                                            && !self.device_test_audio_busy
+                                            && !self.loading_diagnostics
+                                            && self.device_test_controller_tone.is_none(),
                                         primary_button(language.tr("开始压力测试", "Start stress test")),
                                     )
                                     .clicked()
@@ -4780,8 +6522,8 @@ impl eframe::App for FlasherApp {
                                 NoticeTone::Info,
                                 language.tr("等待有效样本", "Waiting for samples"),
                                 language.tr(
-                                    "连接设备后启动自动压力测试，建议至少运行 15 分钟。",
-                                    "Connect the device and start the automated stress test; at least 15 minutes is recommended.",
+                                    "连接设备后启动自动压力测试，并完整运行所选时长；默认 5 分钟适合快速自检。",
+                                    "Connect the device, start the automated stress test, and run the selected duration; the default 5 minutes is suitable for a quick check.",
                                 ),
                             )
                         } else if severe {
@@ -4798,8 +6540,8 @@ impl eframe::App for FlasherApp {
                                 NoticeTone::Warning,
                                 language.tr("存在调度抖动", "Scheduling jitter detected"),
                                 language.tr(
-                                    "平均吞吐正常，但尾部间隔、抖动或空闲堆变化偏高。建议运行 30 至 60 分钟压力测试并检查周期快照。",
-                                    "Average throughput is normal, but tail intervals, jitter, or free-heap change is elevated. Run a 30- to 60-minute stress test and inspect periodic snapshots.",
+                                    "平均吞吐正常，但尾部间隔、抖动或空闲堆变化偏高。建议先排除 USB/蓝牙干扰并重复一次 5 分钟测试；需要长期稳定性验证时再选择更长时长。",
+                                    "Average throughput is normal, but tail intervals, jitter, or free-heap change is elevated. First remove USB/Bluetooth interference and repeat the 5-minute test; use a longer duration only for extended stability validation.",
                                 ),
                             )
                         } else {
@@ -5098,12 +6840,37 @@ impl eframe::App for FlasherApp {
                         });
 
                         ui.add_space(12.0);
+                        let has_guided_results = self.guided_test.phases.iter().any(|phase| {
+                            phase.result != guided_test::PhaseResult::Pending
+                        });
+                        let has_runtime_snapshot = self
+                            .runtime_diagnostics
+                            .iter()
+                            .any(|report| report.snapshot.is_some());
+                        let report_has_data = metrics.sample_count > 0
+                            || has_guided_results
+                            || has_runtime_snapshot
+                            || self.controller_analyzer.left.samples() > 0
+                            || self.controller_analyzer.right.samples() > 0
+                            || !self.calibration_events.is_empty()
+                            || self.last_microphone_metrics.is_some();
+                        let report_waiting = self.loading_diagnostics
+                            || self.device_debug_final_snapshot_pending;
+                        if report_waiting {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(language.tr(
+                                    "正在完成运行快照，完成后即可导出完整报告。",
+                                    "Finishing the runtime snapshot; the complete report can be exported afterwards.",
+                                ));
+                            });
+                        }
                         if ui
                             .add_enabled(
-                                metrics.sample_count > 0,
+                                report_has_data && !report_waiting,
                                 primary_button(language.tr(
-                                    "导出性能 JSON",
-                                    "Export performance JSON",
+                                    "导出完整测试报告 JSON",
+                                    "Export complete test report JSON",
                                 )),
                             )
                             .clicked()
@@ -5117,7 +6884,7 @@ impl eframe::App for FlasherApp {
                 self.start_debug_benchmark();
             }
             if stop_benchmark {
-                self.stop_debug_benchmark(true);
+                self.stop_debug_benchmark(false);
             }
             if capture_snapshot {
                 self.capture_debug_snapshot();
@@ -5128,65 +6895,53 @@ impl eframe::App for FlasherApp {
             if let Some(profile) = ota_switch {
                 self.start_profile_ota(profile);
             }
+            if refresh_polling_rate {
+                self.refresh_polling_rate();
+            }
+            if let Some(mode) = apply_polling_rate {
+                self.reset_test_outputs();
+                self.apply_polling_rate(mode);
+            }
             if guide_start {
                 self.ensure_device_session();
+                self.reset_test_outputs();
                 self.guided_test.start();
                 self.capture_debug_snapshot();
             }
+            if guide_cancel {
+                self.reset_test_outputs();
+                self.guided_test.active = false;
+                self.guided_test.require_input_resync();
+                self.device_test_status = self
+                    .language
+                    .tr(
+                        "引导测试已结束，已保留当前结果。",
+                        "The guided test ended; current results were preserved.",
+                    )
+                    .to_owned();
+            }
             if guide_retest {
+                self.reset_test_outputs();
                 self.guided_test.retest();
             }
             if guide_signal {
-                let phase_id = self.guided_test.phase().id;
-                match phase_id {
-                    "leds" => {
-                        let mut output = device_test::OutputState::default();
-                        output.lightbar_enabled = true;
-                        output.lightbar_rgb = [0, 96, 220];
-                        output.player_leds = 0x15;
-                        output.mute_led = 1;
-                        if let Some(session) = &self.device_test_session {
-                            let _ = session.set_output(output);
-                        }
-                    }
-                    "rumble" => {
-                        let mut output = device_test::OutputState::default();
-                        output.rumble_left = 89;
-                        output.rumble_right = 89;
-                        if let Some(session) = &self.device_test_session {
-                            let _ = session.set_output(output);
-                        }
-                    }
-                    "triggers_output" => {
-                        let mut output = device_test::OutputState::default();
-                        output.left_trigger = device_test::TriggerPreset::Resistance;
-                        output.right_trigger = device_test::TriggerPreset::Resistance;
-                        if let Some(session) = &self.device_test_session {
-                            let _ = session.set_output(output);
-                        }
-                    }
-                    "sound" => {
-                        if let Some(session) = &self.device_test_session {
-                            let _ = session
-                                .start_controller_tone(device_test::ControllerAudioTarget::Speaker);
-                        }
-                    }
-                    "microphone" => self.start_microphone_test(),
-                    "summary" => {
-                        if let Some(session) = &self.device_test_session {
-                            let _ = session.stop_all();
-                        }
-                        self.capture_debug_snapshot();
-                    }
-                    _ => {}
-                }
+                self.generate_guided_test_signal();
             }
             if let Some(result) = guide_result {
-                if result == guided_test::PhaseResult::NotEffective {
-                    self.guided_test.phase_mut().result = result;
+                let phase_id = self.guided_test.phase().id;
+                self.reset_test_outputs();
+                self.guided_test.mark_and_next(result);
+                if result == guided_test::PhaseResult::NotEffective || phase_id == "summary" {
                     self.capture_debug_snapshot();
-                } else {
-                    self.guided_test.mark_and_next(result);
+                }
+                if !self.guided_test.active {
+                    self.device_test_status = self
+                        .language
+                        .tr(
+                            "引导测试已完成，可导出完整测试报告 JSON。",
+                            "Guided diagnostics completed; the complete test report JSON can now be exported.",
+                        )
+                        .to_owned();
                 }
             }
         }
@@ -5764,6 +7519,97 @@ mod tests {
             gui_release_label(&releases[0], Language::ZhCn),
             gui_release_label(&releases[1], Language::ZhCn)
         );
+    }
+
+    #[test]
+    fn debug_report_requires_complete_guidance_benchmark_and_runtime_snapshots() {
+        let mut guided = guided_test::GuidedTest::default();
+        for phase in &mut guided.phases {
+            phase.result = guided_test::PhaseResult::Pass;
+        }
+        let pass = assess_debug_report(
+            &guided.phases,
+            false,
+            false,
+            true,
+            5_000,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(pass.result, "pass");
+        assert!(pass.reasons.is_empty());
+
+        guided.phases[0].result = guided_test::PhaseResult::Skipped;
+        let warning = assess_debug_report(
+            &guided.phases,
+            false,
+            true,
+            false,
+            5_000,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(warning.result, "warning");
+        assert!(warning.reasons.contains(&"guided_phase_skipped"));
+        assert!(warning.reasons.contains(&"benchmark_still_running"));
+        assert!(warning.reasons.contains(&"runtime_snapshot_unavailable"));
+        assert!(warning.reasons.contains(&"runtime_diagnostic_error"));
+
+        guided.phases[1].result = guided_test::PhaseResult::NotEffective;
+        let fail = assess_debug_report(
+            &guided.phases,
+            false,
+            false,
+            true,
+            5_000,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(fail.result, "fail");
+        assert!(fail.reasons.contains(&"guided_phase_not_effective"));
+    }
+
+    #[test]
+    fn unified_report_chinese_summary_marks_missing_tests_explicitly() {
+        let guided = guided_test::GuidedTest::default();
+        let stick_analysis = controller_analyzer::ControllerAnalyzer::default().report();
+        let summary = build_unified_report_summary_zh_cn(
+            "warning",
+            &["guided_test_incomplete", "hid_metrics_missing"],
+            &guided.phases,
+            &stick_analysis,
+            &device_test::DebugMetrics::default(),
+            false,
+            false,
+            &[],
+            false,
+            None,
+        );
+        assert_eq!(summary.overall_result, "警告");
+        assert!(
+            summary
+                .untested_items
+                .contains(&"引导式手柄功能测试".to_owned())
+        );
+        assert!(
+            summary
+                .untested_items
+                .contains(&"双摇杆质量分析".to_owned())
+        );
+        assert!(
+            summary
+                .recommendations
+                .contains(&"完成一次完整的设备性能压力测试".to_owned())
+        );
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"overallResult\":\"警告\""));
+        assert!(json.contains("\"keyMetrics\""));
     }
 
     #[test]

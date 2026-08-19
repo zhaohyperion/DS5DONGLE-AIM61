@@ -105,9 +105,15 @@ static uint8_t  opus_slots[2][OPUS_OUT_SIZE];
 static int8_t   haptic_slots[2][HAPTIC_BUF_SIZE];
 
 /* Pre-computed polyphase sinc filter: [phase][tap] */
-static float sinc_coeff[RESAMP_PHASES][SINC_TAPS];
-static uint16_t sinc_center[OPUS_FRAME_SAMPLES];
-static uint8_t sinc_phase[OPUS_FRAME_SAMPLES];
+/* Coefficients are prepared with float once at boot, then consumed as Q15 in
+ * the realtime path.  Keeping the table in integer form avoids 7,680 software
+ * floating-point MACs for every stereo 512 -> 480 conversion. */
+/* The writable lookup tables are rebuilt once at boot and then read on every
+ * sample.  Keep them in DTCM: together they occupy only 1,680 bytes, while
+ * placing them in pSRAM would add avoidable bus/cache jitter to the hot path. */
+static ATTR_DTCM_SECTION int16_t sinc_coeff_q15[RESAMP_PHASES][SINC_TAPS];
+static ATTR_DTCM_SECTION uint16_t sinc_center[OPUS_FRAME_SAMPLES];
+static ATTR_DTCM_SECTION uint8_t sinc_phase[OPUS_FRAME_SAMPLES];
 
 static void audio_timing_record(audio_timing_accum_t *timing,
                                 uint32_t elapsed_us)
@@ -151,6 +157,7 @@ static void resamp_sinc_init(void)
 
     for (int p = 0; p < RESAMP_PHASES; p++) {
         float frac = (float)p / (float)RESAMP_PHASES;
+        float coeff_float[SINC_TAPS];
         float sum = 0.0f;
 
         for (int t = 0; t < SINC_TAPS; t++) {
@@ -168,14 +175,46 @@ static void resamp_sinc_init(void)
             float wn = ((float)t + 0.5f) / (float)SINC_TAPS;
             float w = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * wn));
 
-            sinc_coeff[p][t] = s * w;
-            sum += sinc_coeff[p][t];
+            coeff_float[t] = s * w;
+            sum += coeff_float[t];
         }
 
         if (fabsf(sum) > 1e-6f) {
             for (int t = 0; t < SINC_TAPS; t++)
-                sinc_coeff[p][t] /= sum;
+                coeff_float[t] /= sum;
         }
+
+        /* Quantise only after normalisation.  Apply the small rounding
+         * residual to the largest-magnitude coefficient so the DC gain stays
+         * as close as possible to unity without perturbing every tap. */
+        int32_t q15_sum = 0;
+        int largest = 0;
+        float largest_abs = 0.0f;
+        for (int t = 0; t < SINC_TAPS; t++) {
+            float scaled = coeff_float[t] * 32768.0f;
+            int32_t quantised = (int32_t)(scaled +
+                (scaled >= 0.0f ? 0.5f : -0.5f));
+            if (quantised > INT16_MAX)
+                quantised = INT16_MAX;
+            if (quantised < INT16_MIN)
+                quantised = INT16_MIN;
+            sinc_coeff_q15[p][t] = (int16_t)quantised;
+            q15_sum += quantised;
+
+            float magnitude = fabsf(coeff_float[t]);
+            if (magnitude > largest_abs) {
+                largest_abs = magnitude;
+                largest = t;
+            }
+        }
+
+        int32_t corrected = (int32_t)sinc_coeff_q15[p][largest] +
+                            (32768 - q15_sum);
+        if (corrected > INT16_MAX)
+            corrected = INT16_MAX;
+        if (corrected < INT16_MIN)
+            corrected = INT16_MIN;
+        sinc_coeff_q15[p][largest] = (int16_t)corrected;
     }
 
     /* Fixed 16:15 geometry: remove one hardware DIV/REM pair from every
@@ -187,25 +226,30 @@ static void resamp_sinc_init(void)
     }
 }
 
-/* ---- Polyphase sinc resample 512 → 480 (stereo int16) ---- */
+/* ---- Polyphase sinc resample 512 → 480 (stereo int16, Q15) ---- */
 ATTR_TCM_SECTION
 static __attribute__((noinline)) void resample_512_480(
     const int16_t *in, int16_t *out)
 {
     for (int i = 0; i < OPUS_FRAME_SAMPLES; i++) {
         int center = sinc_center[i];
-        const float *c = sinc_coeff[sinc_phase[i]];
+        const int16_t *c = sinc_coeff_q15[sinc_phase[i]];
         const int16_t *s = &in[(center - SINC_LEFT_PAD) * 2];
-        float sum_l = 0.0f, sum_r = 0.0f;
+        int32_t sum_l = 0, sum_r = 0;
 
 #pragma GCC unroll 8
         for (int t = 0; t < SINC_TAPS; t++) {
-            sum_l += (float)s[t * 2]     * c[t];
-            sum_r += (float)s[t * 2 + 1] * c[t];
+            sum_l += (int32_t)s[t * 2]     * c[t];
+            sum_r += (int32_t)s[t * 2 + 1] * c[t];
         }
 
-        int32_t l = (int32_t)(sum_l + (sum_l >= 0 ? 0.5f : -0.5f));
-        int32_t r = (int32_t)(sum_r + (sum_r >= 0 ? 0.5f : -0.5f));
+        /* Symmetric rounding before the arithmetic shift keeps negative and
+         * positive samples balanced around zero. */
+        /* Arithmetic right shift rounds negative values toward -infinity.
+         * Adding 0.5 LSB and subtracting one only for negative accumulators
+         * implements symmetric nearest rounding without a one-count DC bias. */
+        int32_t l = (sum_l + 16384 - (sum_l < 0)) >> 15;
+        int32_t r = (sum_r + 16384 - (sum_r < 0)) >> 15;
         if (l > 32767) l = 32767; if (l < -32768) l = -32768;
         if (r > 32767) r = 32767; if (r < -32768) r = -32768;
 
@@ -223,11 +267,18 @@ static void decimate_haptics(const int16_t *in, int8_t *out, uint32_t in_samples
     if (out_pairs > HAPTIC_BUF_SIZE / 2)
         out_pairs = HAPTIC_BUF_SIZE / 2;
 
-    /* haptics_gain [1.0,2.0] → fixed-point 8.8: 256..512 */
+    /* haptics_gain [1.0,2.0] → fixed-point 8.8: 256..512.  Configuration
+     * changes are rare, so avoid repeating the float conversion per block. */
+    static float cached_gain_f = -1.0f;
+    static int32_t cached_gain_fp = 256;
     float gain_f = config_get()->haptics_gain;
-    if (gain_f < 1.0f) gain_f = 1.0f;
-    if (gain_f > 2.0f) gain_f = 2.0f;
-    int32_t gain_fp = (int32_t)(gain_f * 256.0f);
+    if (gain_f != cached_gain_f) {
+        cached_gain_f = gain_f;
+        if (gain_f < 1.0f) gain_f = 1.0f;
+        if (gain_f > 2.0f) gain_f = 2.0f;
+        cached_gain_fp = (int32_t)(gain_f * 256.0f);
+    }
+    int32_t gain_fp = cached_gain_fp;
 
     for (uint32_t i = 0; i < out_pairs; i++) {
         uint32_t idx = (i * HAPTIC_DECIMATE) * 2;
@@ -846,7 +897,10 @@ void audio_mic_task(void *arg)
     (void)arg;
     static uint8_t  mic_opus_buf[MIC_OPUS_SIZE];
     static int16_t  mic_mono[OPUS_FRAME_SAMPLES];
-    static int16_t  mic_stereo[OPUS_FRAME_SAMPLES * 2];
+    static union {
+        uint32_t packed[OPUS_FRAME_SAMPLES];
+        int16_t stereo[OPUS_FRAME_SAMPLES * 2];
+    } mic_output;
 
     for (;;) {
         service_decoder_reset_task();
@@ -880,10 +934,14 @@ void audio_mic_task(void *arg)
             LOG_INF("[AUDIO] First mic frame decoded (%d samples)\n", decoded);
         }
 
+        /* One aligned word store duplicates the mono sample into L/R.  The
+         * union keeps the packed write defined for the GNU C target while
+         * preserving the int16 API expected by the USB audio ring. */
         for (int i = 0; i < decoded; i++) {
-            mic_stereo[i * 2]     = mic_mono[i];
-            mic_stereo[i * 2 + 1] = mic_mono[i];
+            uint16_t sample = (uint16_t)mic_mono[i];
+            mic_output.packed[i] = (uint32_t)sample |
+                                   ((uint32_t)sample << 16);
         }
-        usb_audio_mic_write(mic_stereo, (uint32_t)decoded);
+        usb_audio_mic_write(mic_output.stereo, (uint32_t)decoded);
     }
 }

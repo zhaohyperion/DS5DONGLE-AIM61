@@ -2288,6 +2288,30 @@ int8_t bt_hid_host_get_cached_rssi(void)
     return cached_rssi;
 }
 
+void bt_hid_host_radio_idle(void)
+{
+    int connectable = bt_br_set_connectable(false);
+    int discoverable = bt_br_set_discoverable(false);
+    if (connectable || discoverable) {
+        LOG_WRN("[BT] Radio idle request incomplete: conn=%d disc=%d\n",
+                connectable, discoverable);
+    } else {
+        LOG_INF("[BT] Radio idle: page/inquiry scans disabled\n");
+    }
+}
+
+void bt_hid_host_radio_wake(void)
+{
+    int connectable = bt_br_set_connectable(true);
+    int discoverable = bt_br_set_discoverable(true);
+    if (connectable || discoverable) {
+        LOG_WRN("[BT] Radio wake request incomplete: conn=%d disc=%d\n",
+                connectable, discoverable);
+    } else {
+        LOG_INF("[BT] Radio wake: page/inquiry scans enabled\n");
+    }
+}
+
 int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
 {
     if (!hid_ctx.intr_connected || !hid_ctx.conn)
@@ -2742,6 +2766,20 @@ bool bt_hid_host_get_cached_feature(uint8_t report_id,
         }
     }
     return false;
+}
+
+void bt_hid_host_invalidate_cached_feature(uint8_t report_id)
+{
+    for (int i = 0; i < FEATURE_CACHE_SLOTS; i++) {
+        if (feature_cache[i].report_id == report_id) {
+            /* Publish invalid length first so the USB ISR cannot consume a
+             * response from before the state-changing command. */
+            feature_cache[i].len = 0;
+            feature_cache_barrier();
+            feature_cache[i].report_id = 0;
+            feature_cache_barrier();
+        }
+    }
 }
 
 bool bt_hid_host_is_dse(void)

@@ -34,6 +34,7 @@ static volatile uint32_t state_entered_us = 0;
 static uint8_t           key_attempts     = 0;
 static volatile uint32_t suspend_at_us    = 0;
 static volatile bool     poweroff_sent    = false;
+static volatile bool     radio_wake_pending = false;
 
 /*
  * Last-seen DualSense button bytes (USB payload offsets 7/8/9).
@@ -92,6 +93,7 @@ void usb_wake_init(void)
     host_resumed = false;
     suspend_at_us = 0;
     poweroff_sent = false;
+    radio_wake_pending = false;
 }
 
 void usb_wake_on_suspend(void)
@@ -112,16 +114,22 @@ void usb_wake_on_suspend(void)
 
 void usb_wake_on_resume(void)
 {
+    if (poweroff_sent)
+        radio_wake_pending = true;
     host_suspended = false;
     host_resumed = true;
     suspend_at_us = 0;
+    poweroff_sent = false;
 }
 
 void usb_wake_on_configured(void)
 {
+    if (poweroff_sent)
+        radio_wake_pending = true;
     host_suspended = false;
     host_resumed = true;
     suspend_at_us = 0;
+    poweroff_sent = false;
 }
 
 /* ---- Public API called from FreeRTOS task context ---- */
@@ -147,6 +155,18 @@ void usb_wake_on_bt_disconnect(void)
 bool usb_wake_host_suspended(void)
 {
     return host_suspended;
+}
+
+bool usb_wake_take_radio_wake_request(void)
+{
+    bool pending = false;
+    taskENTER_CRITICAL();
+    if (radio_wake_pending && !host_suspended) {
+        radio_wake_pending = false;
+        pending = true;
+    }
+    taskEXIT_CRITICAL();
+    return pending;
 }
 
 void usb_wake_on_bt_input(const uint8_t *payload, uint16_t len)
@@ -213,7 +233,16 @@ void usb_wake_task(void)
         taskEXIT_CRITICAL();
         if (claimed) {
             bt_power_off_controller();
-            LOG_INF("[WAKE] Suspend debounce elapsed -> controller power off\n");
+            bt_hid_host_radio_idle();
+
+            /* Resume can preempt between claiming this suspend generation and
+             * silencing the radio.  Re-publish the wake request afterwards so
+             * the final hardware state always follows the newest USB state. */
+            taskENTER_CRITICAL();
+            if (!host_suspended || suspend_at_us != suspended_at)
+                radio_wake_pending = true;
+            taskEXIT_CRITICAL();
+            LOG_INF("[WAKE] Suspend debounce elapsed -> controller power off + radio idle\n");
         }
     }
 

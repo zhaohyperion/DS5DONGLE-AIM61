@@ -480,7 +480,19 @@ fn wait_status(
 ) -> Result<Status> {
     let deadline = Instant::now() + timeout;
     loop {
-        let status = read_status(device)?;
+        let status = match read_status(device) {
+            Ok(status) => status,
+            Err(_) if Instant::now() < deadline => {
+                // Windows can transiently reject a Feature Report while the
+                // firmware is erasing/writing flash. Keep polling inside the
+                // caller's bounded timeout instead of aborting a valid OTA.
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(error) => {
+                return Err(error).context("timed out while polling OTA device status");
+            }
+        };
         if status.opcode == CTRL_ERROR || status.state == STATE_ERROR || status.error != 0 {
             bail!(
                 "device rejected OTA command: error={}, state={}, accepted={}, committed={}",

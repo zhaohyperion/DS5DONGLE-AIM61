@@ -640,6 +640,7 @@ static struct usbd_endpoint  kbd_ep_in;
 static volatile bool usb_configured = false;
 static volatile bool usb_suspended = false;
 static volatile bool usb_was_configured_before_suspend = false;
+static volatile bool usb_soft_connected = true;
 static volatile bool ep_in_busy = false;
 static volatile bool kbd_ep_busy = false;
 static volatile uint64_t kbd_ep_busy_since_us = 0;
@@ -1095,6 +1096,8 @@ void usb_gamepad_process_deferred(void)
            xQueueReceive(set_report_queue, &entry, 0) == pdTRUE) {
         LOG_INF("[USB] Deferred SET_REPORT(0x%02x) → BT, %u bytes%s\n",
                entry.report_id, entry.len, entry.is_dse ? " (DSE)" : "");
+        if (entry.report_id == 0x82)
+            bt_hid_host_invalidate_cached_feature(0x83);
         int err = bt_hid_host_set_feature_crc(entry.report_id,
                                                entry.data, entry.len);
         if (err == 0 && entry.is_dse)
@@ -1796,26 +1799,33 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         return;
     }
 
-    /* DSE profile writes (0x60-0x62) and unlock (0x80) — forward + notify */
+    /* DSE profile writes plus the narrowly validated DS5 stick-calibration
+     * protocol. Other controller feature commands remain blocked. */
+    bool valid_stick_calibration =
+        report_id == 0x82 && payload_len == 9 &&
+        payload[1] == 1 && (payload[2] == 1 || payload[2] == 2) &&
+        (payload[0] == 1 || payload[0] == 2 ||
+         (payload[0] == 3 && payload[2] == 1));
     if (report_type == 0x03 && payload_len > 0 &&
         (report_id == 0x60 || report_id == 0x61 ||
-         report_id == 0x62 || report_id == 0x80)) {
+         report_id == 0x62 || report_id == 0x80 ||
+         valid_stick_calibration)) {
         set_report_entry_t entry;
         entry.report_id = report_id;
-        entry.is_dse    = report_id != 0x80;
+        entry.is_dse    = report_id >= 0x60 && report_id <= 0x62;
         entry.len = (payload_len <= SET_REPORT_MAX_DATA)
                         ? payload_len : SET_REPORT_MAX_DATA;
         memcpy(entry.data, payload, entry.len);
         BaseType_t ok = xQueueSendFromISR(set_report_queue, &entry, NULL);
-        LOG_ISR("[USB-ISR] SET_REPORT(DSE 0x%02x) queued=%d len=%lu\n",
+        LOG_ISR("[USB-ISR] SET_REPORT(Feature 0x%02x) queued=%d len=%lu\n",
                report_id, (int)(ok == pdTRUE), (unsigned long)payload_len);
         (void)ok;
         return;
     }
 
-    /* DS5Dongle only forwards DSE profile reports (0x60-0x62, 0x80) to BT.
-     * All other Feature SET_REPORTs (0x08, 0x09 etc.) are dropped — forwarding
-     * 0x08 (BT control) would cause the controller to power-off or re-pair. */
+    /* Only DSE reports and strictly shaped 0x82 calibration requests are
+     * forwarded.  All other Feature SET_REPORTs (0x08, 0x09 etc.) are dropped;
+     * forwarding 0x08 could power off or re-pair the controller. */
     if (report_type == 0x03 && !is_dongle_cmd(report_id) && payload_len > 0) {
         LOG_ISR("[USB-ISR] SET_REPORT(Feature 0x%02x) DROPPED, len=%lu\n",
                report_id, (unsigned long)payload_len);
@@ -1847,6 +1857,7 @@ void usb_soft_disconnect(void)
     active_submit_us = 0u;
     kbd_ep_busy = false;
     kbd_ep_busy_since_us = 0;
+    usb_soft_connected = false;
     *phy_tst |= 1u;
     taskEXIT_CRITICAL();
     usb_audio_stop();
@@ -1858,6 +1869,14 @@ void usb_soft_disconnect(void)
 void usb_soft_connect(void)
 {
     volatile uint32_t *phy_tst = (volatile uint32_t *)(USB_BASE + 0x114);
+    taskENTER_CRITICAL();
+    usb_soft_connected = true;
     *phy_tst &= ~1u;
+    taskEXIT_CRITICAL();
     LOG_INF("[USB] Soft connect (stealth)\n");
+}
+
+bool usb_soft_is_connected(void)
+{
+    return usb_soft_connected;
 }

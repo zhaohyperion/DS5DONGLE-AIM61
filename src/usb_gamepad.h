@@ -100,5 +100,6 @@ void usb_gamepad_process_deferred(void);
 
 void usb_soft_disconnect(void);
 void usb_soft_connect(void);
+bool usb_soft_is_connected(void);
 
 #endif /* USB_GAMEPAD_H */

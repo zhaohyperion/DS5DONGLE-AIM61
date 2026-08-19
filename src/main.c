@@ -52,6 +52,8 @@
 #define HANDSHAKE_TIMEOUT_US  (10ULL * 1000000ULL)
 #define CONNECTING_TIMEOUT_TICKS pdMS_TO_TICKS(8000)
 #define L2CAP_FALLBACK_TIMEOUT_TICKS pdMS_TO_TICKS(3000)
+#define USB_DEFERRED_DISCONNECT_TICKS pdMS_TO_TICKS(10000)
+#define PRIMER_RESEND_DELAY_TICKS pdMS_TO_TICKS(300)
 
 #define USB_OUTPUT_BUF_SZ    64  /* Report ID (1) + SetStateData (up to 63 for DSE) */
 
@@ -99,6 +101,13 @@ static volatile bool dse_mode_changed = false;
 static volatile bool prev_led_disabled = false;
 static volatile bool scan_after_disconnect = false;
 static volatile bool ota_maintenance_mode = false;
+/* Keep the Windows HID/UAC session alive during a quick controller switch.
+ * TickType_t is atomic on RV32, unlike a cross-task 64-bit mtimer value. */
+static volatile bool usb_disconnect_pending = false;
+static volatile TickType_t usb_disconnect_started_tick = 0;
+/* Re-send the fully merged primer after the controller HID channel settles. */
+static volatile bool primer_resend_pending = false;
+static volatile TickType_t primer_resend_started_tick = 0;
 /* Stealth mode: frames of Windows USB output to wait before sending primer */
 static volatile uint8_t stealth_primer_countdown = 0;
 static uint8_t output_seq = 0;  /* sequence counter for 0x31 BT output */
@@ -269,6 +278,11 @@ static int request_led_primer(void)
     state_mgr_set_spk_active(usb_audio_is_active());
     uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
     uint32_t revision = state_mgr_snapshot(merged, sizeof(merged));
+
+    /* state_mgr_apply_config fills the configured values but intentionally
+     * does not assert dirty flags.  A reconnect primer must explicitly mark
+     * both volume bytes valid or the controller can retain its reset values. */
+    merged[0] |= 0x30;
 
     /* Only replay trigger cache — games don't re-send trigger data after
      * USB re-enumeration. LED and player indicators are NOT replayed because
@@ -451,6 +465,7 @@ static void on_hid_state(enum bt_hid_host_state state)
         taskENTER_CRITICAL();
         led_primer_request_id++;
         led_primer_retry_pending = false;
+        primer_resend_pending = false;
         was_connected = ds5_connected;
         ds5_connected = false;
         if (was_connected) {
@@ -488,8 +503,14 @@ static void on_hid_state(enum bt_hid_host_state state)
             xTaskAbortDelay(usb_task_handle);
         if (was_connected && !ota_maintenance_mode &&
             !bt_hid_host_is_switching() &&
-            !config_wake_enabled() && !usb_wake_host_suspended())
-            usb_soft_disconnect();
+            !config_wake_enabled() && !usb_wake_host_suspended() &&
+            usb_soft_is_connected()) {
+            taskENTER_CRITICAL();
+            usb_disconnect_started_tick = xTaskGetTickCount();
+            usb_disconnect_pending = true;
+            taskEXIT_CRITICAL();
+            LOG_INF("[MAIN] USB disconnect deferred for 10 seconds\n");
+        }
         if (was_connected) {
             conn_led_start_us = bflb_mtimer_get_time_us();
             conn_led_off = false;
@@ -569,12 +590,24 @@ static void on_hid_state(enum bt_hid_host_state state)
         handshake_start_us = 0;
 
         if (ever_connected) {
-            /* Reconnection: USB was soft-disconnected in IDLE handler.
-             * Do a full USB replug so the host re-enumerates and re-sends
-             * all init (including adaptive triggers). */
-            stealth_primer_countdown = 5;
-            LOG_INF("[MAIN] Reconnect: USB replug + primer pending\n");
-            usb_soft_connect();
+            bool deferred_cancelled;
+            taskENTER_CRITICAL();
+            deferred_cancelled = usb_disconnect_pending;
+            usb_disconnect_pending = false;
+            taskEXIT_CRITICAL();
+
+            if (!usb_soft_is_connected()) {
+                /* The grace period elapsed: force a real re-enumeration so
+                 * Windows restores HID, audio and adaptive-trigger state. */
+                stealth_primer_countdown = 5;
+                usb_soft_connect();
+                LOG_INF("[MAIN] Reconnect: USB replug + primer pending\n");
+            } else {
+                /* Fast reconnect: preserve the existing Windows audio session. */
+                stealth_primer_countdown = 0;
+                LOG_INF("[MAIN] Reconnect: USB session preserved%s\n",
+                        deferred_cancelled ? " (grace timer cancelled)" : "");
+            }
         } else if (config_usb_stealth()) {
             /* First connection, stealth: USB was disconnected at boot.
              * Let Windows send blue init, then override with our primer. */
@@ -589,6 +622,8 @@ static void on_hid_state(enum bt_hid_host_state state)
 
         taskENTER_CRITICAL();
         ds5_connected = true;
+        primer_resend_started_tick = xTaskGetTickCount();
+        primer_resend_pending = true;
         taskEXIT_CRITICAL();
         /* A wake-enabled host can keep the UAC mic alternate setting open
          * while Bluetooth reconnects.  Restore the DS5 0x32 mic request from
@@ -881,6 +916,9 @@ static void bt_task(void *arg)
         bt_hid_host_tx_tick();
         retry_led_primer();
 
+        if (usb_wake_take_radio_wake_request())
+            bt_hid_host_radio_wake();
+
         /* Periodic RSSI read (~every 5 s) */
         {
             static uint16_t rssi_tick = 0;
@@ -903,6 +941,24 @@ static void bt_task(void *arg)
             }
         } else {
             disconnecting_since = 0;
+        }
+
+        /* A quick controller reconnect cancels this in on_hid_state().  When
+         * it really expires, remove the phantom HID/UAC device from Windows. */
+        bool disconnect_usb = false;
+        TickType_t now_tick = xTaskGetTickCount();
+        taskENTER_CRITICAL();
+        if (usb_disconnect_pending && !ds5_connected &&
+            (TickType_t)(now_tick - usb_disconnect_started_tick) >=
+                USB_DEFERRED_DISCONNECT_TICKS) {
+            usb_disconnect_pending = false;
+            disconnect_usb = true;
+        }
+        taskEXIT_CRITICAL();
+        if (disconnect_usb && !ota_maintenance_mode && !ds5_connected &&
+            usb_soft_is_connected()) {
+            usb_soft_disconnect();
+            LOG_INF("[MAIN] Deferred USB disconnect completed\n");
         }
 
         if (bt_hid_host_poll_scan_early()) {
@@ -1107,7 +1163,7 @@ next_output_iter:;
             }
 
             if (bt_hid_host_get_state() == BT_HID_STATE_IDLE &&
-                idle_ticks >= 20) {
+                idle_ticks >= 20 && !usb_wake_host_suspended()) {
                 if (bt_hid_host_has_pending_conn()) {
                     if (stale_conn_since == 0)
                         stale_conn_since = bflb_mtimer_get_time_us();
@@ -1554,6 +1610,21 @@ static void usb_task(void *arg)
         }
 
         usb_wake_task();
+
+        bool resend_primer = false;
+        TickType_t now_tick = xTaskGetTickCount();
+        taskENTER_CRITICAL();
+        if (primer_resend_pending && ds5_connected &&
+            stealth_primer_countdown == 0 &&
+            (TickType_t)(now_tick - primer_resend_started_tick) >=
+                PRIMER_RESEND_DELAY_TICKS) {
+            primer_resend_pending = false;
+            resend_primer = true;
+        }
+        taskEXIT_CRITICAL();
+        if (resend_primer)
+            request_led_primer();
+
         dse_task();
     }
 }
@@ -1572,6 +1643,10 @@ static void ota_maintenance_changed(bool active)
     if (active) {
         ota_maintenance_mode = true;
         scan_after_disconnect = false;
+        taskENTER_CRITICAL();
+        usb_disconnect_pending = false;
+        primer_resend_pending = false;
+        taskEXIT_CRITICAL();
 
         /* Preserve the vendor-HID control interface while quiescing every
          * latency-heavy DS5 and UAC data path before flash operations. */

@@ -22,4 +22,10 @@ void usb_wake_on_bt_input(const uint8_t *payload, uint16_t len);
 /** Advance the wake FSM. Call periodically from the USB task loop. */
 void usb_wake_task(void);
 
+/**
+ * Consume a pending request to re-enable BR/EDR scans after host resume.
+ * Returns false while a newer suspend generation is active.
+ */
+bool usb_wake_take_radio_wake_request(void);
+
 #endif /* USB_WAKE_H */

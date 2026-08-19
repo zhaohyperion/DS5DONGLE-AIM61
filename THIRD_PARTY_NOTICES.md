@@ -13,6 +13,12 @@ each component.
 - `sqlCRT/ds5dongle-bl618-opensource` — principal open BL618 comparison
   baseline and source of later integration work; GNU GPL v3; copyright sqlCRT
   and contributors.
+- `bibuq0/DSdongle-bl616` — GPL-3.0 comparison source for the v3.17 Q15
+  resampler, delayed USB disconnect, reconnect primer volume flags and
+  suspend-time BR/EDR scan silencing.  This project adapted those ideas to its
+  existing asynchronous ownership and RV32 race-safety model.  The Electron
+  companion, `silk_stubs.c`, CELT-only source pruning and whole-task TCM
+  placement were deliberately not copied.
 
 ## Bouffalo SDK
 
@@ -58,6 +64,37 @@ does not contact the site at runtime. The site's public implementation only
 toggles the microphone indicator; this tool additionally tests actual audio
 capture through the M61 Windows UAC endpoint and clearly identifies that as an
 extension.
+
+## DualSense tester and calibration references
+
+- `daidr/dualsense-tester`, commit
+  `d85bbaf2cf6ade22aae3983f22c99a176e50c827` — DualSense input, touch,
+  motion, output and audio-test interaction reference. MIT License; copyright
+  (c) 2023 Xuezhou Dai (daidr).
+- `dualshock-tools/dualshock-tools.github.io`, commit
+  `af58465fac3447eafa7949b65f0ae650df74a554` — 48-direction stick sampling,
+  RMS circularity-error definition and DS5 `0x82`/`0x83` center/range
+  calibration protocol reference. MIT License; copyright (c) 2024 the_al.
+
+The Windows application is a native Rust implementation and does not embed,
+load or redistribute either web application. Small protocol facts, algorithms
+and interaction patterns were adapted under their MIT terms. The required MIT
+copyright and permission notices are retained below:
+
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions: The above copyright
+> notice and this permission notice shall be included in all copies or
+> substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS",
+> WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+> TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+> NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+> FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+> TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+> THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Rust and Python dependencies
 

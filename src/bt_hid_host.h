@@ -242,6 +242,9 @@ bool bt_hid_host_is_dse(void);
 bool bt_hid_host_get_cached_feature(uint8_t report_id,
                                     const uint8_t **data, uint16_t *len);
 
+/** Invalidate one cached feature report before a command changes its value. */
+void bt_hid_host_invalidate_cached_feature(uint8_t report_id);
+
 /**
  * Send a SET_REPORT (Feature) with BT CRC to the connected controller.
  * @param report_id  HID report ID
@@ -334,5 +337,15 @@ int bt_hid_host_read_rssi(int8_t *rssi);
  * @return last RSSI in dBm, or 0 if not available
  */
 int8_t bt_hid_host_get_cached_rssi(void);
+
+/**
+ * Disable BR/EDR page/inquiry scans after a sustained host suspend.  Existing
+ * ACL teardown is left to the controller; this only removes idle radio work.
+ * Call from task context.
+ */
+void bt_hid_host_radio_idle(void);
+
+/** Re-enable BR/EDR page/inquiry scans after the USB host resumes. */
+void bt_hid_host_radio_wake(void);
 
 #endif /* BT_HID_HOST_H */

@@ -32,6 +32,7 @@ pub struct GuidedTest {
     pub current: usize,
     pub phases: Vec<PhaseRecord>,
     previous: InputState,
+    synchronize_next_input: bool,
 }
 
 impl Default for GuidedTest {
@@ -41,6 +42,7 @@ impl Default for GuidedTest {
             current: 0,
             phases: phase_catalog(),
             previous: InputState::default(),
+            synchronize_next_input: true,
         }
     }
 }
@@ -76,7 +78,16 @@ impl GuidedTest {
         phase.note.clear();
     }
 
+    pub fn require_input_resync(&mut self) {
+        self.synchronize_next_input = true;
+    }
+
     pub fn observe(&mut self, input: &InputState) {
+        if self.synchronize_next_input {
+            self.previous = input.clone();
+            self.synchronize_next_input = false;
+            return;
+        }
         if !self.active {
             self.previous = input.clone();
             return;
@@ -269,8 +280,8 @@ fn phase_catalog() -> Vec<PhaseRecord> {
             "triggers_output",
             "左右自适应扳机",
             "Adaptive triggers",
-            "工具逐步施加受限阻力并自动复位；确认左右效果。",
-            "The tool applies limited gradual resistance and resets it; confirm both sides.",
+            "工具对左右扳机施加受限阻力并自动复位，共重复 3 轮；确认左右效果。",
+            "The tool applies limited resistance to both triggers and resets them for 3 rounds; confirm both sides.",
             "3 rounds each",
         ),
         (
@@ -323,6 +334,7 @@ mod tests {
         guide.start();
         guide.current = 1;
         let mut input = InputState::default();
+        guide.observe(&input);
         for _ in 0..10 {
             input.cross = true;
             guide.observe(&input);
@@ -330,5 +342,39 @@ mod tests {
             guide.observe(&input);
         }
         assert_eq!(guide.phase().samples.get("cross"), Some(&10));
+    }
+
+    #[test]
+    fn reconnect_resync_does_not_create_a_false_button_press() {
+        let mut guide = GuidedTest::default();
+        guide.start();
+        guide.current = 1;
+        let mut input = InputState {
+            cross: true,
+            ..InputState::default()
+        };
+        guide.observe(&input);
+        assert!(guide.phase().samples.is_empty());
+
+        input.cross = false;
+        guide.observe(&input);
+        input.cross = true;
+        guide.observe(&input);
+        assert_eq!(guide.phase().samples.get("cross"), Some(&1));
+
+        guide.require_input_resync();
+        guide.observe(&input);
+        assert_eq!(guide.phase().samples.get("cross"), Some(&1));
+    }
+
+    #[test]
+    fn not_effective_result_is_preserved_when_advancing() {
+        let mut guide = GuidedTest::default();
+        guide.start();
+        guide.phase_mut().note = "no response".to_owned();
+        guide.mark_and_next(PhaseResult::NotEffective);
+        assert_eq!(guide.current, 1);
+        assert_eq!(guide.phases[0].result, PhaseResult::NotEffective);
+        assert_eq!(guide.phases[0].note, "no response");
     }
 }
