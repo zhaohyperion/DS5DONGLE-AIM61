@@ -69,17 +69,20 @@ extension.
 
 - `daidr/dualsense-tester`, commit
   `d85bbaf2cf6ade22aae3983f22c99a176e50c827` — DualSense input, touch,
-  motion, output and audio-test interaction reference. MIT License; copyright
-  (c) 2023 Xuezhou Dai (daidr).
+  motion, output and audio-test interaction reference. The native test-center
+  controller model directly adapts and redistributes local SVG paths from its
+  `DSBody.vue`, plus its 1117x892 coordinate system, physical control locations,
+  stick normalization and two-point touch mapping from `DSCover.vue` and
+  `DSBack.vue`. MIT License; copyright (c) 2023 Xuezhou Dai (daidr).
 - `dualshock-tools/dualshock-tools.github.io`, commit
   `af58465fac3447eafa7949b65f0ae650df74a554` — 48-direction stick sampling,
   RMS circularity-error definition and DS5 `0x82`/`0x83` center/range
   calibration protocol reference. MIT License; copyright (c) 2024 the_al.
 
-The Windows application is a native Rust implementation and does not embed,
-load or redistribute either web application. Small protocol facts, algorithms
-and interaction patterns were adapted under their MIT terms. The required MIT
-copyright and permission notices are retained below:
+The Windows application is a native Rust implementation and does not embed or
+load either web application. The local SVG asset, model coordinates, protocol
+facts, algorithms and interaction patterns were adapted under their MIT terms.
+The required MIT copyright and permission notices are retained below:
 
 > Permission is hereby granted, free of charge, to any person obtaining a copy
 > of this software and associated documentation files (the "Software"), to deal

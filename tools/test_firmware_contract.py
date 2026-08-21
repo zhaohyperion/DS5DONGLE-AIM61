@@ -90,17 +90,28 @@ class FirmwareContractTests(unittest.TestCase):
         ota_control_id = integer_define(ota_header, "OTA_CONTROL_REPORT_ID")
         self.assertEqual(ota_data_id, 0xFA)
         self.assertEqual(ota_control_id, 0xFC)
-        self.assertEqual(len({ota_data_id, ota_control_id, 0xFD}), 3)
+        self.assertEqual(len({ota_data_id, ota_control_id, 0xFB, 0xFD, 0xFE}), 5)
 
         usb = read("src/usb_gamepad.c")
-        self.assertEqual(integer_define("src/usb_gamepad.c", "HID_REPORT_DESC_SIZE_DS"), 353)
-        self.assertEqual(integer_define("src/usb_gamepad.c", "HID_REPORT_DESC_SIZE_DSE"), 469)
+        self.assertEqual(integer_define("src/usb_gamepad.c", "HID_REPORT_DESC_SIZE_DS"), 361)
+        self.assertEqual(integer_define("src/usb_gamepad.c", "HID_REPORT_DESC_SIZE_DSE"), 477)
+        self.assertNotIn("#define HID_REPORT_DESC_SIZE_DS  353", usb)
+        self.assertNotIn("#define HID_REPORT_DESC_SIZE_DSE 469", usb)
         self.assertEqual(usb.count("0x85, RUNTIME_DIAG_REPORT_ID"), 2)
+        self.assertEqual(usb.count("0x85, MACRO_REPORT_ID"), 2)
         self.assertEqual(usb.count("0x09, 0x3F"), 2)
+        self.assertIn("Windows caches HID preparsed", usb)
+        self.assertIn("(APP_VER_Y << 4) | APP_VER_Z", usb)
         self.assertIn("report_id == RUNTIME_DIAG_REPORT_ID", usb)
         self.assertIn("runtime_diag_get_selected_report(feature_resp_buf + 1)", usb)
         self.assertIn("*len = 1 + RUNTIME_DIAG_REPORT_SIZE", usb)
         self.assertIn("runtime_diag_select_page_from_isr(payload, payload_len)", usb)
+
+        macro = read("src/macro_engine.c")
+        self.assertIn("g_active_len < MACRO_HEADER_SIZE", macro)
+        self.assertIn("!(blob_flags() & 0x01u)", macro)
+        self.assertIn("g_last_release_us[id] != 0", macro)
+        self.assertIn("now_us - g_ps_press_us >= 2000000ULL", macro)
 
         ep0_region = usb[
             usb.index("void usbd_hid_get_report") :

@@ -8,6 +8,7 @@
 #include "config.h"
 #include "state_mgr.h"
 #include "remap.h"
+#include "macro_engine.h"
 #include "ota_update.h"
 #include "runtime_diag.h"
 #include "usbd_core.h"
@@ -31,13 +32,8 @@
 #define USB_HID_ONLY_SIZE (9 + 9 + 7 + 7 + USB_KBD_DESC_SIZE)
 #define USB_AUDIO_DESC_SIZE 186
 #define USB_HID_CONFIG_SIZE (9 + USB_AUDIO_DESC_SIZE + USB_HID_ONLY_SIZE)
-#if DS5_DIAGNOSTIC_BUILD
-#define HID_REPORT_DESC_SIZE_DS  353
-#define HID_REPORT_DESC_SIZE_DSE 469
-#else
-#define HID_REPORT_DESC_SIZE_DS  345
-#define HID_REPORT_DESC_SIZE_DSE 461
-#endif
+#define HID_REPORT_DESC_SIZE_DS  361
+#define HID_REPORT_DESC_SIZE_DSE 477
 #define KBD_REPORT_DESC_SIZE 45
 #define USB_KBD_INTERVAL_HS  7  /* 2^(7-1) microframes = 8 ms */
 #ifdef FORCE_FS_MODE
@@ -56,7 +52,8 @@ static volatile bool usb_config_apply_pending = false;
 static volatile uint16_t usb_config_pending_len = 0;
 static uint8_t usb_config_pending_data[sizeof(struct config_body)];
 static volatile uint8_t usb_remap_pending_cmd = 0;
-static uint8_t usb_remap_pending_data[REMAP_BTN_COUNT * sizeof(remap_entry_t)];
+static uint32_t usb_remap_pending_data[REMAP_BTN_COUNT];
+static uint16_t usb_remap_pending_revision = 0xFFFFu;
 static bool first_usb_send_logged = false;
 
 enum usb_deferred_log_bits {
@@ -260,6 +257,10 @@ static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
     0x09, 0x3C,
     0x95, 0x3F,
     0xB1, 0x02,
+    0x85, MACRO_REPORT_ID, /* Report ID (254) — macro store/control */
+    0x09, 0x40,
+    0x95, 0x3F,
+    0xB1, 0x02,
 
     /* Vendor-HID A/B OTA data and control/status reports. */
     0x85, OTA_DATA_REPORT_ID,
@@ -270,12 +271,15 @@ static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
     0x09, 0x3E,
     0x95, 0x3F,
     0xB1, 0x02,
-#if DS5_DIAGNOSTIC_BUILD
+    /* Keep this declaration in both profiles.  Windows caches HID preparsed
+     * data for a VID/PID/port tuple; changing the descriptor during an OTA
+     * profile switch otherwise leaves 0xFD invisible until the device node is
+     * removed.  Standard firmware declares the report but does not create the
+     * diagnostics task or publish runtime samples. */
     0x85, RUNTIME_DIAG_REPORT_ID,
     0x09, 0x3F,
     0x95, 0x3F,
     0xB1, 0x02,
-#endif
 
     0xC0,             /* End Collection */
 };
@@ -350,11 +354,12 @@ static const uint8_t hid_report_desc_dse[HID_REPORT_DESC_SIZE_DSE] = {
     0x85, 0xF8, 0x09, 0x39, 0x95, 0x3F, 0xB1, 0x02,
     0x85, 0xF9, 0x09, 0x3A, 0x95, 0x3F, 0xB1, 0x02,
     0x85, 0xFB, 0x09, 0x3C, 0x95, 0x3F, 0xB1, 0x02,  /* button remap table */
+    0x85, MACRO_REPORT_ID, 0x09, 0x40, 0x95, 0x3F, 0xB1, 0x02,
     0x85, OTA_DATA_REPORT_ID, 0x09, 0x3D, 0x95, 0x3F, 0x91, 0x02,
     0x85, OTA_CONTROL_REPORT_ID, 0x09, 0x3E, 0x95, 0x3F, 0xB1, 0x02,
-#if DS5_DIAGNOSTIC_BUILD
+    /* Descriptor parity with the Standard controller descriptor is required
+     * so profile OTA never changes Windows' cached HID capabilities. */
     0x85, RUNTIME_DIAG_REPORT_ID, 0x09, 0x3F, 0x95, 0x3F, 0xB1, 0x02,
-#endif
     0xC0,
 };
 
@@ -395,7 +400,10 @@ static uint8_t device_desc[] = {
     0x40,                    /* bMaxPacketSize0 */
     (USB_GAMEPAD_VID & 0xFF), (USB_GAMEPAD_VID >> 8),
     (USB_GAMEPAD_PID & 0xFF), (USB_GAMEPAD_PID >> 8),
-    0x00, 0x01,              /* bcdDevice: 1.00 */
+    (uint8_t)((APP_VER_Y << 4) | APP_VER_Z), APP_VER_X,
+                              /* bcdDevice follows MAJOR.MINOR/PATCH BCD
+                               * (3.6.0 -> 3.60) so Windows invalidates the
+                               * pre-v3.6 cached HID preparsed descriptor. */
     0x01,                    /* iManufacturer */
     0x02,                    /* iProduct */
     0x00,                    /* iSerialNumber: none */
@@ -955,6 +963,7 @@ void usb_gamepad_set_dse_mode(bool dse)
 
 void usb_gamepad_process_deferred(void)
 {
+    macro_engine_process_deferred();
     uint32_t event_logs;
     uint8_t unknown_event;
 #if LOG_LEVEL >= 3
@@ -1026,17 +1035,23 @@ void usb_gamepad_process_deferred(void)
     }
 
     uint8_t remap_cmd;
-    uint8_t remap_data[sizeof(usb_remap_pending_data)];
+    uint32_t remap_data[REMAP_BTN_COUNT];
+    uint16_t remap_expected_revision;
     taskENTER_CRITICAL();
     remap_cmd = usb_remap_pending_cmd;
     usb_remap_pending_cmd = 0;
     if (remap_cmd == 1)
         memcpy(remap_data, usb_remap_pending_data, sizeof(remap_data));
+    remap_expected_revision = usb_remap_pending_revision;
     taskEXIT_CRITICAL();
     if (remap_cmd == 1) {
-        remap_set(remap_data, sizeof(remap_data));
-        usb_remap_save_pending = true;
-        LOG_INF("[USB] CMD 0xFB/0x01: remap table updated (save pending)\n");
+        if (remap_set_masks(remap_data, REMAP_BTN_COUNT,
+                            remap_expected_revision)) {
+            usb_remap_save_pending = true;
+            LOG_INF("[USB] CMD 0xFB/0x01: v3 multi-target remap updated (save pending)\n");
+        } else {
+            LOG_WRN("[USB] CMD 0xFB/0x01: invalid or stale remap rejected\n");
+        }
     } else if (remap_cmd == 2) {
         remap_reset();
         usb_remap_save_pending = true;
@@ -1524,7 +1539,8 @@ static uint8_t kbd_idle_report[USB_KBD_EP_MPS];
 static bool is_dongle_cmd(uint8_t report_id)
 {
     return (report_id >= 0xF6 && report_id <= 0xF9) ||
-           report_id == 0xFB || report_id == OTA_CONTROL_REPORT_ID
+           report_id == 0xFB || report_id == MACRO_REPORT_ID ||
+           report_id == OTA_CONTROL_REPORT_ID
 #if DS5_DIAGNOSTIC_BUILD
            || report_id == RUNTIME_DIAG_REPORT_ID
 #endif
@@ -1672,13 +1688,31 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             *data = feature_resp_buf;
             *len  = 5;
         } else if (report_id == 0xFB) {
+            uint32_t masks[REMAP_BTN_COUNT];
             feature_resp_buf[0] = 0xFB;
-            memcpy(feature_resp_buf + 1, remap_get_table(),
-                   REMAP_BTN_COUNT * sizeof(remap_entry_t));
+            feature_resp_buf[1] = REMAP_WIRE_VERSION;
+            feature_resp_buf[2] = REMAP_BTN_COUNT;
+            remap_get_masks(masks, REMAP_BTN_COUNT);
+            bool identity = true;
+            for (uint8_t i = 0; i < REMAP_BTN_COUNT; ++i) {
+                feature_resp_buf[3 + i * 3] = (uint8_t)masks[i];
+                feature_resp_buf[4 + i * 3] = (uint8_t)(masks[i] >> 8);
+                feature_resp_buf[5 + i * 3] = (uint8_t)(masks[i] >> 16);
+                if (masks[i] != (1u << i)) identity = false;
+            }
+            const uint16_t revision = remap_revision();
+            feature_resp_buf[60] = (uint8_t)revision;
+            feature_resp_buf[61] = (uint8_t)(revision >> 8);
+            feature_resp_buf[62] = identity ? 0x01 : 0x00;
+            feature_resp_buf[63] = 0x03; /* disabled sources + synchronous combos */
             *data = feature_resp_buf;
-            *len  = 1 + REMAP_BTN_COUNT * (int)sizeof(remap_entry_t);
-            LOG_ISR("[USB-ISR] GET_REPORT(0xFB) remap table %lu bytes\n",
-                    (unsigned long)*len);
+            *len  = 64;
+            LOG_ISR("[USB-ISR] GET_REPORT(0xFB) remap v%u revision %u\n",
+                    REMAP_WIRE_VERSION, revision);
+        } else if (report_id == MACRO_REPORT_ID) {
+            macro_engine_get_report(feature_resp_buf + 1);
+            *data = feature_resp_buf;
+            *len = 1 + MACRO_REPORT_SIZE;
         } else if (report_id == OTA_CONTROL_REPORT_ID) {
             ota_update_get_status_report(feature_resp_buf + 1);
             *data = feature_resp_buf;
@@ -1768,6 +1802,12 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
     if (usb_maintenance_mode)
         return;
 
+    if (report_id == MACRO_REPORT_ID && report_type == 0x03) {
+        if (payload_len == MACRO_REPORT_SIZE)
+            (void)macro_engine_enqueue_from_isr(payload, payload_len);
+        return;
+    }
+
     /* Dongle config command (0xF6 SET) */
     if (report_type == 0x03 && report_id == 0xF6 && payload_len > 0) {
         uint8_t cmd = payload[0];
@@ -1789,9 +1829,17 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
     /* Button remap command (0xFB SET) */
     if (report_type == 0x03 && report_id == 0xFB && payload_len > 0) {
         uint8_t cmd = payload[0];
-        if (cmd == 0x01 && payload_len >= 1 + REMAP_BTN_COUNT * sizeof(remap_entry_t)) {
-            memcpy(usb_remap_pending_data, payload + 1,
-                   sizeof(usb_remap_pending_data));
+        if (cmd == 0x01 && payload_len >= 63 &&
+            payload[1] == REMAP_WIRE_VERSION &&
+            payload[2] == REMAP_BTN_COUNT) {
+            for (uint8_t i = 0; i < REMAP_BTN_COUNT; ++i) {
+                usb_remap_pending_data[i] =
+                    (uint32_t)payload[3 + i * 3] |
+                    ((uint32_t)payload[4 + i * 3] << 8) |
+                    ((uint32_t)payload[5 + i * 3] << 16);
+            }
+            usb_remap_pending_revision =
+                (uint16_t)payload[60] | ((uint16_t)payload[61] << 8);
             usb_remap_pending_cmd = 1;
         } else if (cmd == 0x02) {
             usb_remap_pending_cmd = 2;

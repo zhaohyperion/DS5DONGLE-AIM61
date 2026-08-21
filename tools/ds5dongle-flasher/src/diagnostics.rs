@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     DUALSENSE_PRODUCT_IDS, FIRMWARE_VERSION_REPORT_ID, SONY_VENDOR_ID,
-    decode_firmware_version_report,
+    decode_firmware_identity_report,
 };
 
 pub const REPORT_ID: u8 = 0xfd;
@@ -67,6 +67,7 @@ pub struct DeviceDiagnostic {
     pub vendor_id: u16,
     pub product_id: u16,
     pub firmware_version: Option<String>,
+    pub build_profile: Option<String>,
     pub snapshot: Option<DiagnosticSnapshot>,
     pub error: Option<String>,
 }
@@ -102,15 +103,24 @@ pub fn probe_runtime_diagnostics() -> Result<Vec<DeviceDiagnostic>> {
             vendor_id: info.vendor_id(),
             product_id: info.product_id(),
             firmware_version: None,
+            build_profile: None,
             snapshot: None,
             error: None,
         };
         match info.open_device(&api) {
             Ok(device) => {
-                report.firmware_version = read_firmware_version(&device);
-                match capture_snapshot(&device) {
-                    Ok(snapshot) => report.snapshot = Some(snapshot),
-                    Err(error) => report.error = Some(format!("{error:#}")),
+                if let Some((version, profile)) = read_firmware_identity(&device) {
+                    report.firmware_version = Some(version);
+                    report.build_profile = Some(profile.clone());
+                    if profile != "standard" {
+                        match capture_snapshot(&device) {
+                            Ok(snapshot) => report.snapshot = Some(snapshot),
+                            Err(error) => report.error = Some(format!("{error:#}")),
+                        }
+                    }
+                } else {
+                    report.error =
+                        Some("unable to read the M61 firmware identity report".to_owned());
                 }
             }
             Err(error) => report.error = Some(format!("unable to open HID device: {error}")),
@@ -129,14 +139,14 @@ pub fn probe_runtime_diagnostics() -> Result<Vec<DeviceDiagnostic>> {
 }
 
 #[cfg(windows)]
-fn read_firmware_version(device: &hidapi::HidDevice) -> Option<String> {
+fn read_firmware_identity(device: &hidapi::HidDevice) -> Option<(String, String)> {
     for attempt in 0..READ_ATTEMPTS {
         let mut report = [0_u8; 64];
         report[0] = FIRMWARE_VERSION_REPORT_ID;
         if let Ok(length) = device.get_feature_report(&mut report)
-            && let Some(version) = decode_firmware_version_report(&report[..length])
+            && let Some(identity) = decode_firmware_identity_report(&report[..length])
         {
-            return Some(version);
+            return Some(identity);
         }
         if attempt + 1 < READ_ATTEMPTS {
             std::thread::sleep(std::time::Duration::from_millis(READ_RETRY_DELAY_MS));
@@ -298,6 +308,11 @@ fn session_report(protocol_version: u8, active: bool) -> [u8; WIRE_REPORT_SIZE] 
 }
 
 fn decode_page(source: &[u8]) -> Result<DiagnosticPage> {
+    if !source.is_empty() && source.iter().all(|byte| *byte == 0) {
+        bail!(
+            "the Windows HID stack returned an all-zero 0xFD report; its cached Standard-profile report descriptor is stale. Close controller tools, reconnect M61, and retry"
+        );
+    }
     let frame = match source {
         [REPORT_ID, payload @ ..] if payload.len() == REPORT_SIZE => payload,
         [b'D', b'G', ..] if source.len() == WIRE_REPORT_SIZE => &source[..REPORT_SIZE],
@@ -524,6 +539,16 @@ mod tests {
         assert_eq!(selector.len(), 64);
         assert_eq!(&selector[..4], &[REPORT_ID, 0x01, 0x02, 5]);
         assert!(selector[4..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn classifies_windows_all_zero_feature_report_as_stale_descriptor() {
+        let error = decode_page(&[0_u8; WIRE_REPORT_SIZE]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cached Standard-profile report descriptor")
+        );
     }
 
     #[test]

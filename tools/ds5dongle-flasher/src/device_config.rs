@@ -5,9 +5,78 @@ const DUALSENSE_PRODUCT_IDS: [u16; 2] = [0x0ce6, 0x0df2];
 const CONFIG_SET_REPORT_ID: u8 = 0xf6;
 const CONFIG_GET_REPORT_ID: u8 = 0xf7;
 const FIRMWARE_ID_REPORT_ID: u8 = 0xf8;
+const REMAP_REPORT_ID: u8 = 0xfb;
+const REMAP_WIRE_VERSION: u8 = 3;
+const REMAP_LEGACY_WIRE_VERSION: u8 = 2;
 const FEATURE_REPORT_SIZE: usize = 64;
 const CONFIG_POLLING_MODE_OFFSET: usize = 10;
 const MAX_ATTEMPTS: usize = 4;
+pub const REMAP_CONTROL_COUNT: usize = 19;
+const REMAP_MASK_BYTES: usize = 3;
+const REMAP_VALID_MASK: u32 = (1_u32 << REMAP_CONTROL_COUNT) - 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ButtonMapping {
+    pub target_masks: [u32; REMAP_CONTROL_COUNT],
+    pub revision: u16,
+    pub imported_legacy_v2: bool,
+}
+
+impl Default for ButtonMapping {
+    fn default() -> Self {
+        let mut target_masks = [0_u32; REMAP_CONTROL_COUNT];
+        for (index, target_mask) in target_masks.iter_mut().enumerate() {
+            *target_mask = 1_u32 << index;
+        }
+        Self {
+            target_masks,
+            revision: u16::MAX,
+            imported_legacy_v2: false,
+        }
+    }
+}
+
+impl ButtonMapping {
+    pub fn is_identity(&self) -> bool {
+        self.target_masks
+            .iter()
+            .enumerate()
+            .all(|(index, target_mask)| *target_mask == 1_u32 << index)
+    }
+
+    pub fn is_target_enabled(&self, source: usize, target: usize) -> bool {
+        self.target_masks
+            .get(source)
+            .is_some_and(|mask| (*mask & (1_u32 << target)) != 0)
+    }
+
+    pub fn set_target_enabled(&mut self, source: usize, target: usize, enabled: bool) {
+        if source >= REMAP_CONTROL_COUNT || target >= REMAP_CONTROL_COUNT {
+            return;
+        }
+        if enabled {
+            self.target_masks[source] |= 1_u32 << target;
+        } else {
+            self.target_masks[source] &= !(1_u32 << target);
+        }
+    }
+
+    pub fn target_count(&self, source: usize) -> u32 {
+        self.target_masks
+            .get(source)
+            .map_or(0, |mask| mask.count_ones())
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (source, target_mask) in self.target_masks.iter().enumerate() {
+            if (*target_mask & !REMAP_VALID_MASK) != 0 {
+                bail!("mapping source {source} has invalid target bits 0x{target_mask:08x}");
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PollingRate {
@@ -89,6 +158,14 @@ fn set_polling_in_config(config: &mut [u8], mode: PollingRate) -> Result<()> {
 }
 
 fn command_report(command: u8, payload: &[u8]) -> Result<[u8; FEATURE_REPORT_SIZE]> {
+    feature_command_report(CONFIG_SET_REPORT_ID, command, payload)
+}
+
+fn feature_command_report(
+    report_id: u8,
+    command: u8,
+    payload: &[u8],
+) -> Result<[u8; FEATURE_REPORT_SIZE]> {
     if payload.len() > FEATURE_REPORT_SIZE - 2 {
         bail!(
             "configuration payload is too large: {} bytes",
@@ -96,10 +173,51 @@ fn command_report(command: u8, payload: &[u8]) -> Result<[u8; FEATURE_REPORT_SIZ
         );
     }
     let mut report = [0_u8; FEATURE_REPORT_SIZE];
-    report[0] = CONFIG_SET_REPORT_ID;
+    report[0] = report_id;
     report[1] = command;
     report[2..2 + payload.len()].copy_from_slice(payload);
     Ok(report)
+}
+
+fn decode_button_mapping(source: &[u8]) -> Result<ButtonMapping> {
+    let payload = payload_without_report_id(source, REMAP_REPORT_ID);
+    if payload.len() < 2 + REMAP_CONTROL_COUNT {
+        bail!(
+            "19-control mapping report is too short: {} bytes",
+            payload.len()
+        );
+    }
+    if usize::from(payload[1]) != REMAP_CONTROL_COUNT {
+        bail!(
+            "device mapping contains {} controls, expected {REMAP_CONTROL_COUNT}",
+            payload[1]
+        );
+    }
+    if payload[0] == REMAP_LEGACY_WIRE_VERSION {
+        let mut mapping = ButtonMapping::default();
+        for (source, target) in payload[2..2 + REMAP_CONTROL_COUNT].iter().enumerate() {
+            if usize::from(*target) >= REMAP_CONTROL_COUNT {
+                bail!("legacy mapping source {source} has invalid target {target}");
+            }
+            mapping.target_masks[source] = 1_u32 << target;
+        }
+        mapping.imported_legacy_v2 = true;
+        return Ok(mapping);
+    }
+    if payload[0] != REMAP_WIRE_VERSION || payload.len() < 63 {
+        bail!("device does not expose mapping protocol v{REMAP_WIRE_VERSION}");
+    }
+    let mut mapping = ButtonMapping::default();
+    for source in 0..REMAP_CONTROL_COUNT {
+        let offset = 2 + source * REMAP_MASK_BYTES;
+        mapping.target_masks[source] = u32::from(payload[offset])
+            | (u32::from(payload[offset + 1]) << 8)
+            | (u32::from(payload[offset + 2]) << 16);
+    }
+    mapping.revision = u16::from_le_bytes([payload[59], payload[60]]);
+    mapping.imported_legacy_v2 = false;
+    mapping.validate()?;
+    Ok(mapping)
 }
 
 #[cfg(windows)]
@@ -134,6 +252,22 @@ fn send_command(device: &hidapi::HidDevice, command: u8, payload: &[u8]) -> Resu
         }
     }
     bail!("unable to send configuration command 0x{command:02x}: {last_error}")
+}
+
+#[cfg(windows)]
+fn send_remap_command(device: &hidapi::HidDevice, command: u8, payload: &[u8]) -> Result<()> {
+    let report = feature_command_report(REMAP_REPORT_ID, command, payload)?;
+    let mut last_error = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match device.send_feature_report(&report) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = format!("attempt {attempt}: {error}"),
+        }
+        if attempt < MAX_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    bail!("unable to send 19-control mapping command: {last_error}")
 }
 
 #[cfg(windows)]
@@ -206,6 +340,61 @@ pub fn apply_polling_rate(mode: PollingRate) -> Result<ApplyResult> {
     })
 }
 
+#[cfg(windows)]
+pub fn read_button_mapping() -> Result<ButtonMapping> {
+    let device = open_config_device()?;
+    decode_button_mapping(&read_feature(&device, REMAP_REPORT_ID)?)
+}
+
+#[cfg(not(windows))]
+pub fn read_button_mapping() -> Result<ButtonMapping> {
+    bail!("19-control mapping is available on Windows only")
+}
+
+#[cfg(windows)]
+pub fn apply_button_mapping(mapping: &ButtonMapping) -> Result<ButtonMapping> {
+    mapping.validate()?;
+    let device = open_config_device()?;
+    let mut payload = Vec::with_capacity(FEATURE_REPORT_SIZE - 2);
+    payload.push(REMAP_WIRE_VERSION);
+    payload.push(REMAP_CONTROL_COUNT as u8);
+    for target_mask in mapping.target_masks {
+        let bytes = target_mask.to_le_bytes();
+        payload.extend_from_slice(&bytes[..REMAP_MASK_BYTES]);
+    }
+    payload.extend_from_slice(&mapping.revision.to_le_bytes());
+    payload.push(0);
+    send_remap_command(&device, 0x01, &payload)?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let verified = decode_button_mapping(&read_feature(&device, REMAP_REPORT_ID)?)?;
+    if verified.target_masks != mapping.target_masks {
+        bail!("device mapping verification did not match the requested 19-control table");
+    }
+    Ok(verified)
+}
+
+#[cfg(not(windows))]
+pub fn apply_button_mapping(_mapping: &ButtonMapping) -> Result<ButtonMapping> {
+    bail!("19-control mapping is available on Windows only")
+}
+
+#[cfg(windows)]
+pub fn reset_button_mapping() -> Result<ButtonMapping> {
+    let device = open_config_device()?;
+    send_remap_command(&device, 0x02, &[])?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let verified = decode_button_mapping(&read_feature(&device, REMAP_REPORT_ID)?)?;
+    if !verified.is_identity() {
+        bail!("device did not restore the identity 19-control mapping");
+    }
+    Ok(verified)
+}
+
+#[cfg(not(windows))]
+pub fn reset_button_mapping() -> Result<ButtonMapping> {
+    bail!("19-control mapping is available on Windows only")
+}
+
 #[cfg(not(windows))]
 pub fn apply_polling_rate(_mode: PollingRate) -> Result<ApplyResult> {
     bail!("device polling configuration is available on Windows only")
@@ -262,6 +451,52 @@ mod tests {
         assert_eq!(report[0], CONFIG_SET_REPORT_ID);
         assert_eq!(report[1], 0x01);
         assert_eq!(&report[2..2 + config.len()], config.as_slice());
+    }
+
+    #[test]
+    fn decodes_versioned_19_control_mapping_and_legacy_v2() {
+        let identity = ButtonMapping::default();
+        let mut wire = vec![
+            REMAP_REPORT_ID,
+            REMAP_WIRE_VERSION,
+            REMAP_CONTROL_COUNT as u8,
+        ];
+        for mask in identity.target_masks {
+            wire.extend_from_slice(&mask.to_le_bytes()[..REMAP_MASK_BYTES]);
+        }
+        wire.extend_from_slice(&7_u16.to_le_bytes());
+        wire.extend_from_slice(&[1, 3]);
+        let decoded = decode_button_mapping(&wire).unwrap();
+        assert_eq!(decoded.target_masks, identity.target_masks);
+        assert_eq!(decoded.revision, 7);
+
+        let mut legacy = vec![
+            REMAP_REPORT_ID,
+            REMAP_LEGACY_WIRE_VERSION,
+            REMAP_CONTROL_COUNT as u8,
+        ];
+        legacy.extend(0..REMAP_CONTROL_COUNT as u8);
+        let decoded = decode_button_mapping(&legacy).unwrap();
+        assert!(decoded.imported_legacy_v2);
+        assert!(decoded.is_identity());
+    }
+
+    #[test]
+    fn mapping_command_fits_one_feature_report() {
+        let identity = ButtonMapping::default();
+        let mut payload = vec![REMAP_WIRE_VERSION, REMAP_CONTROL_COUNT as u8];
+        for mask in identity.target_masks {
+            payload.extend_from_slice(&mask.to_le_bytes()[..REMAP_MASK_BYTES]);
+        }
+        payload.extend_from_slice(&identity.revision.to_le_bytes());
+        payload.push(0);
+        let report = feature_command_report(REMAP_REPORT_ID, 0x01, &payload).unwrap();
+        assert_eq!(report[0], REMAP_REPORT_ID);
+        assert_eq!(report[1], 0x01);
+        assert_eq!(report[2], REMAP_WIRE_VERSION);
+        assert_eq!(report[3], REMAP_CONTROL_COUNT as u8);
+        assert_eq!(report.len(), FEATURE_REPORT_SIZE);
+        assert_eq!(report[4], 1);
     }
 
     #[test]

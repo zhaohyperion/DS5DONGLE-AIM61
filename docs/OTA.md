@@ -1,6 +1,6 @@
 # M61 签名 A/B OTA 规范（协议 v2）
 
-本规范只适用于 **Ai-M61-32S-Kit / BL618 / USB High-Speed** 的 v3.5.2 常用版和诊断版。刷写器 v1.3.1 已实现原生 OTA 客户端，可在“设备调试”页执行 `standard ↔ diagnostic` 双向切换。公开配置网站和网页 OTA 已下线。
+本规范只适用于 **Ai-M61-32S-Kit / BL618 / USB High-Speed** 的 v3.6.0 常用版和诊断版。刷写器 v1.4.0 已实现原生 OTA 客户端，可在“固件刷写”页执行 `standard ↔ diagnostic` 双向切换。公开配置网站和网页 OTA 已下线。
 
 第一次部署、Boot2/分区表损坏或两槽均不可启动时，必须使用 CH340 UART 完整刷写。OTA 只更新应用 RAW 镜像，绝不能写入 Boot2、分区表、整片 Flash、PSM/KEY/DATA 或其他板卡的镜像。
 
@@ -12,14 +12,16 @@ A/B 槽位位于板载 SPI Flash，不在 PSRAM。备用 FW 槽允许的 RAW bod
 
 ## Release 资产
 
-v3.5.2 Release 只公开：
+v3.6.0 Release 只公开：
 
-- `DS5Dongle-aim61-hs-v3.5.2.zip`（Standard）；
-- `DS5Dongle-aim61-hs-diag-v3.5.2.zip`（Diagnostic）；
-- `DS5Dongle-Flasher-Windows-v1.3.1.exe`；
+- `DS5Dongle-aim61-hs-v3.6.0.zip`（Standard）；
+- `DS5Dongle-aim61-hs-diag-v3.6.0.zip`（Diagnostic）；
+- `DS5Dongle-Flasher-Windows-v1.4.0.exe`；
 - `SHA256SUMS.txt`。
 
-每份固件 ZIP 同时包含完整 UART 文件、一个 `.bin.ota` 和对应 `.ota.json`。裸 OTA 文件不单独公开。刷写器先验证 GitHub asset digest，再验证 ZIP 安全性、清单、RAW 头、完整镜像 SHA-256 和正文 SHA-256；设备最终验证签名和目标。
+每份固件 ZIP 同时包含完整 UART 文件、一个 `.bin.ota` 和对应 `.ota.json`。裸 OTA 文件不单独公开。刷写器先验证 GitHub asset digest，再验证 ZIP 安全性、清单、RAW 头、完整镜像 SHA-256、正文 SHA-256 和固定 P-256 公钥签名；设备最终再次验证签名和目标。
+
+“固件刷写”页也允许手动选择本地签名 OTA ZIP。本地文件执行与在线包相同的结构、目标、hash 和电脑端签名校验；用户确认执行前会重新读取并校验归档 SHA-256，防止选择后文件被替换。未签名包、错误密钥、非 AIM61 HS、多个 OTA 清单或清单/正文不一致均在传输前拒绝。本地打包脚本默认生成的 UART ZIP 不持有生产私钥，只有经过签名发布流程补入 `.bin.ota`/`.ota.json` 后才能用于此入口。
 
 ## RAW OTA 容器
 
@@ -30,7 +32,7 @@ Bouffalo SDK 输出：
 16..19  "RAW "
 20..23  body_size, uint32 LE
 32..47  hardware version
-48..63  "EVENT_V3.5.2\0"
+48..63  "EVENT_V3.6.0\0"
 64..95  SHA-256(body)
 512..   application body
 ```
@@ -46,12 +48,12 @@ Bouffalo SDK 输出：
   "board": "aim61",
   "usb_speed": "hs",
   "profile": "standard",
-  "version": "3.5.2",
+  "version": "3.6.0",
   "size": 906832,
   "sha256": "<完整 .bin.ota SHA-256>",
   "body_size": 906320,
   "body_sha256": "<正文 SHA-256>",
-  "url": "https://github.com/.../DS5Dongle-aim61-hs-v3.5.2.zip",
+  "url": "https://github.com/.../DS5Dongle-aim61-hs-v3.6.0.zip",
   "signature": {
     "algorithm": "ECDSA-P256-SHA256",
     "key_id": "local-m61-2026",
@@ -77,7 +79,7 @@ body_size                        4 bytes LE
 SHA-256(body)                   32 bytes
 ```
 
-签名是 ECDSA P-256/SHA-256 的 raw `r||s`，要求 canonical low-S。配置进入 canonical，因此不能把 Standard 的签名套到 Diagnostic，也不能签名后修改板型、速度、版本、长度或正文 hash。
+签名是 ECDSA P-256/SHA-256 的 raw `r||s`，要求 canonical low-S。配置进入 canonical，因此不能把 Standard 的签名套到 Diagnostic，也不能签名后修改板型、速度、版本、长度或正文 hash。Windows 工具内置发布公钥并使用完全相同的 58 字节 canonical 在传输前验签，固件端仍独立验签，任一侧失败都会中止。
 
 发布配置：
 
@@ -162,7 +164,7 @@ GET `0xFC` 返回 `len=44` 状态数据，frame argument 是 `accepted_offset`�
 6. 等待 READY_REBOOT 或计划内 USB 断开；重启后重新读取 `0xF8` 的 `版本|配置`。
 7. 任一步骤失败时尽力发送 ABORT；原活动槽不被替换。60 秒无活动自动 TIMEOUT。
 
-同版本只允许配置不同的显式切换；同版本同配置被拒绝，版本降级被拒绝。v3.5.2 回退 v3.5.1 必须走 UART 完整刷写。
+同版本只允许配置不同的显式切换；同版本同配置被拒绝，版本降级被拒绝。v3.6.0 回退 v3.5.x 必须走 UART 完整刷写。
 
 ## 固定协议向量
 
@@ -183,11 +185,11 @@ ERROR  = 4f5402ff78563412001000002c0611030100100000f02b0d0000821600fb03000001000
 ```powershell
 python tools\ota_release.py inspect --image build\build_out\ds5dongle_bl618_bl616.bin.ota
 python tools\ota_release.py generate --image <image.bin.ota> --manifest <profile.ota.json> `
-  --channel beta --version 3.5.2 --usb-speed hs --profile standard `
-  --url https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/download/v3.5.2/DS5Dongle-aim61-hs-v3.5.2.zip `
+  --channel beta --version 3.6.0 --usb-speed hs --profile standard `
+  --url https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/download/v3.6.0/DS5Dongle-aim61-hs-v3.6.0.zip `
   --private-key <private.pem> --key-id <key-id>
 python tools\ota_release.py verify --image <image.bin.ota> --manifest <profile.ota.json> `
   --public-key <public.pem> --expected-key-id <key-id>
 ```
 
-发布前应验证：正常升级、Standard/Diagnostic 双向切换、传输中掉电、签名/hash/目标错误拒绝、试运行失败回滚、配对与设置保留、UART 救援。v3.5.2 预发布按用户要求不等待真机测试，但不能把“CI 通过”描述成“真机已验证”。
+发布前应验证：正常升级、Standard/Diagnostic 双向切换、传输中掉电、签名/hash/目标错误拒绝、试运行失败回滚、配对、映射、宏与设置保留、UART 救援。v3.6.0 预发布按用户要求不等待真机测试，但不能把“CI 通过”描述成“真机已验证”。

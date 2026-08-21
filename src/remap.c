@@ -1,224 +1,272 @@
 #include "remap.h"
-#include "usb_gamepad.h"
 #include "debug_log.h"
 #include "easyflash.h"
-#include <string.h>
+#include "usb_gamepad.h"
 #include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
 
-/* ------------------------------------------------------------------ */
-/* Bit extraction helpers: indices into the 63-byte USB input payload  */
-/* p[7]:  dpad[3:0]  ■[4] ✕[5] ○[6] △[7]                           */
-/* p[8]:  L1[0] R1[1] L2[2] R2[3] Create[4] Options[5] L3[6] R3[7]  */
-/* p[9]:  PS[0] TP_click[1] Mute[2]                                   */
-/* ------------------------------------------------------------------ */
+#define REMAP_EF_KEY_V3 "btn_remap_v3"
+#define REMAP_EF_KEY_V2 "btn_remap_v2"
+#define REMAP_STORE_MAGIC 0x33504D52u /* RMP3 */
 
-/* Maps button ID → (byte_offset, bit_mask) in the 63-byte payload */
-static const struct { uint8_t off; uint8_t mask; } BTN_LOC[REMAP_BTN_COUNT] = {
-    [REMAP_BTN_SQUARE]   = { 7, 0x10 },
-    [REMAP_BTN_CROSS]    = { 7, 0x20 },
-    [REMAP_BTN_CIRCLE]   = { 7, 0x40 },
-    [REMAP_BTN_TRIANGLE] = { 7, 0x80 },
-    [REMAP_BTN_L1]       = { 8, 0x01 },
-    [REMAP_BTN_R1]       = { 8, 0x02 },
-    [REMAP_BTN_L2]       = { 8, 0x04 },
-    [REMAP_BTN_R2]       = { 8, 0x08 },
-    [REMAP_BTN_CREATE]   = { 8, 0x10 },
-    [REMAP_BTN_OPTIONS]  = { 8, 0x20 },
-    [REMAP_BTN_L3]       = { 8, 0x40 },
-    [REMAP_BTN_R3]       = { 8, 0x80 },
-    [REMAP_BTN_PS]       = { 9, 0x01 },
-    [REMAP_BTN_TP_CLICK] = { 9, 0x02 },
-    [REMAP_BTN_MUTE]     = { 9, 0x04 },
+typedef struct {
+    uint32_t magic;
+    uint16_t revision;
+    uint8_t version;
+    uint8_t count;
+    uint32_t masks[REMAP_BTN_COUNT];
+    uint32_t checksum;
+} remap_store_t;
+
+/* Retained v2 layout. The original key is not changed so rollback keeps the
+ * pre-upgrade mapping. */
+typedef struct {
+    uint8_t type;
+    uint8_t value;
+    uint8_t modifier;
+    uint8_t flags;
+} remap_v2_entry_t;
+
+static const struct { uint8_t off; uint8_t mask; } BTN_LOC[REMAP_DIGITAL_BTN_COUNT] = {
+    [REMAP_BTN_SQUARE] = { 7, 0x10 }, [REMAP_BTN_CROSS] = { 7, 0x20 },
+    [REMAP_BTN_CIRCLE] = { 7, 0x40 }, [REMAP_BTN_TRIANGLE] = { 7, 0x80 },
+    [REMAP_BTN_L1] = { 8, 0x01 }, [REMAP_BTN_R1] = { 8, 0x02 },
+    [REMAP_BTN_L2] = { 8, 0x04 }, [REMAP_BTN_R2] = { 8, 0x08 },
+    [REMAP_BTN_CREATE] = { 8, 0x10 }, [REMAP_BTN_OPTIONS] = { 8, 0x20 },
+    [REMAP_BTN_L3] = { 8, 0x40 }, [REMAP_BTN_R3] = { 8, 0x80 },
+    [REMAP_BTN_PS] = { 9, 0x01 }, [REMAP_BTN_TP_CLICK] = { 9, 0x02 },
+    [REMAP_BTN_MUTE] = { 9, 0x04 },
 };
 
-/* ------------------------------------------------------------------ */
-/* Module state                                                         */
-/* ------------------------------------------------------------------ */
+static uint32_t g_masks[REMAP_BTN_COUNT];
+static uint16_t g_revision;
+static bool g_identity;
 
-static remap_entry_t g_remap[REMAP_BTN_COUNT];
-static bool g_remap_is_identity = true;
-/* Last keyboard report sent to host — used for change detection and key-up */
-static uint8_t last_kbd_report[8];
-
-/* ------------------------------------------------------------------ */
-/* Internal helpers                                                     */
-/* ------------------------------------------------------------------ */
-
-static bool validate_entry(const remap_entry_t *e)
+static uint32_t checksum32(const uint8_t *data, size_t len)
 {
-    /* KBD type is reserved/disabled — treat as invalid to force identity */
-    if (e->type == REMAP_TYPE_BTN)
-        return e->value < REMAP_BTN_COUNT;
-    return false;
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    return hash;
 }
 
-static void sanitize_entry(remap_entry_t *e, uint8_t src_id)
+static void update_identity(void)
 {
-    if (!validate_entry(e))
-        *e = (remap_entry_t){ REMAP_TYPE_BTN, src_id, 0, 0 };
-}
-
-static void update_identity_cache(void)
-{
-    for (int i = 0; i < REMAP_BTN_COUNT; i++) {
-        if (g_remap[i].type   != REMAP_TYPE_BTN ||
-            g_remap[i].value  != (uint8_t)i     ||
-            g_remap[i].modifier != 0             ||
-            g_remap[i].flags  != 0) {
-            g_remap_is_identity = false;
-            return;
+    g_identity = true;
+    for (uint8_t i = 0; i < REMAP_BTN_COUNT; ++i) {
+        if (g_masks[i] != (1u << i)) {
+            g_identity = false;
+            break;
         }
     }
-    g_remap_is_identity = true;
+}
+
+static bool masks_valid(const uint32_t *masks)
+{
+    if (masks == NULL) return false;
+    for (uint8_t i = 0; i < REMAP_BTN_COUNT; ++i) {
+        if ((masks[i] & ~REMAP_TARGET_MASK) != 0) return false;
+    }
+    return true;
 }
 
 static inline uint8_t get_src_bit(const uint8_t *p, int id)
 {
-    return (p[BTN_LOC[id].off] & BTN_LOC[id].mask) ? 1u : 0u;
+    if (id < REMAP_DIGITAL_BTN_COUNT)
+        return (p[BTN_LOC[id].off] & BTN_LOC[id].mask) ? 1u : 0u;
+    const uint8_t hat = p[7] & 0x0Fu;
+    switch (id) {
+    case REMAP_BTN_DPAD_UP: return hat == 0 || hat == 1 || hat == 7;
+    case REMAP_BTN_DPAD_RIGHT: return hat == 1 || hat == 2 || hat == 3;
+    case REMAP_BTN_DPAD_DOWN: return hat == 3 || hat == 4 || hat == 5;
+    case REMAP_BTN_DPAD_LEFT: return hat == 5 || hat == 6 || hat == 7;
+    default: return 0;
+    }
 }
 
-/* ------------------------------------------------------------------ */
-/* Public API                                                           */
-/* ------------------------------------------------------------------ */
+static uint8_t encode_hat(uint8_t up, uint8_t right, uint8_t down, uint8_t left)
+{
+    if (up && down) up = down = 0;
+    if (left && right) left = right = 0;
+    if (up) return right ? 1 : (left ? 7 : 0);
+    if (down) return right ? 3 : (left ? 5 : 4);
+    if (right) return 2;
+    if (left) return 6;
+    return 8;
+}
 
 void remap_init(void)
 {
+    g_revision = 0;
     remap_reset();
-    memset(last_kbd_report, 0, sizeof(last_kbd_report));
 }
 
 void remap_reset(void)
 {
-    for (int i = 0; i < REMAP_BTN_COUNT; i++)
-        g_remap[i] = (remap_entry_t){ REMAP_TYPE_BTN, (uint8_t)i, 0, 0 };
-    g_remap_is_identity = true;
+    for (uint8_t i = 0; i < REMAP_BTN_COUNT; ++i) g_masks[i] = 1u << i;
+    if (++g_revision == 0) g_revision = 1;
+    g_identity = true;
 }
 
 void remap_load(void)
 {
+    remap_store_t stored;
     size_t len = 0;
-    ef_get_env_blob("btn_remap", g_remap, sizeof(g_remap), &len);
+    memset(&stored, 0, sizeof(stored));
+    ef_get_env_blob(REMAP_EF_KEY_V3, &stored, sizeof(stored), &len);
+    const uint32_t expected = checksum32((const uint8_t *)&stored,
+                                          offsetof(remap_store_t, checksum));
+    if (len == sizeof(stored) && stored.magic == REMAP_STORE_MAGIC &&
+        stored.version == REMAP_WIRE_VERSION && stored.count == REMAP_BTN_COUNT &&
+        stored.checksum == expected && masks_valid(stored.masks)) {
+        memcpy(g_masks, stored.masks, sizeof(g_masks));
+        g_revision = stored.revision ? stored.revision : 1;
+        update_identity();
+        LOG_INF("[REMAP] Loaded v3 revision %u, identity=%d\n",
+                g_revision, (int)g_identity);
+        return;
+    }
 
-    size_t n_loaded = len / sizeof(remap_entry_t);
+    remap_v2_entry_t old[REMAP_BTN_COUNT];
+    memset(old, 0, sizeof(old));
+    len = 0;
+    ef_get_env_blob(REMAP_EF_KEY_V2, old, sizeof(old), &len);
+    if (len > 0 && len <= sizeof(old) && len % sizeof(old[0]) == 0) {
+        remap_reset();
+        const size_t count = len / sizeof(old[0]);
+        for (size_t i = 0; i < count; ++i) {
+            if (old[i].type == 0 && old[i].value < REMAP_BTN_COUNT)
+                g_masks[i] = 1u << old[i].value;
+        }
+        update_identity();
+        (void)remap_save();
+        LOG_INF("[REMAP] Migrated %u v2 entries to v3\n", (unsigned)count);
+        return;
+    }
 
-    /* Sanitize what was loaded from flash (protect against bit-flip corruption) */
-    for (size_t i = 0; i < n_loaded; i++)
-        sanitize_entry(&g_remap[i], (uint8_t)i);
-
-    /* Fill any entries not present (first boot / new firmware adding buttons) */
-    for (size_t i = n_loaded; i < REMAP_BTN_COUNT; i++)
-        g_remap[i] = (remap_entry_t){ REMAP_TYPE_BTN, (uint8_t)i, 0, 0 };
-
-    update_identity_cache();
-    LOG_INF("[REMAP] Loaded %u/%u entries, identity=%d\n",
-            (unsigned)n_loaded, REMAP_BTN_COUNT, (int)g_remap_is_identity);
+    remap_reset();
+    LOG_INF("[REMAP] No valid mapping found; using identity v3\n");
 }
 
 bool remap_save(void)
 {
-    int r = ef_set_env_blob("btn_remap", g_remap, sizeof(g_remap));
-    return r == 0;
+    remap_store_t stored = {
+        .magic = REMAP_STORE_MAGIC,
+        .revision = g_revision,
+        .version = REMAP_WIRE_VERSION,
+        .count = REMAP_BTN_COUNT,
+    };
+    memcpy(stored.masks, g_masks, sizeof(g_masks));
+    stored.checksum = checksum32((const uint8_t *)&stored,
+                                  offsetof(remap_store_t, checksum));
+    return ef_set_env_blob(REMAP_EF_KEY_V3, &stored, sizeof(stored)) == 0;
 }
 
-void remap_set(const uint8_t *data, uint8_t len)
+bool remap_set_masks(const uint32_t *masks, uint8_t count,
+                     uint16_t expected_revision)
 {
-    if (len < REMAP_BTN_COUNT * sizeof(remap_entry_t))
-        return;
+    if (count != REMAP_BTN_COUNT || !masks_valid(masks)) return false;
+    if (expected_revision != 0xFFFFu && expected_revision != g_revision) return false;
+    memcpy(g_masks, masks, sizeof(g_masks));
+    if (++g_revision == 0) g_revision = 1;
+    update_identity();
+    return true;
+}
 
-    memcpy(g_remap, data, REMAP_BTN_COUNT * sizeof(remap_entry_t));
+void remap_get_masks(uint32_t *masks, uint8_t count)
+{
+    if (masks == NULL) return;
+    const uint8_t copy = count < REMAP_BTN_COUNT ? count : REMAP_BTN_COUNT;
+    memcpy(masks, g_masks, copy * sizeof(g_masks[0]));
+}
 
-    for (int i = 0; i < REMAP_BTN_COUNT; i++)
-        sanitize_entry(&g_remap[i], (uint8_t)i);
+uint16_t remap_revision(void) { return g_revision; }
 
-    update_identity_cache();
-    LOG_INF("[REMAP] Table updated, identity=%d\n", (int)g_remap_is_identity);
+uint32_t remap_physical_mask(const uint8_t *payload)
+{
+    uint32_t mask = 0;
+    if (payload == NULL) return 0;
+    for (uint8_t i = 0; i < REMAP_BTN_COUNT; ++i) {
+        if (get_src_bit(payload, i)) mask |= 1u << i;
+    }
+    return mask;
+}
+
+uint32_t remap_logical_mask(const uint8_t *payload)
+{
+    return remap_physical_mask(payload);
+}
+
+void remap_write_logical_mask(uint8_t *p, uint32_t mask,
+                              uint8_t l2_value, uint8_t r2_value)
+{
+    if (p == NULL) return;
+    mask &= REMAP_TARGET_MASK;
+    p[4] = (mask & (1u << REMAP_BTN_L2)) ? l2_value : 0;
+    p[5] = (mask & (1u << REMAP_BTN_R2)) ? r2_value : 0;
+    p[7] = encode_hat((mask >> REMAP_BTN_DPAD_UP) & 1u,
+                      (mask >> REMAP_BTN_DPAD_RIGHT) & 1u,
+                      (mask >> REMAP_BTN_DPAD_DOWN) & 1u,
+                      (mask >> REMAP_BTN_DPAD_LEFT) & 1u)
+         | ((mask & (1u << REMAP_BTN_SQUARE)) ? 0x10 : 0)
+         | ((mask & (1u << REMAP_BTN_CROSS)) ? 0x20 : 0)
+         | ((mask & (1u << REMAP_BTN_CIRCLE)) ? 0x40 : 0)
+         | ((mask & (1u << REMAP_BTN_TRIANGLE)) ? 0x80 : 0);
+    p[8] = ((mask & (1u << REMAP_BTN_L1)) ? 0x01 : 0)
+         | ((mask & (1u << REMAP_BTN_R1)) ? 0x02 : 0)
+         | ((mask & (1u << REMAP_BTN_L2)) ? 0x04 : 0)
+         | ((mask & (1u << REMAP_BTN_R2)) ? 0x08 : 0)
+         | ((mask & (1u << REMAP_BTN_CREATE)) ? 0x10 : 0)
+         | ((mask & (1u << REMAP_BTN_OPTIONS)) ? 0x20 : 0)
+         | ((mask & (1u << REMAP_BTN_L3)) ? 0x40 : 0)
+         | ((mask & (1u << REMAP_BTN_R3)) ? 0x80 : 0);
+    p[9] = (p[9] & 0xF8)
+         | ((mask & (1u << REMAP_BTN_PS)) ? 0x01 : 0)
+         | ((mask & (1u << REMAP_BTN_TP_CLICK)) ? 0x02 : 0)
+         | ((mask & (1u << REMAP_BTN_MUTE)) ? 0x04 : 0);
 }
 
 void remap_apply(uint8_t *p)
 {
-    if (g_remap_is_identity)
-        return;
-
-    /* Extract all source bits and analog values before modifying */
+    if (g_identity) return;
     uint8_t src[REMAP_BTN_COUNT];
-    for (int i = 0; i < REMAP_BTN_COUNT; i++)
-        src[i] = get_src_bit(p, i);
-    uint8_t analog_l2 = p[4];
-    uint8_t analog_r2 = p[5];
+    for (uint8_t i = 0; i < REMAP_BTN_COUNT; ++i) src[i] = get_src_bit(p, i);
+    const uint8_t analog_l2 = p[4], analog_r2 = p[5];
+    uint8_t dst[REMAP_BTN_COUNT] = { 0 };
+    uint8_t out_l2 = 0, out_r2 = 0;
 
-    /* Build dst from scratch */
-    uint8_t dst[REMAP_BTN_COUNT];
-    memset(dst, 0, sizeof(dst));
-
-    for (int i = 0; i < REMAP_BTN_COUNT; i++) {
-        if (!src[i])
-            continue;
-        if (g_remap[i].type == REMAP_TYPE_BTN) {
-            dst[g_remap[i].value] |= 1;
-        } else { /* REMAP_TYPE_KBD */
-            if (!(g_remap[i].flags & REMAP_FLAG_SUPPRESS))
-                dst[i] |= 1;  /* suppress=0: preserve gamepad bit */
+    for (uint8_t source = 0; source < REMAP_BTN_COUNT; ++source) {
+        if (!src[source]) continue;
+        const uint32_t mask = g_masks[source];
+        for (uint8_t target = 0; target < REMAP_BTN_COUNT; ++target) {
+            if ((mask & (1u << target)) == 0) continue;
+            dst[target] = 1;
+            const uint8_t value = source == REMAP_BTN_L2 ? analog_l2 :
+                                  source == REMAP_BTN_R2 ? analog_r2 : 0xFF;
+            if (target == REMAP_BTN_L2 && value > out_l2) out_l2 = value;
+            if (target == REMAP_BTN_R2 && value > out_r2) out_r2 = value;
         }
     }
 
-    /* L2/R2 symmetric analog swap */
-    if (g_remap[REMAP_BTN_L2].type  == REMAP_TYPE_BTN &&
-        g_remap[REMAP_BTN_L2].value == REMAP_BTN_R2   &&
-        g_remap[REMAP_BTN_R2].type  == REMAP_TYPE_BTN &&
-        g_remap[REMAP_BTN_R2].value == REMAP_BTN_L2) {
-        p[4] = analog_r2;
-        p[5] = analog_l2;
-    }
-
-    /* Write back button bytes, preserving d-pad nibble in byte 7 */
-    p[7] = (p[7] & 0x0F)
-         | (dst[REMAP_BTN_SQUARE]   ? 0x10 : 0)
-         | (dst[REMAP_BTN_CROSS]    ? 0x20 : 0)
-         | (dst[REMAP_BTN_CIRCLE]   ? 0x40 : 0)
+    p[4] = out_l2;
+    p[5] = out_r2;
+    p[7] = encode_hat(dst[REMAP_BTN_DPAD_UP], dst[REMAP_BTN_DPAD_RIGHT],
+                      dst[REMAP_BTN_DPAD_DOWN], dst[REMAP_BTN_DPAD_LEFT])
+         | (dst[REMAP_BTN_SQUARE] ? 0x10 : 0)
+         | (dst[REMAP_BTN_CROSS] ? 0x20 : 0)
+         | (dst[REMAP_BTN_CIRCLE] ? 0x40 : 0)
          | (dst[REMAP_BTN_TRIANGLE] ? 0x80 : 0);
-
-    p[8] = (dst[REMAP_BTN_L1]      ? 0x01 : 0)
-         | (dst[REMAP_BTN_R1]      ? 0x02 : 0)
-         | (dst[REMAP_BTN_L2]      ? 0x04 : 0)
-         | (dst[REMAP_BTN_R2]      ? 0x08 : 0)
-         | (dst[REMAP_BTN_CREATE]  ? 0x10 : 0)
-         | (dst[REMAP_BTN_OPTIONS] ? 0x20 : 0)
-         | (dst[REMAP_BTN_L3]      ? 0x40 : 0)
-         | (dst[REMAP_BTN_R3]      ? 0x80 : 0);
-
-    p[9] = (p[9] & 0xF8)
-         | (dst[REMAP_BTN_PS]       ? 0x01 : 0)
-         | (dst[REMAP_BTN_TP_CLICK] ? 0x02 : 0)
-         | (dst[REMAP_BTN_MUTE]     ? 0x04 : 0);
+    p[8] = (dst[REMAP_BTN_L1] ? 0x01 : 0) | (dst[REMAP_BTN_R1] ? 0x02 : 0)
+         | (dst[REMAP_BTN_L2] ? 0x04 : 0) | (dst[REMAP_BTN_R2] ? 0x08 : 0)
+         | (dst[REMAP_BTN_CREATE] ? 0x10 : 0) | (dst[REMAP_BTN_OPTIONS] ? 0x20 : 0)
+         | (dst[REMAP_BTN_L3] ? 0x40 : 0) | (dst[REMAP_BTN_R3] ? 0x80 : 0);
+    p[9] = (p[9] & 0xF8) | (dst[REMAP_BTN_PS] ? 0x01 : 0)
+         | (dst[REMAP_BTN_TP_CLICK] ? 0x02 : 0) | (dst[REMAP_BTN_MUTE] ? 0x04 : 0);
 }
 
-void remap_kbd_tick(const uint8_t *p)
-{
-    (void)p;
-    /* Keyboard mapping disabled — no keyboard interface in use */
-}
-
-void remap_on_disconnect(void)
-{
-    /* If keys were held when controller disconnected, send key-up to PC */
-    bool had_keys = (last_kbd_report[0] != 0);
-    for (int k = 2; !had_keys && k < 8; k++)
-        had_keys = (last_kbd_report[k] != 0);
-
-    if (had_keys && usb_gamepad_kbd_ready()) {
-        uint8_t zero[8] = { 0 };
-        usb_gamepad_send_kbd_report(zero, 8);
-    }
-    memset(last_kbd_report, 0, sizeof(last_kbd_report));
-}
-
-bool remap_has_kbd_targets(void)
-{
-    /* Keyboard mapping disabled */
-    return false;
-}
-
-const remap_entry_t *remap_get_table(void)
-{
-    return g_remap;
-}
+void remap_kbd_tick(const uint8_t *p) { (void)p; }
+void remap_on_disconnect(void) { }
+bool remap_has_kbd_targets(void) { return false; }

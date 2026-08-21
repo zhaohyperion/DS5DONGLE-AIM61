@@ -48,10 +48,10 @@ class OtaReleaseTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('FIRMWARE_VERSION: 3.5.2', workflow)
-        self.assertIn('PROJECT_SDK_VERSION: 3.5.2', workflow)
+        self.assertIn('FIRMWARE_VERSION: 3.6.0', workflow)
+        self.assertIn('PROJECT_SDK_VERSION: 3.6.0', workflow)
         self.assertIn('profile: [standard, diagnostic]', workflow)
-        self.assertIn('DS5Dongle-aim61-hs$suffix-v3.5.2.bin.ota', workflow)
+        self.assertIn('DS5Dongle-aim61-hs$suffix-v3.6.0.bin.ota', workflow)
         self.assertIn("foreach ($profile in @('standard', 'diagnostic'))", workflow)
         self.assertIn('--profile $profile', workflow)
         self.assertIn("secrets.OTA_P256_PRIVATE_KEY_B64", workflow)

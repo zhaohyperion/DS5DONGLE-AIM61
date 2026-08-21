@@ -1,10 +1,15 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+#[cfg(windows)]
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use super::{DUALSENSE_PRODUCT_IDS, SONY_VENDOR_ID};
+
+#[cfg(windows)]
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 const INPUT_REPORT_ID: u8 = 0x01;
 const OUTPUT_REPORT_ID: u8 = 0x02;
@@ -24,7 +29,7 @@ pub struct TouchPoint {
     pub y: u16,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputState {
     pub lx: u8,
@@ -64,6 +69,50 @@ pub struct InputState {
     pub headset_microphone_connected: bool,
     pub report_count: u64,
     pub report_rate_hz: f32,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            lx: 128,
+            ly: 128,
+            rx: 128,
+            ry: 128,
+            l2: 0,
+            r2: 0,
+            dpad: 8,
+            square: false,
+            cross: false,
+            circle: false,
+            triangle: false,
+            l1: false,
+            r1: false,
+            l2_button: false,
+            r2_button: false,
+            create: false,
+            options: false,
+            l3: false,
+            r3: false,
+            ps: false,
+            touchpad_click: false,
+            mute: false,
+            gyro_x: 0,
+            gyro_y: 0,
+            gyro_z: 0,
+            accel_x: 0,
+            accel_y: 0,
+            accel_z: 0,
+            touch: [TouchPoint::default(); 2],
+            battery_percent: None,
+            battery_charging: false,
+            battery_cable_connected: false,
+            battery_error: false,
+            headphone_connected: false,
+            headset_microphone_connected: false,
+            report_count: 0,
+            report_rate_hz: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -250,6 +299,8 @@ pub struct OutputState {
     pub mute_led: u8,
     pub left_trigger: TriggerPreset,
     pub right_trigger: TriggerPreset,
+    pub left_trigger_force: u8,
+    pub right_trigger_force: u8,
 }
 
 impl Default for OutputState {
@@ -263,6 +314,8 @@ impl Default for OutputState {
             mute_led: 0,
             left_trigger: TriggerPreset::Off,
             right_trigger: TriggerPreset::Off,
+            left_trigger_force: 230,
+            right_trigger_force: 230,
         }
     }
 }
@@ -890,6 +943,8 @@ fn guided_demo_frame(kind: GuidedOutputDemo, frame: usize) -> Option<(OutputStat
                     OutputState {
                         left_trigger: TriggerPreset::Resistance,
                         right_trigger: TriggerPreset::Resistance,
+                        left_trigger_force: 89,
+                        right_trigger_force: 89,
                         ..OutputState::default()
                     }
                 } else {
@@ -911,6 +966,7 @@ fn stress_output_state(elapsed: Duration) -> OutputState {
             player_leds: 0x05,
             left_trigger: TriggerPreset::Resistance,
             right_trigger: TriggerPreset::Off,
+            left_trigger_force: 70,
             ..OutputState::default()
         },
         1 => OutputState {
@@ -921,6 +977,7 @@ fn stress_output_state(elapsed: Duration) -> OutputState {
             player_leds: 0x0a,
             left_trigger: TriggerPreset::Off,
             right_trigger: TriggerPreset::Resistance,
+            right_trigger_force: 70,
             ..OutputState::default()
         },
         2 => OutputState {
@@ -931,6 +988,8 @@ fn stress_output_state(elapsed: Duration) -> OutputState {
             player_leds: 0x11,
             left_trigger: TriggerPreset::Resistance,
             right_trigger: TriggerPreset::Resistance,
+            left_trigger_force: 70,
+            right_trigger_force: 70,
             ..OutputState::default()
         },
         /* Five seconds of complete actuator release limits motor heating,
@@ -1100,33 +1159,33 @@ fn build_output_report_with_audio(
     data[41] = 0x02;
     data[42] = 0;
     data[43] = state.player_leds & 0x1f;
-    encode_trigger(data, 10, state.right_trigger);
-    encode_trigger(data, 21, state.left_trigger);
+    encode_trigger(data, 10, state.right_trigger, state.right_trigger_force);
+    encode_trigger(data, 21, state.left_trigger, state.left_trigger_force);
     if state.lightbar_enabled {
         data[44..47].copy_from_slice(&state.lightbar_rgb);
     }
     report
 }
 
-fn encode_trigger(data: &mut [u8], offset: usize, preset: TriggerPreset) {
+fn encode_trigger(data: &mut [u8], offset: usize, preset: TriggerPreset, force: u8) {
     data[offset..offset + 8].fill(0);
     match preset {
         TriggerPreset::Off => {}
         TriggerPreset::Resistance => {
             data[offset] = 0x01;
             data[offset + 1] = 40;
-            data[offset + 2] = 230;
+            data[offset + 2] = force;
         }
         TriggerPreset::Weapon => {
             data[offset] = 0x02;
             data[offset + 1] = 15;
             data[offset + 2] = 100;
-            data[offset + 3] = 255;
+            data[offset + 3] = force;
         }
         TriggerPreset::Automatic => {
             data[offset] = 0x06;
             data[offset + 1] = 10;
-            data[offset + 2] = 255;
+            data[offset + 2] = force;
             data[offset + 3] = 20;
         }
     }
@@ -1233,6 +1292,8 @@ pub enum AudioChannel {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MicrophoneTestMetrics {
+    pub capture_backend: String,
+    pub capture_endpoint: String,
     pub sample_rate_hz: u32,
     pub channels: u16,
     pub bits_per_sample: u16,
@@ -1245,6 +1306,14 @@ pub struct MicrophoneTestMetrics {
     pub silence_rms_percent: Option<f32>,
     pub signal_to_silence_db: Option<f32>,
     pub stereo_difference_rms_percent: Option<f32>,
+    pub playback_succeeded: bool,
+    pub playback_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MicrophoneTestResult {
+    pub metrics: MicrophoneTestMetrics,
+    pub wav: Vec<u8>,
 }
 
 fn make_test_wav(channel: AudioChannel) -> Vec<u8> {
@@ -1311,53 +1380,190 @@ fn play_wav_memory(_wav: &[u8]) -> Result<()> {
     bail!("audio tests are available on Windows only")
 }
 
-pub fn record_and_play_microphone(seconds: u32) -> Result<MicrophoneTestMetrics> {
+pub fn record_and_play_microphone(seconds: u32) -> Result<MicrophoneTestResult> {
     #[cfg(not(windows))]
     bail!("audio tests are available on Windows only");
 
     #[cfg(windows)]
     {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let path = std::env::temp_dir().join(format!("DS5Dongle-mic-test-{suffix}.wav"));
-        let path_text = path.to_string_lossy().replace('"', "");
-        let _ = mci("close ds5mic");
-        mci("open new type waveaudio alias ds5mic")?;
-        let result = (|| -> Result<()> {
-            mci("set ds5mic time format milliseconds")?;
-            // The firmware exposes the controller's mono source duplicated as
-            // 48 kHz, 16-bit stereo UAC1 input, so request that exact format.
-            mci(
-                "set ds5mic channels 2 samplespersec 48000 bitspersample 16 alignment 4 bytespersec 192000",
-            )?;
-            mci("record ds5mic")?;
-            thread::sleep(Duration::from_secs(
-                microphone_recording_seconds(seconds) as u64
-            ));
-            mci("stop ds5mic")?;
-            mci(&format!("save ds5mic \"{path_text}\""))?;
-            Ok(())
-        })();
-        let _ = mci("close ds5mic");
-        result?;
-
-        let analysis = std::fs::read(&path)
-            .context("unable to read the recorded microphone WAV")
-            .and_then(|wav| analyze_microphone_wav(&wav, seconds));
-        let _ = mci("close ds5play");
-        let playback = (|| -> Result<()> {
-            mci(&format!(
-                "open \"{path_text}\" type waveaudio alias ds5play"
-            ))?;
-            mci("play ds5play wait")
-        })();
-        let _ = mci("close ds5play");
-        let _ = std::fs::remove_file(&path);
-        playback?;
-        analysis
+        let (endpoint, sample_rate_hz, channels, samples) = capture_m61_microphone_wasapi(seconds)?;
+        let wav = make_pcm16_wav(&samples, sample_rate_hz, channels)?;
+        let mut metrics = analyze_microphone_wav(&wav, seconds)?;
+        metrics.capture_backend = "Windows WASAPI".to_owned();
+        metrics.capture_endpoint = endpoint;
+        match play_wav_memory(&wav) {
+            Ok(()) => {
+                metrics.playback_succeeded = true;
+                metrics.playback_error = None;
+            }
+            Err(error) => {
+                // Capture and signal analysis remain valid even when the
+                // independently selected Windows playback endpoint fails.
+                metrics.playback_succeeded = false;
+                metrics.playback_error = Some(format!("{error:#}"));
+            }
+        }
+        Ok(MicrophoneTestResult { metrics, wav })
     }
+}
+
+#[cfg(windows)]
+fn capture_m61_microphone_wasapi(seconds: u32) -> Result<(String, u32, u16, Vec<f32>)> {
+    let host = cpal::default_host();
+    let mut available = Vec::new();
+    let mut candidates = Vec::new();
+    for device in host
+        .input_devices()
+        .context("unable to enumerate Windows WASAPI input endpoints")?
+    {
+        let name = device
+            .name()
+            .unwrap_or_else(|_| "<unnamed input>".to_owned());
+        available.push(name.clone());
+        let lower = name.to_ascii_lowercase();
+        let rank = if lower.contains("dualsense wireless controller") {
+            Some(0_u8)
+        } else if lower.contains("m61") {
+            Some(1)
+        } else if lower.contains("wireless controller") {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(rank) = rank {
+            candidates.push((rank, name, device));
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.0);
+    let (_, endpoint_name, device) = candidates.into_iter().next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "M61/DualSense WASAPI microphone endpoint was not found; available inputs: {}",
+            if available.is_empty() {
+                "none".to_owned()
+            } else {
+                available.join(", ")
+            }
+        )
+    })?;
+
+    let mut configs = device
+        .supported_input_configs()
+        .context("unable to query the M61 WASAPI microphone formats")?
+        .collect::<Vec<_>>();
+    configs.sort_by_key(|range| {
+        let contains_48k =
+            range.min_sample_rate().0 <= 48_000 && range.max_sample_rate().0 >= 48_000;
+        (
+            !contains_48k,
+            range.channels() != 2,
+            match range.sample_format() {
+                cpal::SampleFormat::I16 => 0_u8,
+                cpal::SampleFormat::F32 => 1,
+                cpal::SampleFormat::U16 => 2,
+                _ => 3,
+            },
+        )
+    });
+    let range = configs
+        .into_iter()
+        .next()
+        .context("the M61 WASAPI endpoint exposes no supported input format")?;
+    let sample_rate = if range.min_sample_rate().0 <= 48_000 && range.max_sample_rate().0 >= 48_000
+    {
+        cpal::SampleRate(48_000)
+    } else {
+        range.max_sample_rate()
+    };
+    let sample_format = range.sample_format();
+    let supported = range.with_sample_rate(sample_rate);
+    let config = supported.config();
+    let channels = config.channels;
+    let capture_seconds = microphone_recording_seconds(seconds);
+    let max_samples = sample_rate.0 as usize * channels as usize * capture_seconds as usize;
+    let samples = Arc::new(Mutex::new(Vec::<f32>::with_capacity(max_samples)));
+    let callback_samples = Arc::clone(&samples);
+    let stream_error = Arc::new(Mutex::new(None::<String>));
+    let callback_error = Arc::clone(&stream_error);
+    let error_callback = move |error: cpal::StreamError| {
+        if let Ok(mut slot) = callback_error.lock() {
+            *slot = Some(error.to_string());
+        }
+    };
+
+    macro_rules! build_stream {
+        ($sample:ty, $convert:expr) => {{
+            let target = Arc::clone(&callback_samples);
+            device.build_input_stream(
+                &config,
+                move |data: &[$sample], _| {
+                    if let Ok(mut output) = target.lock() {
+                        let remaining = max_samples.saturating_sub(output.len());
+                        output.extend(data.iter().take(remaining).map($convert));
+                    }
+                },
+                error_callback,
+                None,
+            )
+        }};
+    }
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => build_stream!(f32, |sample: &f32| sample.clamp(-1.0, 1.0)),
+        cpal::SampleFormat::I16 => {
+            build_stream!(i16, |sample: &i16| *sample as f32 / i16::MAX as f32)
+        }
+        cpal::SampleFormat::U16 => build_stream!(u16, |sample: &u16| {
+            (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0
+        }),
+        other => bail!("unsupported M61 WASAPI sample format: {other:?}"),
+    }
+    .context("unable to open the selected M61 WASAPI microphone endpoint")?;
+    stream
+        .play()
+        .context("unable to start M61 WASAPI microphone capture")?;
+    thread::sleep(Duration::from_secs(capture_seconds as u64));
+    drop(stream);
+    if let Some(error) = stream_error.lock().ok().and_then(|mut value| value.take()) {
+        bail!("M61 WASAPI capture failed: {error}");
+    }
+    let captured = Arc::try_unwrap(samples)
+        .map_err(|_| anyhow::anyhow!("WASAPI capture buffer is still in use"))?
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("WASAPI capture buffer was poisoned"))?;
+    if captured.len() < sample_rate.0 as usize * channels as usize / 2 {
+        bail!(
+            "M61 WASAPI capture returned too little audio: {} samples",
+            captured.len()
+        );
+    }
+    Ok((endpoint_name, sample_rate.0, channels, captured))
+}
+
+#[cfg(windows)]
+fn make_pcm16_wav(samples: &[f32], sample_rate_hz: u32, channels: u16) -> Result<Vec<u8>> {
+    if channels == 0 || sample_rate_hz == 0 {
+        bail!("invalid WASAPI capture format");
+    }
+    let data_bytes =
+        u32::try_from(samples.len().saturating_mul(2)).context("captured WAV is too large")?;
+    let block_align = channels * 2;
+    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36_u32 + data_bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate_hz.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate_hz * block_align as u32).to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for sample in samples {
+        let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        wav.extend_from_slice(&pcm.to_le_bytes());
+    }
+    Ok(wav)
 }
 
 fn analyze_microphone_wav(wav: &[u8], requested_seconds: u32) -> Result<MicrophoneTestMetrics> {
@@ -1457,6 +1663,8 @@ fn analyze_microphone_wav(wav: &[u8], requested_seconds: u32) -> Result<Micropho
     });
 
     Ok(MicrophoneTestMetrics {
+        capture_backend: String::new(),
+        capture_endpoint: String::new(),
         sample_rate_hz,
         channels,
         bits_per_sample,
@@ -1470,6 +1678,8 @@ fn analyze_microphone_wav(wav: &[u8], requested_seconds: u32) -> Result<Micropho
         signal_to_silence_db,
         stereo_difference_rms_percent: (channels >= 2)
             .then_some((stereo_diff_squared / frame_count as f64).sqrt() as f32 * 100.0),
+        playback_succeeded: false,
+        playback_error: None,
     })
 }
 
@@ -1478,42 +1688,9 @@ fn microphone_recording_seconds(requested: u32) -> u32 {
 }
 
 #[cfg(windows)]
-fn mci(command: &str) -> Result<()> {
-    let wide: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
-    let code =
-        unsafe { mciSendStringW(wide.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
-    if code != 0 {
-        let mut detail = [0_u16; 256];
-        let described =
-            unsafe { mciGetErrorStringW(code, detail.as_mut_ptr(), detail.len() as u32) } != 0;
-        let detail = if described {
-            String::from_utf16_lossy(
-                &detail[..detail
-                    .iter()
-                    .position(|value| *value == 0)
-                    .unwrap_or(detail.len())],
-            )
-        } else {
-            "unknown Windows multimedia error".to_owned()
-        };
-        bail!(
-            "Windows audio command failed ({code}: {detail}) while running `{command}`; verify the M61 USB audio endpoint is enabled and selected as the Windows default device"
-        )
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
 #[link(name = "winmm")]
 unsafe extern "system" {
     fn PlaySoundW(sound: *const u16, module: *mut core::ffi::c_void, flags: u32) -> i32;
-    fn mciSendStringW(
-        command: *const u16,
-        return_string: *mut u16,
-        return_length: u32,
-        callback: *mut core::ffi::c_void,
-    ) -> u32;
-    fn mciGetErrorStringW(error_code: u32, error_text: *mut u16, error_text_length: u32) -> i32;
 }
 
 #[cfg(test)]
@@ -1589,14 +1766,16 @@ mod tests {
             mute_led: 1,
             left_trigger: TriggerPreset::Resistance,
             right_trigger: TriggerPreset::Weapon,
+            left_trigger_force: 111,
+            right_trigger_force: 222,
         };
         let report = build_output_report(&state);
         assert_eq!(report.len(), 48);
         assert_eq!(report[0], OUTPUT_REPORT_ID);
         assert_eq!(report[1], 0x0f);
         assert_eq!(report[2], 0x15);
-        assert_eq!(&report[11..15], &[2, 15, 100, 255]);
-        assert_eq!(&report[22..25], &[1, 40, 230]);
+        assert_eq!(&report[11..15], &[2, 15, 100, 222]);
+        assert_eq!(&report[22..25], &[1, 40, 111]);
         assert_eq!(&report[45..48], &[1, 2, 3]);
     }
 

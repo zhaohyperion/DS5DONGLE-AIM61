@@ -14,6 +14,10 @@ enum led_pattern {
     LED_BLINK_TRIPLE,      /* Triple flash — bonds cleared */
     LED_BLINK_BATTERY,     /* Red blink — critical battery (<=10%) */
     LED_BLINK_BATTERY_WARN,/* Yellow blink — low battery (<=20%) */
+    LED_YELLOW_SOLID,      /* Macro recorder countdown */
+    LED_RED_BLINK_SLOW,    /* Macro recorder >=80% */
+    LED_RED_BLINK_FAST,    /* Macro recorder full/error */
+    LED_GREEN_BLINK_TRIPLE,/* Macro recorder saved */
 };
 
 void led_status_init(void);

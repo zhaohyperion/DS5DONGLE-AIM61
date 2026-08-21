@@ -16,6 +16,7 @@
 #include "config.h"
 #include "dse.h"
 #include "remap.h"
+#include "macro_engine.h"
 #include "ota_update.h"
 #include "runtime_diag.h"
 
@@ -499,6 +500,7 @@ static void on_hid_state(enum bt_hid_host_state state)
         dse_reset();
         audio_reset();
         remap_on_disconnect();
+        macro_engine_on_disconnect();
         if (wake_usb && usb_task_handle)
             xTaskAbortDelay(usb_task_handle);
         if (was_connected && !ota_maintenance_mode &&
@@ -1437,8 +1439,11 @@ static void usb_task(void *arg)
                 last_policy_us = now_us;
             }
 
+            macro_engine_observe_raw(raw_report + 2, now_us);
             remap_kbd_tick(raw_report + 2);
             remap_apply(raw_report + 2);
+            macro_engine_record_mapped(raw_report + 2, now_us);
+            macro_engine_apply(raw_report + 2, now_us);
             if (publish_usb_input_for_epoch(
                     raw_report + 2, queued_input.connection_epoch, true,
                     queued_input.received_us)) {
@@ -1534,7 +1539,9 @@ static void usb_task(void *arg)
                         /*
                          * PS shortcut (matches DS5Dongle ps_shortcut.cpp):
                          *   short press → Win+G  (Game Bar)
-                         *   long press ≥ 750ms → Win+Tab (Task View)
+                         *   750..1999ms → Win+Tab on release
+                         *   ≥2s is reserved for macro emergency stop; no
+                         *   Windows shortcut is emitted for that hold.
                          *   50ms debounce, 30ms key hold before release
                          */
                         if (ps_shortcut_enabled) {
@@ -1552,36 +1559,29 @@ static void usb_task(void *arg)
                                 ps_press_us = now_us;
                                 ps_was_pressed = true;
                                 ps_long_fired = false;
-                            } else if (ps_debounced && ps_was_pressed) {
-                                if (!ps_long_fired &&
-                                    (now_us - ps_press_us >= 750000ULL) &&
-                                    usb_gamepad_kbd_ready_at(now_us)) {
-                                    uint8_t kbd[8] = {0x08, 0, 0x2B,
-                                                      0, 0, 0, 0, 0};
-                                    usb_gamepad_send_kbd_report(kbd, sizeof(kbd));
-                                    LOG_INF("[PS] Hold -> Win+Tab\n");
-                                    ps_long_fired = true;
-                                    ps_key_pending = true;
-                                    ps_key_rel_us = now_us + 30000ULL;
-                                }
                             } else if (!ps_debounced && ps_was_pressed) {
                                 if (!ps_long_fired &&
                                     usb_gamepad_kbd_ready_at(now_us)) {
-                                    if (now_us - ps_press_us >= 750000ULL) {
+                                    const uint64_t held_us = now_us - ps_press_us;
+                                    if (held_us >= 2000000ULL) {
+                                        LOG_INF("[PS] Emergency hold; shortcut suppressed\n");
+                                    } else if (held_us >= 750000ULL) {
                                         uint8_t kbd[8] = {0x08, 0, 0x2B,
                                                           0, 0, 0, 0, 0};
                                         usb_gamepad_send_kbd_report(kbd,
                                                                     sizeof(kbd));
-                                        LOG_INF("[PS] Long press -> Win+Tab\n");
+                                        ps_key_pending = true;
+                                        ps_key_rel_us = now_us + 30000ULL;
+                                        LOG_INF("[PS] Long release -> Win+Tab\n");
                                     } else {
                                         uint8_t kbd[8] = {0x08, 0, 0x0A,
                                                           0, 0, 0, 0, 0};
                                         usb_gamepad_send_kbd_report(kbd,
                                                                     sizeof(kbd));
+                                        ps_key_pending = true;
+                                        ps_key_rel_us = now_us + 30000ULL;
                                         LOG_INF("[PS] Short press -> Win+G\n");
                                     }
-                                    ps_key_pending = true;
-                                    ps_key_rel_us = now_us + 30000ULL;
                                 }
                                 ps_was_pressed = false;
                             }
@@ -1727,6 +1727,8 @@ int main(void)
     config_load();
     remap_init();
     remap_load();
+    bool macro_ok = (macro_engine_init() == 0);
+    LOG_INF("[B] macros: %s\n", macro_ok ? "OK" : "FAIL");
     led_status_init();
     led_status_set(LED_PURPLE_BLINK_SLOW);
     boot_button_init();

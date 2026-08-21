@@ -19,6 +19,9 @@ const DATA_BYTES_MAX: usize = 46;
 const OTA_HEADER_SIZE: usize = 512;
 const OTA_MAGIC: &[u8; 16] = b"BL60X_OTA_Ver1.0";
 const OTA_RAW_TYPE: &[u8; 4] = b"RAW ";
+const OTA_RELEASE_PUBLIC_KEY_SEC1_B64: &str =
+    "BMquuIp6ocsO2MsjrjjB5a67pWJDHNL27+OcZx6hbUGDzcJ6higdFgtJv7iLV/QEYcuuMiizffKnbuoN+kxnCNc=";
+const OTA_RELEASE_KEY_ID: &str = "local-m61-2026";
 
 const CTRL_BEGIN: u8 = 0x01;
 const CTRL_AUTH: u8 = 0x02;
@@ -70,6 +73,34 @@ struct OtaPackage {
     version: [u8; 3],
     profile: BuildProfile,
     signature: [u8; 64],
+    version_text: String,
+    channel: String,
+    key_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct OtaPackageInfo {
+    pub profile: BuildProfile,
+    pub version: String,
+    pub channel: String,
+    pub key_id: String,
+    pub image_size: usize,
+    pub archive_sha256: String,
+}
+
+pub fn inspect_zip(path: &Path) -> Result<OtaPackageInfo> {
+    let profile = manifest_profile(path)?;
+    let package = load_ota_package(path, profile)?;
+    Ok(OtaPackageInfo {
+        profile: package.profile,
+        version: package.version_text,
+        channel: package.channel,
+        key_id: package.key_id,
+        image_size: package.image.len(),
+        archive_sha256: hex_digest(
+            &std::fs::read(path).with_context(|| format!("cannot hash {}", path.display()))?,
+        ),
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,13 +192,49 @@ fn load_ota_package(path: &Path, expected_profile: BuildProfile) -> Result<OtaPa
     let manifest: OtaManifest =
         serde_json::from_slice(&manifest.context("firmware ZIP has no .ota.json manifest")?)
             .context("invalid OTA manifest JSON")?;
-    validate_package(image, manifest, expected_profile)
+    validate_package(image, manifest, expected_profile, true)
+}
+
+fn manifest_profile(path: &Path) -> Result<BuildProfile> {
+    let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("invalid firmware ZIP")?;
+    let mut profile = None;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry
+            .enclosed_name()
+            .and_then(|path| path.file_name().map(|name| name.to_owned()))
+            .ok_or_else(|| anyhow!("unsafe ZIP path: {}", entry.name()))?
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if name.ends_with(".ota.json") {
+            if profile.is_some() {
+                bail!("firmware ZIP contains multiple OTA manifests");
+            }
+            if entry.size() > 64 * 1024 {
+                bail!("OTA manifest is too large");
+            }
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut bytes)?;
+            let manifest: OtaManifest =
+                serde_json::from_slice(&bytes).context("invalid OTA manifest JSON")?;
+            if manifest.schema != 1 || manifest.board != "aim61" || manifest.usb_speed != "hs" {
+                bail!("local OTA package is not for AIM61 High-Speed");
+            }
+            profile = Some(manifest.profile);
+        }
+    }
+    profile.context("firmware ZIP has no .ota.json manifest")
 }
 
 fn validate_package(
     image: Vec<u8>,
     manifest: OtaManifest,
     expected_profile: BuildProfile,
+    verify_signature: bool,
 ) -> Result<OtaPackage> {
     if manifest.schema != 1
         || manifest.board != "aim61"
@@ -222,6 +289,7 @@ fn validate_package(
     {
         bail!("OTA signature metadata is invalid")
     }
+    let key_id = signature.key_id.clone();
     let raw = base64::engine::general_purpose::STANDARD
         .decode(signature.value)
         .context("OTA signature is not valid base64")?;
@@ -229,12 +297,51 @@ fn validate_package(
         .try_into()
         .map_err(|_| anyhow!("OTA P-256 signature must be 64 bytes"))?;
 
+    if verify_signature {
+        if key_id != OTA_RELEASE_KEY_ID {
+            bail!(
+                "OTA signing key ID is not trusted by this tool: expected {}, got {}",
+                OTA_RELEASE_KEY_ID,
+                key_id
+            );
+        }
+        let mut canonical = Vec::with_capacity(58);
+        canonical.extend_from_slice(b"DS5DONGLE-OTA-V2");
+        canonical.extend_from_slice(&[
+            1,
+            1,
+            if expected_profile == BuildProfile::Diagnostic {
+                1
+            } else {
+                0
+            },
+        ]);
+        canonical.extend_from_slice(&version);
+        canonical.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        canonical.extend_from_slice(&body_hash);
+        if canonical.len() != 58 {
+            bail!("internal OTA signature canonical length mismatch");
+        }
+        let public_key = base64::engine::general_purpose::STANDARD
+            .decode(OTA_RELEASE_PUBLIC_KEY_SEC1_B64)
+            .context("embedded OTA release public key is invalid")?;
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_FIXED,
+            public_key,
+        )
+        .verify(&canonical, &signature)
+        .map_err(|_| anyhow!("OTA P-256 signature verification failed on this PC"))?;
+    }
+
     Ok(OtaPackage {
         image,
         body_sha256: body_hash,
         version,
         profile: expected_profile,
         signature,
+        version_text: manifest.version,
+        channel: manifest.channel,
+        key_id,
     })
 }
 
@@ -557,7 +664,7 @@ mod tests {
             url: "https://example.invalid/firmware.zip".to_owned(),
             signature: Some(OtaSignature {
                 algorithm: "ECDSA-P256-SHA256".to_owned(),
-                key_id: "test-key".to_owned(),
+                key_id: OTA_RELEASE_KEY_ID.to_owned(),
                 scope: "DS5DONGLE-OTA-V2".to_owned(),
                 value: base64::engine::general_purpose::STANDARD.encode([0x5a; 64]),
             }),
@@ -610,11 +717,20 @@ mod tests {
     #[test]
     fn validates_profile_bound_raw_package() {
         let (image, manifest) = package_fixture(BuildProfile::Diagnostic);
-        let package = validate_package(image.clone(), manifest, BuildProfile::Diagnostic).unwrap();
+        let package =
+            validate_package(image.clone(), manifest, BuildProfile::Diagnostic, false).unwrap();
         assert_eq!(package.image, image);
         assert_eq!(package.profile, BuildProfile::Diagnostic);
 
         let (image, manifest) = package_fixture(BuildProfile::Diagnostic);
-        assert!(validate_package(image, manifest, BuildProfile::Standard).is_err());
+        assert!(validate_package(image, manifest, BuildProfile::Standard, false).is_err());
+
+        let (image, manifest) = package_fixture(BuildProfile::Diagnostic);
+        let error = validate_package(image, manifest, BuildProfile::Diagnostic, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("P-256 signature verification failed")
+        );
     }
 }

@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File tools\m61-diagnostics.ps1 -SelfTest
 
 ## Firmware logging policy
 
-The v3.5.2 standard profile uses custom `LOG_LEVEL=0` and has no `0xFD` descriptor, publisher task, diagnostic report banks, or periodic diagnostic work. The diagnostic profile normally uses level 1. Detailed snapshots are produced only while a host has activated a diagnostic session.
+The v3.6.0 standard profile uses custom `LOG_LEVEL=0` and has no `0xFD` handler, publisher task, diagnostic report banks, or periodic diagnostic work. Standard and Diagnostic deliberately reserve the same `0xFD` descriptor entry so Windows cannot reuse incompatible HID preparsed data under the shared VID/PID. The diagnostic profile normally uses level 1. Detailed snapshots are produced only while a host has activated a diagnostic session.
 
 The following paths must never print or hex-dump payloads:
 
@@ -60,7 +60,9 @@ For AI-M61, native USB still requires the USB_DM/USB_DP/GND wiring described in 
 
 ## Vendor HID Feature Report `0xFD`
 
-Runtime diagnostics use local vendor Feature Report `0xFD`. It is deliberately separate from configuration reports `0xF6`-`0xF9`, remapping `0xFB`, and OTA reports `0xFA`/`0xFC`; it is never forwarded to the controller. Only the **diagnostic firmware profile** declares it. The standard profile does not expose `0xFD` for either DualSense or DualSense Edge.
+Runtime diagnostics use local vendor Feature Report `0xFD`. It is deliberately separate from configuration reports `0xF6`-`0xF9`, remapping `0xFB`, and OTA reports `0xFA`/`0xFC`; it is never forwarded to the controller. Both profiles reserve the same descriptor declaration for Windows compatibility, but only the **diagnostic firmware profile** implements its SET/GET handler and snapshot task. The standard profile is identified through `0xF8`, so the host never probes `0xFD` on it.
+
+The USB `bcdDevice` value is derived from the firmware version (v3.6.0 becomes 3.60). This invalidates Windows HID descriptor caches left by pre-v3.6 profile switches. If a stale device instance still returns an all-zero feature report, the native tool reports that condition explicitly instead of presenting a misleading CRC failure.
 
 The layouts below describe the 63-byte payload of Feature Report `0xFD`. CherryUSB internally prefixes that payload with the report ID, so the firmware class callback returns 64 bytes. Native host APIs may expose that prefix differently; it is never part of the CRC.
 

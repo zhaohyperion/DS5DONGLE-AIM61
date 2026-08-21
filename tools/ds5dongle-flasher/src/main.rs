@@ -4,10 +4,12 @@
 )]
 
 mod controller_analyzer;
+mod controller_model;
 mod device_config;
 mod device_test;
 mod diagnostics;
 mod guided_test;
+mod macro_config;
 mod ota_client;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -48,15 +50,15 @@ skip_mode = 0x0, 0x0
 boot2_isp_mode = 0
 
 [boot2]
-filedir = ./boot2_bl616_*.bin
+filedir = boot2_bl616_*.bin
 address = 0x000000
 
 [partition]
-filedir = ./partition.bin
+filedir = partition.bin
 address = 0xE000
 
 [FW]
-filedir = ./{firmware_name}
+filedir = {firmware_name}
 address = @partition
 "#
     )
@@ -529,7 +531,7 @@ fn print_help() {
          Usage: ds5dongle-flasher.exe [options]\n\n\
          Options:\n  \
            --board BOARD     aim61 (preferred), lctech616, or m0sdock\n  \
-           --usb-speed MODE  fs (recommended) or hs\n  \
+           --usb-speed MODE  hs (AIM61 recommended) or fs\n  \
            --port COM5       Select a serial/BootROM COM port\n  \
            --baud RATE       460800 (default) or 115200\n  \
            --list            List detected M61 CH340 devices\n  \
@@ -1121,18 +1123,19 @@ fn read_firmware_directory(path: &Path) -> Result<FirmwareSet> {
     )
     .context("invalid firmware.json")?;
     let checksum_path = path.join(CHECKSUM_MANIFEST_NAME);
-    let checksum = checksum_path
-        .is_file()
-        .then(|| fs::read_to_string(&checksum_path))
-        .transpose()
-        .context("failed to read SHA256 manifest")?;
+    let checksum = fs::read_to_string(&checksum_path).with_context(|| {
+        format!(
+            "local firmware directory is missing {}",
+            checksum_path.display()
+        )
+    })?;
     validate_firmware_set(
         path.display().to_string(),
         firmware_manifest.clone(),
         fs::read(path.join(&firmware_manifest.boot2)).context("missing boot2")?,
         fs::read(path.join(&firmware_manifest.partition)).context("missing partition.bin")?,
         fs::read(path.join(&firmware_manifest.firmware)).context("missing application firmware")?,
-        checksum.as_deref(),
+        Some(&checksum),
     )
 }
 
@@ -1296,6 +1299,7 @@ fn diagnostic_bundle_json(
     .context("unable to serialize diagnostic bundle")
 }
 
+#[cfg(test)]
 fn decode_firmware_version_report(report: &[u8]) -> Option<String> {
     decode_firmware_identity_report(report).map(|identity| identity.0)
 }
@@ -1407,6 +1411,65 @@ fn print_firmware_devices(devices: &[FirmwareDeviceInfo]) {
             device.product_id
         );
     }
+}
+
+#[cfg(windows)]
+fn wait_for_ota_reenumeration(profile: BuildProfile, expected_version: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let expected_profile = profile.label().to_ascii_lowercase();
+    let mut saw_disconnect = false;
+    let mut last_observed = "device has not reappeared".to_owned();
+    while Instant::now() < deadline {
+        match probe_firmware_devices() {
+            Ok(devices) if devices.is_empty() => {
+                saw_disconnect = true;
+                last_observed = "USB HID device disconnected".to_owned();
+            }
+            Ok(devices) => {
+                last_observed = devices
+                    .iter()
+                    .map(|device| format!("{}|{}", device.firmware_version, device.build_profile))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if devices.iter().any(|device| {
+                    device.build_profile.eq_ignore_ascii_case(&expected_profile)
+                        && device.firmware_version == expected_version
+                }) && (saw_disconnect || Instant::now() + Duration::from_secs(25) >= deadline)
+                {
+                    if profile == BuildProfile::Diagnostic {
+                        match diagnostics::probe_runtime_diagnostics() {
+                            Ok(reports)
+                                if reports.iter().any(|report| report.snapshot.is_some()) =>
+                            {
+                                return Ok(());
+                            }
+                            Ok(reports) => {
+                                last_observed = reports
+                                    .iter()
+                                    .filter_map(|report| report.error.as_deref())
+                                    .collect::<Vec<_>>()
+                                    .join("; ");
+                            }
+                            Err(error) => last_observed = error.to_string(),
+                        }
+                    } else {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(error) => {
+                saw_disconnect = true;
+                last_observed = error.to_string();
+            }
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    bail!(
+        "OTA transfer completed, but Windows did not re-enumerate AIM61 as {} {} within 30 seconds; last observed: {}. Reconnect the normal USB port and use Read device profile again",
+        expected_version,
+        profile.label(),
+        last_observed
+    )
 }
 
 fn choose_port(devices: &[&Ch340Device]) -> Result<String> {
@@ -1736,9 +1799,13 @@ enum GuiEvent {
     FirmwareDevices(std::result::Result<Vec<FirmwareDeviceInfo>, String>),
     PollingRate(std::result::Result<device_config::PollingRate, String>),
     PollingRateApplied(std::result::Result<device_config::ApplyResult, String>),
+    ButtonMapping(std::result::Result<device_config::ButtonMapping, String>),
+    ButtonMappingApplied(std::result::Result<device_config::ButtonMapping, String>),
+    DeviceMacros(std::result::Result<macro_config::MacroSet, String>),
+    DeviceMacrosApplied(std::result::Result<macro_config::MacroSet, String>),
     Diagnostics(std::result::Result<Vec<diagnostics::DeviceDiagnostic>, String>),
     AudioTestDone(std::result::Result<(), String>),
-    MicrophoneTestDone(std::result::Result<device_test::MicrophoneTestMetrics, String>),
+    MicrophoneTestDone(std::result::Result<device_test::MicrophoneTestResult, String>),
     OtaDone {
         profile: BuildProfile,
         result: std::result::Result<(), String>,
@@ -1762,8 +1829,17 @@ struct RetryState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppTab {
     TestCenter,
-    Flasher,
+    ButtonMapping,
     DeviceDebug,
+    Flasher,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MappingSubTab {
+    #[default]
+    Mapping,
+    MacroEditor,
+    DeviceMacros,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1785,6 +1861,509 @@ impl Language {
             Self::ZhCn => "简体中文",
             Self::En => "English",
         }
+    }
+}
+
+fn remap_control_label(control: usize, language: Language) -> &'static str {
+    match control {
+        0 => "□ Square",
+        1 => "× Cross",
+        2 => "○ Circle",
+        3 => "△ Triangle",
+        4 => "L1",
+        5 => "R1",
+        6 => "L2",
+        7 => "R2",
+        8 => language.tr("创建键", "Create"),
+        9 => language.tr("选项键", "Options"),
+        10 => "L3",
+        11 => "R3",
+        12 => "PS",
+        13 => language.tr("触摸板键", "Touchpad button"),
+        14 => language.tr("静音键", "Mute"),
+        15 => language.tr("方向键 上", "D-pad Up"),
+        16 => language.tr("方向键 右", "D-pad Right"),
+        17 => language.tr("方向键 下", "D-pad Down"),
+        18 => language.tr("方向键 左", "D-pad Left"),
+        _ => language.tr("未知", "Unknown"),
+    }
+}
+
+fn macro_editor_ui(
+    ui: &mut eframe::egui::Ui,
+    set: &mut macro_config::MacroSet,
+    selected_index: &mut usize,
+    status: &mut Option<String>,
+    language: Language,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button(language.tr("新增宏", "New macro")).clicked() {
+            let id = set.macros.iter().map(|item| item.id).max().unwrap_or(0) + 1;
+            let mut definition = macro_config::MacroDefinition::default();
+            definition.id = id;
+            definition.name = format!("Macro {id}");
+            set.macros.push(definition);
+            *selected_index = set.macros.len() - 1;
+        }
+        if ui
+            .add_enabled(
+                !set.macros.is_empty(),
+                eframe::egui::Button::new(language.tr("复制", "Duplicate")),
+            )
+            .clicked()
+        {
+            let source_index = (*selected_index).min(set.macros.len() - 1);
+            let source = set.macros[source_index].clone();
+            let mut copy = source;
+            copy.id = set.macros.iter().map(|item| item.id).max().unwrap_or(0) + 1;
+            copy.name.push_str(language.tr(" 副本", " copy"));
+            set.macros.push(copy);
+            *selected_index = set.macros.len() - 1;
+        }
+        if ui
+            .add_enabled(
+                !set.macros.is_empty(),
+                eframe::egui::Button::new(language.tr("删除", "Delete")),
+            )
+            .clicked()
+        {
+            let index = (*selected_index).min(set.macros.len() - 1);
+            set.macros.remove(index);
+            *selected_index = (*selected_index).min(set.macros.len().saturating_sub(1));
+        }
+        if ui.button(language.tr("导出 JSON", "Export JSON")).clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .set_file_name("DS5Dongle-macros.json")
+                .save_file()
+        {
+            match macro_config::export_json(set)
+                .and_then(|data| fs::write(&path, data).map_err(anyhow::Error::from))
+            {
+                Ok(()) => {
+                    *status = Some(format!(
+                        "{}: {}",
+                        language.tr("已导出", "Exported"),
+                        path.display()
+                    ))
+                }
+                Err(error) => {
+                    *status = Some(format!(
+                        "{}: {error:#}",
+                        language.tr("导出失败", "Export failed")
+                    ))
+                }
+            }
+        }
+        if ui.button(language.tr("导入 JSON", "Import JSON")).clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .pick_file()
+        {
+            let imported = fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|data| macro_config::import_json(&data));
+            match imported {
+                Ok(candidate) => {
+                    *set = candidate;
+                    *selected_index = 0;
+                    *status = Some(
+                        language
+                            .tr(
+                                "导入成功；内容仍是草稿，未写入设备。",
+                                "Imported as a draft; nothing was written to the device.",
+                            )
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    *status = Some(format!(
+                        "{}: {error:#}",
+                        language.tr("导入被拒绝", "Import rejected")
+                    ))
+                }
+            }
+        }
+    });
+    ui.add_space(8.0);
+
+    if set.macros.is_empty() {
+        notice(
+            ui,
+            NoticeTone::Info,
+            language.tr("尚无宏", "No macros yet"),
+            language.tr(
+                "新增宏或从设备导入独立录制内容。时序宏总开关默认关闭。",
+                "Create a macro or import a standalone recording. The master macro switch defaults to off.",
+            ),
+        );
+        return;
+    }
+
+    *selected_index = (*selected_index).min(set.macros.len() - 1);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(language.tr("当前宏", "Selected macro"));
+        eframe::egui::ComboBox::from_id_salt("macro_selection")
+            .selected_text(&set.macros[*selected_index].name)
+            .show_ui(ui, |ui| {
+                for (index, definition) in set.macros.iter().enumerate() {
+                    ui.selectable_value(selected_index, index, &definition.name);
+                }
+            });
+    });
+
+    let definition = &mut set.macros[*selected_index];
+    eframe::egui::Grid::new("macro_definition_grid")
+        .num_columns(2)
+        .spacing([18.0, 8.0])
+        .show(ui, |ui| {
+            ui.label(language.tr("名称", "Name"));
+            ui.text_edit_singleline(&mut definition.name);
+            ui.end_row();
+            ui.label(language.tr("设备档位", "Device profile"));
+            eframe::egui::ComboBox::from_id_salt("macro_profile")
+                .selected_text(format!("{}", definition.profile + 1))
+                .show_ui(ui, |ui| {
+                    for profile in 0..macro_config::PROFILE_COUNT {
+                        ui.selectable_value(
+                            &mut definition.profile,
+                            profile,
+                            format!("{}", profile + 1),
+                        );
+                    }
+                });
+            ui.end_row();
+            ui.label(language.tr("物理触发键", "Physical trigger"));
+            eframe::egui::ComboBox::from_id_salt("macro_trigger")
+                .selected_text(remap_control_label(
+                    usize::from(definition.trigger),
+                    language,
+                ))
+                .show_ui(ui, |ui| {
+                    for trigger in 0..device_config::REMAP_CONTROL_COUNT {
+                        ui.selectable_value(
+                            &mut definition.trigger,
+                            trigger as u8,
+                            remap_control_label(trigger, language),
+                        );
+                    }
+                });
+            ui.end_row();
+            ui.label(language.tr("触发方式", "Trigger mode"));
+            eframe::egui::ComboBox::from_id_salt("macro_trigger_mode")
+                .selected_text(match definition.trigger_mode {
+                    macro_config::TriggerMode::Press => language.tr("按下", "Press"),
+                    macro_config::TriggerMode::Release => language.tr("松开", "Release"),
+                    macro_config::TriggerMode::LongPress { .. } => {
+                        language.tr("长按", "Long press")
+                    }
+                    macro_config::TriggerMode::DoubleTap { .. } => {
+                        language.tr("双击", "Double tap")
+                    }
+                    macro_config::TriggerMode::Hold => language.tr("按住执行", "While held"),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut definition.trigger_mode,
+                        macro_config::TriggerMode::Press,
+                        language.tr("按下", "Press"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.trigger_mode,
+                        macro_config::TriggerMode::Release,
+                        language.tr("松开", "Release"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.trigger_mode,
+                        macro_config::TriggerMode::LongPress { threshold_ms: 600 },
+                        language.tr("长按", "Long press"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.trigger_mode,
+                        macro_config::TriggerMode::DoubleTap { window_ms: 300 },
+                        language.tr("双击", "Double tap"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.trigger_mode,
+                        macro_config::TriggerMode::Hold,
+                        language.tr("按住执行", "While held"),
+                    );
+                });
+            ui.end_row();
+            ui.label(language.tr("播放方式", "Playback"));
+            eframe::egui::ComboBox::from_id_salt("macro_playback")
+                .selected_text(match definition.playback_mode {
+                    macro_config::PlaybackMode::Once => language.tr("单次", "Once"),
+                    macro_config::PlaybackMode::Hold => language.tr("按住", "Hold"),
+                    macro_config::PlaybackMode::Repeat { .. } => language.tr("固定重复", "Repeat"),
+                    macro_config::PlaybackMode::LoopWhileHeld { .. } => {
+                        language.tr("按住循环", "Loop while held")
+                    }
+                    macro_config::PlaybackMode::ToggleLoop { .. } => {
+                        language.tr("切换循环", "Toggle loop")
+                    }
+                    macro_config::PlaybackMode::Turbo { .. } => language.tr("连发", "Turbo"),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut definition.playback_mode,
+                        macro_config::PlaybackMode::Once,
+                        language.tr("单次", "Once"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.playback_mode,
+                        macro_config::PlaybackMode::Hold,
+                        language.tr("按住", "Hold"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.playback_mode,
+                        macro_config::PlaybackMode::Repeat {
+                            count: 2,
+                            gap_ms: 50,
+                        },
+                        language.tr("固定重复", "Repeat"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.playback_mode,
+                        macro_config::PlaybackMode::LoopWhileHeld { gap_ms: 50 },
+                        language.tr("按住循环", "Loop while held"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.playback_mode,
+                        macro_config::PlaybackMode::ToggleLoop { gap_ms: 50 },
+                        language.tr("切换循环", "Toggle loop"),
+                    );
+                    ui.selectable_value(
+                        &mut definition.playback_mode,
+                        macro_config::PlaybackMode::Turbo {
+                            frequency_hz: 10,
+                            fixed_count: None,
+                        },
+                        language.tr("连发", "Turbo"),
+                    );
+                });
+            ui.end_row();
+        });
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(
+            &mut definition.enabled,
+            language.tr("启用此宏", "Enable macro"),
+        );
+        ui.checkbox(
+            &mut definition.trigger_passthrough,
+            language.tr("触发键透传", "Pass through trigger"),
+        );
+        if definition.recorded_on_device {
+            ui.colored_label(
+                COLOR_ACCENT,
+                language.tr("设备独立录制", "Recorded on device"),
+            );
+        }
+    });
+
+    match &mut definition.trigger_mode {
+        macro_config::TriggerMode::LongPress { threshold_ms } => {
+            ui.add(
+                eframe::egui::Slider::new(threshold_ms, 200..=3000)
+                    .text(language.tr("长按阈值 ms", "Long-press ms")),
+            );
+        }
+        macro_config::TriggerMode::DoubleTap { window_ms } => {
+            ui.add(
+                eframe::egui::Slider::new(window_ms, 100..=600)
+                    .text(language.tr("双击窗口 ms", "Double-tap ms")),
+            );
+        }
+        _ => {}
+    }
+    match &mut definition.playback_mode {
+        macro_config::PlaybackMode::Repeat { count, gap_ms } => {
+            ui.horizontal(|ui| {
+                ui.add(
+                    eframe::egui::DragValue::new(count)
+                        .range(1..=999)
+                        .prefix(language.tr("次数 ", "Count ")),
+                );
+                ui.add(
+                    eframe::egui::DragValue::new(gap_ms)
+                        .range(0..=60000)
+                        .prefix(language.tr("间隔 ms ", "Gap ms ")),
+                );
+            });
+        }
+        macro_config::PlaybackMode::LoopWhileHeld { gap_ms }
+        | macro_config::PlaybackMode::ToggleLoop { gap_ms } => {
+            ui.add(
+                eframe::egui::DragValue::new(gap_ms)
+                    .range(0..=60000)
+                    .prefix(language.tr("循环间隔 ms ", "Loop gap ms ")),
+            );
+        }
+        macro_config::PlaybackMode::Turbo {
+            frequency_hz,
+            fixed_count,
+        } => {
+            ui.horizontal(|ui| {
+                ui.add(eframe::egui::Slider::new(frequency_hz, 1..=50).text("Hz"));
+                let mut fixed = fixed_count.is_some();
+                if ui
+                    .checkbox(&mut fixed, language.tr("固定次数", "Fixed count"))
+                    .changed()
+                {
+                    *fixed_count = fixed.then_some(10);
+                }
+                if let Some(count) = fixed_count {
+                    ui.add(eframe::egui::DragValue::new(count).range(1..=999));
+                }
+            });
+        }
+        _ => {}
+    }
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.heading(language.tr("时间轴步骤", "Timeline steps"));
+        if ui.button(language.tr("添加步骤", "Add step")).clicked() {
+            definition.steps.push(macro_config::MacroStep::default());
+        }
+    });
+    let mut remove_step = None;
+    for (index, step) in definition.steps.iter_mut().enumerate() {
+        eframe::egui::CollapsingHeader::new(format!(
+            "{} {} · {} ms",
+            language.tr("步骤", "Step"),
+            index + 1,
+            u32::from(step.duration_ms) + u32::from(step.random_extra_ms)
+        ))
+        .id_salt(format!("macro_step_{index}"))
+        .default_open(index == 0)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    eframe::egui::DragValue::new(&mut step.duration_ms)
+                        .range(1..=60000)
+                        .prefix(language.tr("保持 ms ", "Hold ms ")),
+                );
+                ui.add(
+                    eframe::egui::DragValue::new(&mut step.random_extra_ms)
+                        .range(0..=60000)
+                        .prefix(language.tr("随机附加 0..", "Random extra 0..")),
+                );
+                if ui.button(language.tr("删除步骤", "Delete step")).clicked() {
+                    remove_step = Some(index);
+                }
+            });
+            let mut has_digital = step.digital_mask.is_some();
+            if ui
+                .checkbox(
+                    &mut has_digital,
+                    language.tr("更新数字按键", "Update digital controls"),
+                )
+                .changed()
+            {
+                step.digital_mask = has_digital.then_some(0);
+            }
+            if let Some(mask) = &mut step.digital_mask {
+                ui.horizontal_wrapped(|ui| {
+                    for target in 0..device_config::REMAP_CONTROL_COUNT {
+                        let bit = 1_u32 << target;
+                        let mut enabled = (*mask & bit) != 0;
+                        if ui
+                            .checkbox(&mut enabled, remap_control_label(target, language))
+                            .changed()
+                        {
+                            if enabled {
+                                *mask |= bit;
+                            } else {
+                                *mask &= !bit;
+                            }
+                        }
+                    }
+                });
+            }
+            let mut has_axes = step.axes.is_some();
+            if ui
+                .checkbox(
+                    &mut has_axes,
+                    language.tr("更新摇杆和扳机", "Update sticks and triggers"),
+                )
+                .changed()
+            {
+                step.axes = has_axes.then_some([128, 128, 128, 128, 0, 0]);
+            }
+            if let Some(axes) = &mut step.axes {
+                for (label, value) in ["LX", "LY", "RX", "RY", "L2", "R2"]
+                    .into_iter()
+                    .zip(axes.iter_mut())
+                {
+                    ui.add(eframe::egui::Slider::new(value, 0..=255).text(label));
+                }
+            }
+            let mut has_touch = step.touches.is_some();
+            if ui
+                .checkbox(
+                    &mut has_touch,
+                    language.tr("更新触摸点", "Update touch points"),
+                )
+                .changed()
+            {
+                step.touches = has_touch.then_some([macro_config::TouchPoint::default(); 2]);
+            }
+            if let Some(points) = &mut step.touches {
+                for (point_index, point) in points.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut point.active, format!("#{}", point_index + 1));
+                        ui.add(
+                            eframe::egui::DragValue::new(&mut point.x)
+                                .range(0..=1919)
+                                .prefix("X "),
+                        );
+                        ui.add(
+                            eframe::egui::DragValue::new(&mut point.y)
+                                .range(0..=1079)
+                                .prefix("Y "),
+                        );
+                    });
+                }
+            }
+        });
+    }
+    if let Some(index) = remove_step
+        && definition.steps.len() > 1
+    {
+        definition.steps.remove(index);
+    }
+
+    ui.add_space(8.0);
+    match set.validate() {
+        Ok(summary) => {
+            notice(
+                ui,
+                if summary.warnings.is_empty() {
+                    NoticeTone::Info
+                } else {
+                    NoticeTone::Warning
+                },
+                language.tr("离线校验通过", "Offline validation passed"),
+                &format!(
+                    "{} macros · {} steps · {} bytes / {} bytes",
+                    summary.macro_count,
+                    summary.step_count,
+                    summary.compiled_bytes,
+                    macro_config::MAX_DEVICE_BYTES
+                ),
+            );
+        }
+        Err(error) => notice(
+            ui,
+            NoticeTone::Warning,
+            language.tr("宏草稿不可写入", "Macro draft cannot be written"),
+            &format!("{error:#}"),
+        ),
+    }
+    if let Some(message) = status.as_deref() {
+        ui.add_space(6.0);
+        ui.label(eframe::egui::RichText::new(message).color(COLOR_TEXT_PRIMARY));
     }
 }
 
@@ -1849,6 +2428,17 @@ struct FlasherApp {
     loading_polling_rate: bool,
     applying_polling_rate: bool,
     polling_rate_error: Option<String>,
+    device_button_mapping: Option<device_config::ButtonMapping>,
+    selected_button_mapping: device_config::ButtonMapping,
+    mapping_sub_tab: MappingSubTab,
+    macro_set: macro_config::MacroSet,
+    selected_macro_index: usize,
+    macro_status: Option<String>,
+    loading_device_macros: bool,
+    applying_device_macros: bool,
+    loading_button_mapping: bool,
+    applying_button_mapping: bool,
+    button_mapping_error: Option<String>,
     runtime_diagnostics: Vec<diagnostics::DeviceDiagnostic>,
     device_test_session: Option<device_test::TestSession>,
     device_test_input: device_test::InputState,
@@ -1856,6 +2446,7 @@ struct FlasherApp {
     device_test_status: String,
     device_test_audio_busy: bool,
     last_microphone_metrics: Option<device_test::MicrophoneTestMetrics>,
+    last_microphone_wav: Option<Vec<u8>>,
     device_test_controller_tone: Option<device_test::ControllerAudioTarget>,
     device_test_connected: bool,
     controller_analyzer: controller_analyzer::ControllerAnalyzer,
@@ -1885,6 +2476,9 @@ struct FlasherApp {
     show_advanced_firmware: bool,
     firmware_mode: FirmwareMode,
     local_firmware: Option<FirmwareSet>,
+    local_firmware_path: Option<PathBuf>,
+    local_ota_path: Option<PathBuf>,
+    local_ota_info: Option<ota_client::OtaPackageInfo>,
     selected_port: Option<String>,
     baud: u32,
     loading_releases: bool,
@@ -1943,6 +2537,7 @@ struct UnifiedReportSummaryZhCn {
 
 impl FlasherApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         install_cjk_font(&cc.egui_ctx);
         configure_visual_style(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
@@ -1958,6 +2553,17 @@ impl FlasherApp {
             loading_polling_rate: false,
             applying_polling_rate: false,
             polling_rate_error: None,
+            device_button_mapping: None,
+            selected_button_mapping: device_config::ButtonMapping::default(),
+            mapping_sub_tab: MappingSubTab::Mapping,
+            macro_set: macro_config::MacroSet::default(),
+            selected_macro_index: 0,
+            macro_status: None,
+            loading_device_macros: false,
+            applying_device_macros: false,
+            loading_button_mapping: false,
+            applying_button_mapping: false,
+            button_mapping_error: None,
             runtime_diagnostics: Vec::new(),
             device_test_session: None,
             device_test_input: device_test::InputState::default(),
@@ -1967,6 +2573,7 @@ impl FlasherApp {
                 .to_owned(),
             device_test_audio_busy: false,
             last_microphone_metrics: None,
+            last_microphone_wav: None,
             device_test_controller_tone: None,
             device_test_connected: false,
             controller_analyzer: controller_analyzer::ControllerAnalyzer::default(),
@@ -2001,6 +2608,9 @@ impl FlasherApp {
             show_advanced_firmware: false,
             firmware_mode: FirmwareMode::Online,
             local_firmware: None,
+            local_firmware_path: None,
+            local_ota_path: None,
+            local_ota_info: None,
             selected_port: None,
             baud: 460_800,
             loading_releases: false,
@@ -2113,6 +2723,105 @@ impl FlasherApp {
         });
     }
 
+    fn refresh_button_mapping(&mut self) {
+        if self.loading_button_mapping || self.applying_button_mapping {
+            return;
+        }
+        self.loading_button_mapping = true;
+        self.button_mapping_error = None;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = device_config::read_button_mapping().map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::ButtonMapping(result));
+        });
+    }
+
+    fn apply_button_mapping(&mut self, mapping: device_config::ButtonMapping) {
+        if self.loading_button_mapping || self.applying_button_mapping || self.busy.is_some() {
+            return;
+        }
+        self.applying_button_mapping = true;
+        self.button_mapping_error = None;
+        self.status = self
+            .language
+            .tr(
+                "正在写入并校验 19 控件映射...",
+                "Writing and verifying the 19-control mapping...",
+            )
+            .to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result =
+                device_config::apply_button_mapping(&mapping).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::ButtonMappingApplied(result));
+        });
+    }
+
+    fn reset_button_mapping(&mut self) {
+        if self.loading_button_mapping || self.applying_button_mapping || self.busy.is_some() {
+            return;
+        }
+        self.applying_button_mapping = true;
+        self.button_mapping_error = None;
+        self.status = self
+            .language
+            .tr(
+                "正在恢复默认一对一映射...",
+                "Restoring the default one-to-one mapping...",
+            )
+            .to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result =
+                device_config::reset_button_mapping().map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::ButtonMappingApplied(result));
+        });
+    }
+
+    fn refresh_device_macros(&mut self) {
+        if self.loading_device_macros || self.applying_device_macros {
+            return;
+        }
+        self.loading_device_macros = true;
+        self.macro_status = Some(
+            self.language
+                .tr("正在读取设备宏...", "Reading device macros...")
+                .to_owned(),
+        );
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result =
+                macro_config::read_device_macro_set().map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::DeviceMacros(result));
+        });
+    }
+
+    fn apply_device_macros(&mut self) {
+        if self.loading_device_macros || self.applying_device_macros || self.busy.is_some() {
+            return;
+        }
+        if let Err(error) = self.macro_set.validate() {
+            self.macro_status = Some(format!("{error:#}"));
+            return;
+        }
+        self.applying_device_macros = true;
+        self.macro_status = Some(
+            self.language
+                .tr(
+                    "正在写入宏、切换事务槽并回读校验...",
+                    "Writing macros, switching the transactional slot, and verifying...",
+                )
+                .to_owned(),
+        );
+        let set = self.macro_set.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result =
+                macro_config::write_device_macro_set(&set).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::DeviceMacrosApplied(result));
+        });
+    }
+
     fn start_diagnostics(&mut self) {
         if self.loading_diagnostics || self.busy.is_some() {
             return;
@@ -2172,7 +2881,24 @@ impl FlasherApp {
                     };
                 }
                 device_test::TestEvent::Input(input) => {
-                    self.guided_test.observe(&input);
+                    let automatically_completed = self.guided_test.observe(&input);
+                    if !automatically_completed.is_empty() {
+                        let names = automatically_completed
+                            .iter()
+                            .map(|(zh, en)| self.language.tr(zh, en))
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        self.device_test_status = match self.language {
+                            Language::ZhCn => {
+                                format!("已自动完成：{names}；继续按当前提示操作")
+                            }
+                            Language::En => {
+                                format!(
+                                    "Automatically completed: {names}; continue with the current instruction"
+                                )
+                            }
+                        };
+                    }
                     self.controller_analyzer.observe(&input);
                     if self.calibration_postcheck_pending
                         && self.controller_analyzer.read_only_analysis_complete()
@@ -2383,6 +3109,42 @@ impl FlasherApp {
                 .map_err(|error| format!("{error:#}"));
             let _ = tx.send(GuiEvent::MicrophoneTestDone(result));
         });
+    }
+
+    fn save_microphone_wav(&mut self) {
+        let Some(wav) = self.last_microphone_wav.as_ref() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(self.language.tr(
+                "保存最近一次 M61 麦克风录音",
+                "Save the latest M61 microphone recording",
+            ))
+            .set_file_name(&format!(
+                "DS5Dongle-M61-microphone-{}.wav",
+                diagnostics::now_unix_ms()
+            ))
+            .add_filter("WAVE audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+        match fs::write(&path, wav) {
+            Ok(()) => {
+                self.status = match self.language {
+                    Language::ZhCn => format!("麦克风录音已保存：{}", path.display()),
+                    Language::En => format!("Microphone recording saved: {}", path.display()),
+                };
+                self.append_log(self.status.clone());
+            }
+            Err(error) => {
+                self.status = match self.language {
+                    Language::ZhCn => format!("保存麦克风录音失败：{error}"),
+                    Language::En => format!("Unable to save microphone recording: {error}"),
+                };
+                self.append_log(self.status.clone());
+            }
+        }
     }
 
     fn reset_test_outputs(&mut self) {
@@ -2655,11 +3417,7 @@ impl FlasherApp {
             }
             result_reasons.push("microphone_signal_insufficient");
         }
-        let guided_has_results = self
-            .guided_test
-            .phases
-            .iter()
-            .any(|phase| phase.result != guided_test::PhaseResult::Pending);
+        let guided_has_results = guided_test_has_data(&self.guided_test.phases);
         let phase_status = |id: &str| {
             self.guided_test
                 .phases
@@ -2706,6 +3464,9 @@ impl FlasherApp {
             self.calibration_postcheck_pending,
             self.last_microphone_metrics.as_ref(),
         );
+        let macro_validation = self.macro_set.validate().ok();
+        let macro_blob = self.macro_set.compile().ok();
+        let macro_blob_sha256 = macro_blob.as_ref().map(|blob| sha256(blob));
         let report = serde_json::json!({
             "schema": "ds5dongle-flasher-diagnostics/v2",
             "reportKind": "unifiedControllerAndDongleTest",
@@ -2721,8 +3482,34 @@ impl FlasherApp {
                 "serialDevices": serial_devices,
                 "firmwareDevices": firmware_devices,
             },
+            "deviceConfiguration": {
+                "pollingRate": self.device_polling_rate.map(device_config::PollingRate::label),
+                "buttonMappingProtocol": "v3-19-controls-multitarget",
+                "buttonMapping": &self.device_button_mapping,
+                "legacy15ButtonMappingImported": false,
+                "macroConfiguration": {
+                    "schema": self.macro_set.schema,
+                    "generation": self.macro_set.generation,
+                    "activeProfile": self.macro_set.active_profile,
+                    "globallyEnabled": self.macro_set.globally_enabled,
+                    "sequenceEnabled": self.macro_set.sequence_enabled,
+                    "repeatEnabled": self.macro_set.repeat_enabled,
+                    "macroCount": macro_validation.as_ref().map(|summary| summary.macro_count),
+                    "stepCount": macro_validation.as_ref().map(|summary| summary.step_count),
+                    "compiledBytes": macro_validation.as_ref().map(|summary| summary.compiled_bytes),
+                    "compiledSha256": macro_blob_sha256,
+                    "fullDefinitionsIncluded": false,
+                },
+            },
             "testCoverage": {
                 "guidedControllerTest": if self.guided_test.active { "running" } else if guided_has_results { "completeOrPartial" } else { "notTested" },
+                "automaticControllerInput": if self.guided_test.phases.iter().filter(|phase| phase.automatic).all(|phase| phase.result == guided_test::PhaseResult::Pass) {
+                    "complete"
+                } else if self.guided_test.phases.iter().filter(|phase| phase.automatic).any(|phase| !phase.samples.is_empty()) {
+                    "partial"
+                } else {
+                    "notTested"
+                },
                 "stickAnalysis": if stick_analysis.complete { "complete" } else if stick_analysis.left.samples > 0 || stick_analysis.right.samples > 0 { "partial" } else { "notTested" },
                 "performanceBenchmark": if self.device_debug_started.is_some() { "running" } else if self.device_debug_complete { "complete" } else if self.device_debug_metrics.sample_count > 0 { "partial" } else { "notTested" },
                 "runtimeSnapshots": if runtime_snapshot_available { "available" } else { "notAvailable" },
@@ -2739,6 +3526,19 @@ impl FlasherApp {
             "controllerTests": {
                 "liveInputSnapshot": &self.device_test_input,
                 "guidedPhases": &self.guided_test.phases,
+                "automaticInputCoverage": self.guided_test.phases.iter().filter(|phase| phase.automatic).map(|phase| serde_json::json!({
+                    "phase": phase.id,
+                    "completed": phase.completed_requirements(),
+                    "total": phase.requirements.len(),
+                    "coveragePercent": phase.coverage_percent() * 100.0,
+                    "missing": phase.missing_requirements().iter().map(|(key, observed, target)| serde_json::json!({
+                        "key": key,
+                        "observed": observed,
+                        "target": target,
+                    })).collect::<Vec<_>>(),
+                    "result": phase.result,
+                    "resultSource": phase.result_source,
+                })).collect::<Vec<_>>(),
                 "stickAnalysis": &stick_analysis,
                 "stickAnalysisCheckpoints": &self.controller_analysis_checkpoints,
                 "calibrationEvents": &self.calibration_events,
@@ -2791,7 +3591,7 @@ impl FlasherApp {
             "audioOutputMetrics": {
                 "method": "frozen ds.evua.cc-compatible HID 0x02/0x80 vectors",
             },
-            "userConfirmations": self.guided_test.phases.iter().map(|phase| serde_json::json!({
+            "userConfirmations": self.guided_test.phases.iter().filter(|phase| phase.result_source == guided_test::ResultSource::User).map(|phase| serde_json::json!({
                 "phase": phase.id, "result": phase.result, "note": phase.note,
             })).collect::<Vec<_>>(),
             "result": result,
@@ -2921,6 +3721,7 @@ impl FlasherApp {
         ));
 
         let tx = self.tx.clone();
+        let expected_version = release.tag.trim_start_matches('v').to_owned();
         thread::spawn(move || {
             // Let the test-center HID worker close its handle and reset outputs.
             thread::sleep(Duration::from_millis(350));
@@ -2936,15 +3737,132 @@ impl FlasherApp {
                 ota_client::update_from_zip(&temp_path, profile, |message| {
                     let _ = tx.send(GuiEvent::Log(message));
                 })?;
+                let _ = tx.send(GuiEvent::Log(
+                    "OTA transfer committed; waiting for Windows USB re-enumeration...".to_owned(),
+                ));
+                wait_for_ota_reenumeration(profile, &expected_version)?;
                 Ok(())
             })()
             .map_err(|error| format!("{error:#}"));
             let _ = fs::remove_file(&temp_path);
-            if result.is_ok() {
-                // Firmware waits before rebooting. Give Windows time to enumerate the new profile.
-                thread::sleep(Duration::from_secs(3));
-            }
             let _ = tx.send(GuiEvent::OtaDone { profile, result });
+        });
+    }
+
+    fn choose_local_ota_zip(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(self.language.tr(
+                "选择已签名的 AIM61 High-Speed OTA ZIP",
+                "Select a signed AIM61 High-Speed OTA ZIP",
+            ))
+            .add_filter("Signed DS5Dongle OTA ZIP", &["zip"])
+            .pick_file()
+        else {
+            return;
+        };
+        match ota_client::inspect_zip(&path) {
+            Ok(info) => {
+                self.status = match self.language {
+                    Language::ZhCn => format!(
+                        "本地 OTA 已通过电脑端验签：{} {} / {}",
+                        info.version,
+                        info.profile.localized_label(self.language),
+                        info.channel
+                    ),
+                    Language::En => format!(
+                        "Local OTA passed PC-side signature verification: {} {} / {}",
+                        info.version,
+                        info.profile.label(),
+                        info.channel
+                    ),
+                };
+                self.append_log(format!(
+                    "Local OTA verified: path={} version={} profile={} channel={} key={} bytes={} zip_sha256={}",
+                    path.display(),
+                    info.version,
+                    info.profile.label(),
+                    info.channel,
+                    info.key_id,
+                    info.image_size,
+                    info.archive_sha256
+                ));
+                self.local_ota_path = Some(path);
+                self.local_ota_info = Some(info);
+            }
+            Err(error) => {
+                self.local_ota_path = None;
+                self.local_ota_info = None;
+                self.status = self
+                    .language
+                    .tr(
+                        "本地 OTA ZIP 验证失败，未对设备进行任何操作。",
+                        "Local OTA ZIP verification failed; the device was not modified.",
+                    )
+                    .to_owned();
+                self.append_log(format!("Local OTA rejected: {error:#}"));
+            }
+        }
+    }
+
+    fn start_local_ota(&mut self) {
+        if self.busy.is_some()
+            || self.device_debug_started.is_some()
+            || self.guided_test.active
+            || self.device_test_audio_busy
+            || self.loading_diagnostics
+        {
+            self.status = self
+                .language
+                .tr(
+                    "请先结束测试、录音和快照采集，再执行本地 OTA。",
+                    "End tests, recording, and snapshot capture before local OTA.",
+                )
+                .to_owned();
+            return;
+        }
+        let (Some(path), Some(selected_info)) =
+            (self.local_ota_path.clone(), self.local_ota_info.clone())
+        else {
+            return;
+        };
+        if let Some(session) = self.device_test_session.take() {
+            let _ = session.stop_all();
+            session.shutdown();
+        }
+        self.device_test_connected = false;
+        self.busy = Some(
+            self.language
+                .tr("正在执行本地签名 OTA…", "Applying signed local OTA…")
+                .to_owned(),
+        );
+        self.status = self.language.tr(
+            "将再次校验文件、传输固件并验证 USB 重枚举；请勿断开供电。",
+            "The package will be verified again, transferred, and checked after USB re-enumeration. Keep USB power connected.",
+        ).to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let current_info = ota_client::inspect_zip(&path)?;
+                if current_info.profile != selected_info.profile
+                    || current_info.version != selected_info.version
+                    || current_info.key_id != selected_info.key_id
+                    || current_info.archive_sha256 != selected_info.archive_sha256
+                {
+                    bail!("local OTA package changed after it was selected");
+                }
+                ota_client::update_from_zip(&path, current_info.profile, |message| {
+                    let _ = tx.send(GuiEvent::Log(message));
+                })?;
+                let _ = tx.send(GuiEvent::Log(
+                    "Local OTA committed; waiting for Windows USB re-enumeration...".to_owned(),
+                ));
+                wait_for_ota_reenumeration(current_info.profile, &current_info.version)
+            })()
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(GuiEvent::OtaDone {
+                profile: selected_info.profile,
+                result,
+            });
         });
     }
 
@@ -2968,7 +3886,7 @@ impl FlasherApp {
         else {
             return;
         };
-        match read_firmware_zip(&path, false) {
+        match read_firmware_zip(&path, true) {
             Ok(set) => {
                 self.status = match self.language {
                     Language::ZhCn => format!("已读取本地固件：{}", set.label),
@@ -2989,9 +3907,11 @@ impl FlasherApp {
                     ),
                 });
                 self.local_firmware = Some(set);
+                self.local_firmware_path = Some(path);
             }
             Err(error) => {
                 self.local_firmware = None;
+                self.local_firmware_path = None;
                 self.status = self
                     .language
                     .tr("本地固件 ZIP 无效。", "The local firmware ZIP is invalid.")
@@ -3021,9 +3941,11 @@ impl FlasherApp {
                     Language::En => format!("Loaded local firmware directory: {}", set.label),
                 };
                 self.local_firmware = Some(set);
+                self.local_firmware_path = Some(path);
             }
             Err(error) => {
                 self.local_firmware = None;
+                self.local_firmware_path = None;
                 self.status = self
                     .language
                     .tr(
@@ -3190,6 +4112,13 @@ impl FlasherApp {
                         prepare_local_runtime(&set)?
                     }
                 };
+                let _ = tx.send(GuiEvent::Log(match language {
+                    Language::ZhCn => format!("Bouffalo 临时刷写目录：{}", runtime.path.display()),
+                    Language::En => format!(
+                        "Bouffalo temporary flashing directory: {}",
+                        runtime.path.display()
+                    ),
+                }));
                 let _ = tx.send(GuiEvent::Log(
                     language
                         .tr(
@@ -3515,6 +4444,99 @@ impl FlasherApp {
                         Language::En => format!("Failed to set polling mode: {error}"),
                     });
                 }
+                GuiEvent::ButtonMapping(Ok(mapping)) => {
+                    self.loading_button_mapping = false;
+                    self.selected_button_mapping = mapping.clone();
+                    self.device_button_mapping = Some(mapping);
+                    self.button_mapping_error = None;
+                    self.append_log(self.language.tr(
+                        "已读取设备的 19 控件映射。",
+                        "Read the device's 19-control mapping.",
+                    ));
+                }
+                GuiEvent::ButtonMapping(Err(error)) => {
+                    self.loading_button_mapping = false;
+                    self.device_button_mapping = None;
+                    self.button_mapping_error = Some(error.clone());
+                    self.append_log(match self.language {
+                        Language::ZhCn => format!("读取 19 控件映射失败：{error}"),
+                        Language::En => format!("Failed to read the 19-control mapping: {error}"),
+                    });
+                }
+                GuiEvent::ButtonMappingApplied(Ok(mapping)) => {
+                    self.applying_button_mapping = false;
+                    self.selected_button_mapping = mapping.clone();
+                    self.device_button_mapping = Some(mapping);
+                    self.button_mapping_error = None;
+                    self.status = self
+                        .language
+                        .tr(
+                            "19 控件映射已保存并回读校验成功。",
+                            "The 19-control mapping was saved and verified.",
+                        )
+                        .to_owned();
+                    self.append_log(self.status.clone());
+                }
+                GuiEvent::ButtonMappingApplied(Err(error)) => {
+                    self.applying_button_mapping = false;
+                    self.button_mapping_error = Some(error.clone());
+                    self.status = self
+                        .language
+                        .tr(
+                            "按键映射设置失败；设备仍保留上一次成功保存的映射。",
+                            "Button mapping failed; the device retains the last successfully saved mapping.",
+                        )
+                        .to_owned();
+                    self.append_log(match self.language {
+                        Language::ZhCn => format!("设置 19 控件映射失败：{error}"),
+                        Language::En => format!("Failed to set the 19-control mapping: {error}"),
+                    });
+                }
+                GuiEvent::DeviceMacros(Ok(set)) => {
+                    self.loading_device_macros = false;
+                    self.selected_macro_index = self
+                        .selected_macro_index
+                        .min(set.macros.len().saturating_sub(1));
+                    self.macro_set = set;
+                    self.macro_status = Some(
+                        self.language
+                            .tr(
+                                "设备宏读取完成；独立录制内容也已载入编辑器。",
+                                "Device macros loaded, including standalone recordings.",
+                            )
+                            .to_owned(),
+                    );
+                    self.append_log(self.macro_status.clone().unwrap_or_default());
+                }
+                GuiEvent::DeviceMacros(Err(error)) => {
+                    self.loading_device_macros = false;
+                    self.macro_status = Some(match self.language {
+                        Language::ZhCn => format!("读取设备宏失败：{error}"),
+                        Language::En => format!("Failed to read device macros: {error}"),
+                    });
+                    self.append_log(self.macro_status.clone().unwrap_or_default());
+                }
+                GuiEvent::DeviceMacrosApplied(Ok(set)) => {
+                    self.applying_device_macros = false;
+                    self.macro_set = set;
+                    self.macro_status = Some(
+                        self.language
+                            .tr(
+                                "宏已保存到设备 A/B 存储并回读校验成功。",
+                                "Macros were saved to transactional A/B storage and verified.",
+                            )
+                            .to_owned(),
+                    );
+                    self.append_log(self.macro_status.clone().unwrap_or_default());
+                }
+                GuiEvent::DeviceMacrosApplied(Err(error)) => {
+                    self.applying_device_macros = false;
+                    self.macro_status = Some(match self.language {
+                        Language::ZhCn => format!("写入设备宏失败：{error}"),
+                        Language::En => format!("Failed to write device macros: {error}"),
+                    });
+                    self.append_log(self.macro_status.clone().unwrap_or_default());
+                }
                 GuiEvent::Diagnostics(Ok(reports)) => {
                     self.loading_diagnostics = false;
                     self.diagnostics_error = None;
@@ -3547,6 +4569,11 @@ impl FlasherApp {
                         .iter()
                         .filter(|report| report.snapshot.is_some())
                         .count();
+                    let standard_only = !self.runtime_diagnostics.is_empty()
+                        && self.runtime_diagnostics.iter().all(|report| {
+                            report.build_profile.as_deref() == Some("standard")
+                                && report.error.is_none()
+                        });
                     if captured > 0 {
                         self.status = match self.language {
                             Language::ZhCn => format!("一键诊断完成：已读取 {captured} 台设备。"),
@@ -3568,6 +4595,14 @@ impl FlasherApp {
                             .tr(
                                 "未检测到运行中的 DS5DONGLE-AIM61。串口环境结果仍可查看。",
                                 "No running DS5DONGLE-AIM61 was detected. Serial diagnostics are still available.",
+                            )
+                            .to_owned();
+                    } else if standard_only {
+                        self.status = self
+                            .language
+                            .tr(
+                                "已识别常用版固件；0xFD 运行快照仅由诊断版生成。",
+                                "Standard firmware identified; only Diagnostic produces 0xFD runtime snapshots.",
                             )
                             .to_owned();
                     } else {
@@ -3622,10 +4657,12 @@ impl FlasherApp {
                 GuiEvent::MicrophoneTestDone(result) => {
                     self.device_test_audio_busy = false;
                     match result {
-                        Ok(metrics) => {
+                        Ok(recording) => {
+                            let metrics = recording.metrics;
                             self.device_test_status = match self.language {
                                 Language::ZhCn => format!(
-                                    "麦克风测试完成：RMS {:.2}%，峰值 {:.2}%，有效声音窗口 {} 个，{}。请回听确认清晰度。",
+                                    "麦克风测试完成（{}）：RMS {:.2}%，峰值 {:.2}%，有效声音窗口 {} 个，{}；回放{}。",
+                                    metrics.capture_endpoint,
                                     metrics.rms_percent,
                                     metrics.peak_percent,
                                     metrics.active_windows,
@@ -3634,9 +4671,15 @@ impl FlasherApp {
                                     } else {
                                         "未检测到足够的有效声音"
                                     },
+                                    if metrics.playback_succeeded {
+                                        "成功，请确认清晰度"
+                                    } else {
+                                        "失败，录音指标和 WAV 仍可保存"
+                                    },
                                 ),
                                 Language::En => format!(
-                                    "Microphone test completed: RMS {:.2}%, peak {:.2}%, {} active windows; {}. Confirm clarity by listening.",
+                                    "Microphone test completed ({}): RMS {:.2}%, peak {:.2}%, {} active windows; {}; playback {}.",
+                                    metrics.capture_endpoint,
                                     metrics.rms_percent,
                                     metrics.peak_percent,
                                     metrics.active_windows,
@@ -3645,11 +4688,18 @@ impl FlasherApp {
                                     } else {
                                         "insufficient signal"
                                     },
+                                    if metrics.playback_succeeded {
+                                        "succeeded; confirm clarity"
+                                    } else {
+                                        "failed; metrics and WAV remain available"
+                                    },
                                 ),
                             };
+                            self.last_microphone_wav = Some(recording.wav);
                             self.last_microphone_metrics = Some(metrics);
                         }
                         Err(error) => {
+                            self.last_microphone_wav = None;
                             self.device_test_status = match self.language {
                                 Language::ZhCn => format!("麦克风测试失败：{error}"),
                                 Language::En => format!("Microphone test failed: {error}"),
@@ -3664,16 +4714,16 @@ impl FlasherApp {
                         Ok(()) => {
                             self.status = match (self.language, profile) {
                                 (Language::ZhCn, BuildProfile::Standard) => {
-                                    "常用版 OTA 已完成，设备已重新启动。".to_owned()
+                                    "常用版 OTA 已完成，并已验证设备重新枚举和固件身份。".to_owned()
                                 }
                                 (Language::ZhCn, BuildProfile::Diagnostic) => {
-                                    "诊断版 OTA 已完成，设备已重新启动。".to_owned()
+                                    "诊断版 OTA 已完成，并已验证设备重新枚举和固件身份。".to_owned()
                                 }
                                 (Language::En, BuildProfile::Standard) => {
-                                    "Standard OTA completed and the device restarted.".to_owned()
+                                    "Standard OTA completed; USB re-enumeration and firmware identity were verified.".to_owned()
                                 }
                                 (Language::En, BuildProfile::Diagnostic) => {
-                                    "Diagnostic OTA completed and the device restarted.".to_owned()
+                                    "Diagnostic OTA completed; USB re-enumeration and firmware identity were verified.".to_owned()
                                 }
                             };
                             self.append_log(self.status.clone());
@@ -3684,8 +4734,8 @@ impl FlasherApp {
                             self.status = self
                                 .language
                                 .tr(
-                                    "OTA 切换失败；设备原有固件未被激活槽覆盖。",
-                                    "OTA profile switch failed; the active firmware slot was not replaced.",
+                                    "OTA 未能完成全部传输、验签或重新枚举验证；请查看日志后重新读取设备模式。",
+                                    "OTA did not complete transfer, verification, or re-enumeration checks. Review the log and read the device profile again.",
                                 )
                                 .to_owned();
                             self.append_log(match self.language {
@@ -3919,18 +4969,34 @@ impl FlasherApp {
                         ),
                     });
                 } else {
-                    lines.push(match self.language {
-                        Language::ZhCn => format!(
-                            "USB HID：{} 已连接，但 0xFD 不可用：{}",
-                            report.product_name,
-                            report.error.as_deref().unwrap_or("未知错误")
-                        ),
-                        Language::En => format!(
-                            "USB HID: {} is connected, but 0xFD is unavailable: {}",
-                            report.product_name,
-                            report.error.as_deref().unwrap_or("unknown error")
-                        ),
-                    });
+                    if report.build_profile.as_deref() == Some("standard") && report.error.is_none()
+                    {
+                        lines.push(match self.language {
+                            Language::ZhCn => format!(
+                                "USB HID：{}，固件 {} / 常用版；0xFD 快照仅诊断版提供",
+                                report.product_name,
+                                report.firmware_version.as_deref().unwrap_or("未知")
+                            ),
+                            Language::En => format!(
+                                "USB HID: {}, firmware {} / Standard; 0xFD snapshots are Diagnostic-only",
+                                report.product_name,
+                                report.firmware_version.as_deref().unwrap_or("unknown")
+                            ),
+                        });
+                    } else {
+                        lines.push(match self.language {
+                            Language::ZhCn => format!(
+                                "USB HID：{} 已连接，但 0xFD 不可用：{}",
+                                report.product_name,
+                                report.error.as_deref().unwrap_or("未知错误")
+                            ),
+                            Language::En => format!(
+                                "USB HID: {} is connected, but 0xFD is unavailable: {}",
+                                report.product_name,
+                                report.error.as_deref().unwrap_or("unknown error")
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -4013,6 +5079,73 @@ fn dpad_name(value: u8, language: Language) -> &'static str {
     }
 }
 
+fn guided_requirement_label(key: &str, language: Language) -> String {
+    if let Some(value) = key
+        .strip_prefix("dpad")
+        .and_then(|value| value.parse::<u8>().ok())
+    {
+        return format!("D-pad {}", dpad_name(value, language));
+    }
+    for (prefix, zh, en) in [
+        ("left", "左摇杆", "Left stick"),
+        ("right", "右摇杆", "Right stick"),
+    ] {
+        if let Some(direction) = key.strip_prefix(prefix) {
+            let direction = match direction {
+                "Center" => language.tr("回中", "center"),
+                "Right" => language.tr("右", "right"),
+                "UpRight" => language.tr("右上", "up-right"),
+                "Up" => language.tr("上", "up"),
+                "UpLeft" => language.tr("左上", "up-left"),
+                "Left" => language.tr("左", "left"),
+                "DownLeft" => language.tr("左下", "down-left"),
+                "Down" => language.tr("下", "down"),
+                "DownRight" => language.tr("右下", "down-right"),
+                _ => direction,
+            };
+            return format!("{} {direction}", language.tr(zh, en));
+        }
+    }
+    match key {
+        "square" => "□ Square".to_owned(),
+        "cross" => "× Cross".to_owned(),
+        "circle" => "○ Circle".to_owned(),
+        "triangle" => "△ Triangle".to_owned(),
+        "create" => "Create".to_owned(),
+        "options" => "Options".to_owned(),
+        "ps" => "PS".to_owned(),
+        "mute" => language.tr("静音键", "Mute").to_owned(),
+        "l1" | "r1" | "l3" | "r3" => key.to_ascii_uppercase(),
+        "l2Button" => language.tr("L2 数字按键位", "L2 digital button").to_owned(),
+        "r2Button" => language.tr("R2 数字按键位", "R2 digital button").to_owned(),
+        "l2Press" => language.tr("L2 开始压下", "L2 initial pull").to_owned(),
+        "r2Press" => language.tr("R2 开始压下", "R2 initial pull").to_owned(),
+        "l2Mid" => language.tr("L2 中段", "L2 middle").to_owned(),
+        "r2Mid" => language.tr("R2 中段", "R2 middle").to_owned(),
+        "l2Full" => language.tr("L2 满量程", "L2 full scale").to_owned(),
+        "r2Full" => language.tr("R2 满量程", "R2 full scale").to_owned(),
+        "l2Release" => language.tr("L2 释放", "L2 release").to_owned(),
+        "r2Release" => language.tr("R2 释放", "R2 release").to_owned(),
+        "finger1" => language.tr("触摸点 1", "Touch point 1").to_owned(),
+        "finger2" => language.tr("触摸点 2", "Touch point 2").to_owned(),
+        "leftRegion" => language.tr("左侧区域", "Left region").to_owned(),
+        "rightRegion" => language.tr("右侧区域", "Right region").to_owned(),
+        "swipeLeft" => language.tr("向左滑动", "Swipe left").to_owned(),
+        "swipeRight" => language.tr("向右滑动", "Swipe right").to_owned(),
+        "swipeUp" => language.tr("向上滑动", "Swipe up").to_owned(),
+        "swipeDown" => language.tr("向下滑动", "Swipe down").to_owned(),
+        "twoFinger" => language.tr("双指触摸", "Two-finger touch").to_owned(),
+        "click" => language.tr("按下触摸板", "Touchpad click").to_owned(),
+        "gyroX" => language.tr("陀螺仪 X", "Gyroscope X").to_owned(),
+        "gyroY" => language.tr("陀螺仪 Y", "Gyroscope Y").to_owned(),
+        "gyroZ" => language.tr("陀螺仪 Z", "Gyroscope Z").to_owned(),
+        "accelX" => language.tr("加速度计 X", "Accelerometer X").to_owned(),
+        "accelY" => language.tr("加速度计 Y", "Accelerometer Y").to_owned(),
+        "accelZ" => language.tr("加速度计 Z", "Accelerometer Z").to_owned(),
+        _ => key.to_owned(),
+    }
+}
+
 fn input_progress(ui: &mut eframe::egui::Ui, label: &str, value: u8) {
     ui.label(label);
     ui.add(
@@ -4022,20 +5155,351 @@ fn input_progress(ui: &mut eframe::egui::Ui, label: &str, value: u8) {
     );
 }
 
-fn input_button(ui: &mut eframe::egui::Ui, label: &str, pressed: bool) {
-    let (fill, stroke, color) = if pressed {
-        (COLOR_SUCCESS_SOFT, COLOR_SUCCESS, COLOR_TEXT_PRIMARY)
-    } else {
-        (COLOR_SURFACE_RAISED, COLOR_BORDER, COLOR_TEXT_MUTED)
+fn controller_input_diagram(
+    ui: &mut eframe::egui::Ui,
+    input: &device_test::InputState,
+    language: Language,
+) {
+    use controller_model as model;
+    use eframe::egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+
+    // Native adaptation of daidr/dualsense-tester's 1117×892 DS5 model.
+    let width = ui.available_width().clamp(360.0, 900.0);
+    let scale = width / model::VIEW_WIDTH;
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(width, model::VIEW_HEIGHT * scale), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let point = |x: f32, y: f32| Pos2::new(rect.left() + x * scale, rect.top() + y * scale);
+    let scaled_rect = |left: f32, top: f32, right: f32, bottom: f32| {
+        Rect::from_min_max(point(left, top), point(right, bottom))
     };
-    eframe::egui::Frame::new()
-        .fill(fill)
-        .stroke(eframe::egui::Stroke::new(1.0_f32, stroke))
-        .corner_radius(7.0)
-        .inner_margin(eframe::egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.label(eframe::egui::RichText::new(label).color(color).strong());
-        });
+
+    eframe::egui::Image::new(eframe::egui::include_image!(
+        "../assets/dualsense-front.svg"
+    ))
+    .paint_at(ui, rect);
+
+    let draw_circle = |center: Pos2, radius: f32, label: &str, pressed: bool| {
+        if !pressed {
+            return;
+        }
+        painter.circle_filled(center, radius * scale, COLOR_ACCENT);
+        painter.circle_stroke(
+            center,
+            radius * scale,
+            Stroke::new((2.0 * scale).max(1.0), COLOR_ACCENT),
+        );
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            label,
+            FontId::proportional((25.0 * scale).max(9.0)),
+            eframe::egui::Color32::WHITE,
+        );
+    };
+    let draw_pill = |center: Pos2, size: Vec2, label: &str, pressed: bool| {
+        if !pressed {
+            return;
+        }
+        let pill = Rect::from_center_size(center, size * scale);
+        painter.rect_filled(pill, 8.0 * scale, COLOR_ACCENT);
+        painter.rect_stroke(
+            pill,
+            8.0 * scale,
+            Stroke::new((1.7 * scale).max(1.0), COLOR_ACCENT),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            label,
+            FontId::proportional((21.0 * scale).max(9.0)),
+            eframe::egui::Color32::WHITE,
+        );
+    };
+
+    draw_pill(
+        point(195.0, 67.0),
+        Vec2::new(120.0, 82.0),
+        &format!("L2  {}", input.l2),
+        input.l2_button || input.l2 > 0,
+    );
+    draw_pill(
+        point(922.0, 67.0),
+        Vec2::new(120.0, 82.0),
+        &format!("R2  {}", input.r2),
+        input.r2_button || input.r2 > 0,
+    );
+    draw_pill(point(196.0, 166.0), Vec2::new(150.0, 38.0), "L1", input.l1);
+    draw_pill(point(921.0, 166.0), Vec2::new(150.0, 38.0), "R1", input.r1);
+    if input.l2 == 0 && !input.l2_button {
+        painter.text(
+            point(195.0, 67.0),
+            Align2::CENTER_CENTER,
+            "L2  0",
+            FontId::proportional((21.0 * scale).max(9.0)),
+            COLOR_TEXT_PRIMARY,
+        );
+    }
+    if input.r2 == 0 && !input.r2_button {
+        painter.text(
+            point(922.0, 67.0),
+            Align2::CENTER_CENTER,
+            "R2  0",
+            FontId::proportional((21.0 * scale).max(9.0)),
+            COLOR_TEXT_PRIMARY,
+        );
+    }
+    if !input.l1 {
+        painter.text(
+            point(196.0, 166.0),
+            Align2::CENTER_CENTER,
+            "L1",
+            FontId::proportional((21.0 * scale).max(9.0)),
+            COLOR_TEXT_PRIMARY,
+        );
+    }
+    if !input.r1 {
+        painter.text(
+            point(921.0, 166.0),
+            Align2::CENTER_CENTER,
+            "R1",
+            FontId::proportional((21.0 * scale).max(9.0)),
+            COLOR_TEXT_PRIMARY,
+        );
+    }
+
+    let touchpad = scaled_rect(
+        model::TOUCHPAD_LEFT,
+        model::TOUCHPAD_TOP,
+        model::TOUCHPAD_LEFT + model::TOUCHPAD_WIDTH,
+        model::TOUCHPAD_TOP + model::TOUCHPAD_HEIGHT,
+    );
+    if input.touchpad_click {
+        painter.rect_filled(touchpad, 12.0 * scale, COLOR_ACCENT);
+    }
+    painter.rect_stroke(
+        touchpad,
+        12.0 * scale,
+        Stroke::new(
+            (2.0 * scale).max(1.0),
+            if input.touchpad_click {
+                COLOR_ACCENT
+            } else {
+                COLOR_BORDER
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        touchpad.center(),
+        Align2::CENTER_CENTER,
+        language.tr("触摸板", "Touchpad"),
+        FontId::proportional((24.0 * scale).max(9.0)),
+        if input.touchpad_click {
+            eframe::egui::Color32::WHITE
+        } else {
+            COLOR_TEXT_PRIMARY
+        },
+    );
+    for (index, touch) in input.touch.iter().enumerate() {
+        if !touch.active {
+            continue;
+        }
+        let source = model::touch_position(touch.x, touch.y);
+        let marker = point(source.0, source.1);
+        painter.circle_filled(marker, (19.0 * scale).max(4.0), COLOR_WARNING);
+        painter.text(
+            marker,
+            Align2::CENTER_CENTER,
+            (index + 1).to_string(),
+            FontId::proportional((18.0 * scale).max(8.0)),
+            COLOR_TEXT_PRIMARY,
+        );
+        painter.text(
+            marker + Vec2::new(0.0, -27.0 * scale),
+            Align2::CENTER_BOTTOM,
+            format!("{}, {}", touch.x, touch.y),
+            FontId::proportional((16.0 * scale).max(8.0)),
+            COLOR_TEXT_PRIMARY,
+        );
+    }
+
+    draw_pill(
+        point(269.0, 225.0),
+        Vec2::new(43.0, 67.0),
+        "C",
+        input.create,
+    );
+    draw_pill(
+        point(848.0, 225.0),
+        Vec2::new(43.0, 67.0),
+        "O",
+        input.options,
+    );
+    painter.text(
+        point(269.0, 184.0),
+        Align2::CENTER_BOTTOM,
+        "Create",
+        FontId::proportional((15.0 * scale).max(8.0)),
+        COLOR_TEXT_PRIMARY,
+    );
+    painter.text(
+        point(848.0, 184.0),
+        Align2::CENTER_BOTTOM,
+        "Options",
+        FontId::proportional((15.0 * scale).max(8.0)),
+        COLOR_TEXT_PRIMARY,
+    );
+
+    let [dpad_up, dpad_right, dpad_down, dpad_left] = model::dpad_active(input.dpad);
+    draw_pill(
+        point(model::DPAD_UP.0, model::DPAD_UP.1),
+        Vec2::new(69.0, 88.0),
+        "▲",
+        dpad_up,
+    );
+    draw_pill(
+        point(model::DPAD_RIGHT.0, model::DPAD_RIGHT.1),
+        Vec2::new(88.0, 69.0),
+        "▶",
+        dpad_right,
+    );
+    draw_pill(
+        point(model::DPAD_DOWN.0, model::DPAD_DOWN.1),
+        Vec2::new(69.0, 88.0),
+        "▼",
+        dpad_down,
+    );
+    draw_pill(
+        point(model::DPAD_LEFT.0, model::DPAD_LEFT.1),
+        Vec2::new(88.0, 69.0),
+        "◀",
+        dpad_left,
+    );
+
+    draw_circle(
+        point(model::TRIANGLE.0, model::TRIANGLE.1),
+        34.957,
+        "△",
+        input.triangle,
+    );
+    draw_circle(
+        point(model::CROSS.0, model::CROSS.1),
+        34.957,
+        "×",
+        input.cross,
+    );
+    draw_circle(
+        point(model::SQUARE.0, model::SQUARE.1),
+        34.957,
+        "□",
+        input.square,
+    );
+    draw_circle(
+        point(model::CIRCLE.0, model::CIRCLE.1),
+        34.957,
+        "○",
+        input.circle,
+    );
+
+    let draw_stick = |center: Pos2, x: u8, y: u8, label: &str, pressed: bool| {
+        let range_radius = model::STICK_RANGE_RADIUS * scale;
+        let cap_radius = model::STICK_CAP_RADIUS * scale;
+        painter.circle_stroke(center, range_radius, Stroke::new(1.0_f32, COLOR_BORDER));
+        painter.line_segment(
+            [
+                center + Vec2::new(-range_radius, 0.0),
+                center + Vec2::new(range_radius, 0.0),
+            ],
+            Stroke::new(1.0_f32, COLOR_BORDER),
+        );
+        painter.line_segment(
+            [
+                center + Vec2::new(0.0, -range_radius),
+                center + Vec2::new(0.0, range_radius),
+            ],
+            Stroke::new(1.0_f32, COLOR_BORDER),
+        );
+        let source_offset = model::stick_offset(x, y);
+        let cap_center = center + Vec2::new(source_offset.0 * scale, source_offset.1 * scale);
+        painter.circle_filled(
+            cap_center,
+            cap_radius,
+            if pressed { COLOR_ACCENT } else { COLOR_SURFACE },
+        );
+        painter.circle_stroke(
+            cap_center,
+            cap_radius,
+            Stroke::new(
+                (2.0 * scale).max(1.0),
+                if pressed {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_TEXT_MUTED
+                },
+            ),
+        );
+        painter.text(
+            cap_center,
+            Align2::CENTER_CENTER,
+            label,
+            FontId::proportional((22.0 * scale).max(8.0)),
+            if pressed {
+                eframe::egui::Color32::WHITE
+            } else {
+                COLOR_TEXT_PRIMARY
+            },
+        );
+        painter.text(
+            center + Vec2::new(0.0, 145.0 * scale),
+            Align2::CENTER_CENTER,
+            format!("X {x}   Y {y}"),
+            FontId::proportional((18.0 * scale).max(8.0)),
+            COLOR_TEXT_PRIMARY,
+        );
+    };
+    draw_stick(
+        point(model::LEFT_STICK.0, model::LEFT_STICK.1),
+        input.lx,
+        input.ly,
+        "L3",
+        input.l3,
+    );
+    draw_stick(
+        point(model::RIGHT_STICK.0, model::RIGHT_STICK.1),
+        input.rx,
+        input.ry,
+        "R3",
+        input.r3,
+    );
+
+    draw_circle(point(558.5, 532.0), 28.0, "PS", input.ps);
+    draw_pill(
+        point(558.5, 592.0),
+        Vec2::new(76.0, 28.0),
+        language.tr("静音", "Mute"),
+        input.mute,
+    );
+
+    painter.text(
+        point(model::VIEW_WIDTH / 2.0, 760.0),
+        Align2::CENTER_CENTER,
+        format!(
+            "D-pad: {}  ·  {}",
+            dpad_name(input.dpad, language),
+            language.tr("蓝色表示当前按下", "Blue indicates active input")
+        ),
+        FontId::proportional((19.0 * scale).max(9.0)),
+        COLOR_TEXT_PRIMARY,
+    );
+    painter.text(
+        point(model::VIEW_WIDTH / 2.0, 804.0),
+        Align2::CENTER_CENTER,
+        format!("dualsense-tester model · {}", &model::SOURCE_COMMIT[..8]),
+        FontId::proportional((14.0 * scale).max(8.0)),
+        COLOR_TEXT_MUTED,
+    );
 }
 
 fn stick_analysis_dial(
@@ -4246,9 +5710,7 @@ fn build_unified_report_summary_zh_cn(
     let mut untested_items = Vec::new();
     let mut recommendations = Vec::new();
 
-    let guided_started = phases
-        .iter()
-        .any(|phase| phase.result != guided_test::PhaseResult::Pending);
+    let guided_started = guided_test_has_data(phases);
     let guided_finished = phases
         .iter()
         .all(|phase| phase.result != guided_test::PhaseResult::Pending);
@@ -4259,10 +5721,29 @@ fn build_unified_report_summary_zh_cn(
     }
     for phase in phases {
         match phase.result {
-            guided_test::PhaseResult::NotEffective => push_unique(
-                &mut abnormal_items,
-                format!("引导项目“{}”未生效", phase.title_zh),
-            ),
+            guided_test::PhaseResult::NotEffective => {
+                push_unique(
+                    &mut abnormal_items,
+                    format!("引导项目“{}”未生效", phase.title_zh),
+                );
+                if phase.automatic {
+                    let missing = phase
+                        .missing_requirements()
+                        .iter()
+                        .map(|(key, _, _)| guided_requirement_label(key, Language::ZhCn))
+                        .collect::<Vec<_>>();
+                    if !missing.is_empty() {
+                        push_unique(
+                            &mut abnormal_items,
+                            format!("{}缺少：{}", phase.title_zh, missing.join("、")),
+                        );
+                        push_unique(
+                            &mut recommendations,
+                            format!("复测{}的缺失输入：{}", phase.title_zh, missing.join("、")),
+                        );
+                    }
+                }
+            }
             guided_test::PhaseResult::Skipped => push_unique(
                 &mut untested_items,
                 format!("引导项目“{}”已跳过", phase.title_zh),
@@ -4345,7 +5826,7 @@ fn build_unified_report_summary_zh_cn(
             push_unique(&mut abnormal_items, "麦克风录音未检测到足够的有效声音");
             push_unique(
                 &mut recommendations,
-                "确认 Windows 默认输入设备为 M61，并靠近手柄麦克风重新录制",
+                "关闭占用 M61/DualSense 麦克风的程序，并靠近手柄麦克风重新录制",
             );
         }
         None => push_unique(&mut untested_items, "Windows M61 UAC 麦克风信号检测"),
@@ -4492,6 +5973,12 @@ fn assess_debug_report(
     }
 }
 
+fn guided_test_has_data(phases: &[guided_test::PhaseRecord]) -> bool {
+    phases
+        .iter()
+        .any(|phase| phase.result != guided_test::PhaseResult::Pending || !phase.samples.is_empty())
+}
+
 const COLOR_APP_BG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(244, 247, 251);
 const COLOR_HEADER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 255, 255);
 const COLOR_SURFACE: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(255, 255, 255);
@@ -4529,6 +6016,9 @@ fn configure_visual_style(ctx: &eframe::egui::Context) {
     visuals.hyperlink_color = COLOR_ACCENT_HOVER;
     visuals.selection.bg_fill = COLOR_ACCENT_SOFT;
     visuals.selection.stroke = eframe::egui::Stroke::new(1.5_f32, COLOR_ACCENT_HOVER);
+    // Keep disabled controls visibly disabled without washing their labels into
+    // the white background. The border/fill already communicates availability.
+    visuals.disabled_alpha = 0.82;
     visuals.widgets.noninteractive.bg_fill = COLOR_SURFACE;
     visuals.widgets.noninteractive.weak_bg_fill = COLOR_SURFACE;
     visuals.widgets.noninteractive.bg_stroke = eframe::egui::Stroke::new(1.0_f32, COLOR_BORDER);
@@ -4808,8 +6298,12 @@ impl eframe::App for FlasherApp {
                 ui.horizontal(|ui| {
                     for (tab, label) in [
                         (AppTab::TestCenter, language.tr("测试中心", "Test center")),
-                        (AppTab::Flasher, language.tr("固件刷写", "Firmware flasher")),
+                        (
+                            AppTab::ButtonMapping,
+                            language.tr("按键映射", "Button mapping"),
+                        ),
                         (AppTab::DeviceDebug, language.tr("设备调试", "Device debug")),
+                        (AppTab::Flasher, language.tr("固件刷写", "Firmware flasher")),
                     ] {
                         let selected = self.current_tab == tab;
                         let button = eframe::egui::Button::new(
@@ -4839,6 +6333,10 @@ impl eframe::App for FlasherApp {
             });
         if previous_tab != self.current_tab && self.current_tab == AppTab::TestCenter {
             self.open_device_test();
+        } else if previous_tab != self.current_tab && self.current_tab == AppTab::ButtonMapping {
+            self.ensure_device_session();
+            self.refresh_button_mapping();
+            self.refresh_device_macros();
         } else if previous_tab != self.current_tab && self.current_tab == AppTab::DeviceDebug {
             self.ensure_device_session();
             self.refresh_polling_rate();
@@ -4880,10 +6378,357 @@ impl eframe::App for FlasherApp {
             ctx.request_repaint();
         }
 
-        if self.current_tab == AppTab::Flasher {
+        if self.current_tab == AppTab::ButtonMapping {
+            let mut refresh_mapping = false;
+            let mut apply_mapping = false;
+            let mut reset_mapping = false;
+            let mut refresh_macros = false;
+            let mut apply_macros = false;
             eframe::egui::CentralPanel::default()
                 .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
                 .show(ctx, |ui| {
+                    eframe::egui::ScrollArea::vertical()
+                        .id_salt("mapping_page_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.heading(language.tr("按键映射与宏", "Mapping and macros"));
+                            ui.label(
+                                eframe::egui::RichText::new(language.tr(
+                                    "使用 DualSense 图形编辑 19 控件映射、同步组合与设备端宏。所有修改先保存在草稿中，应用后自动读回校验。",
+                                    "Edit all 19 controls, synchronous combinations, and device macros on the DualSense model. Changes remain drafts until applied and verified.",
+                                ))
+                                .color(COLOR_TEXT_MUTED),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for (tab, zh, en) in [
+                                    (MappingSubTab::Mapping, "19 键映射", "19-control mapping"),
+                                    (MappingSubTab::MacroEditor, "宏编辑器", "Macro editor"),
+                                    (MappingSubTab::DeviceMacros, "录制与设备宏", "Recording & device macros"),
+                                ] {
+                                    let selected = self.mapping_sub_tab == tab;
+                                    if ui
+                                        .add(
+                                            eframe::egui::Button::new(
+                                                eframe::egui::RichText::new(language.tr(zh, en))
+                                                    .color(COLOR_TEXT_PRIMARY)
+                                                    .strong(),
+                                            )
+                                            .fill(if selected { COLOR_ACCENT_SOFT } else { COLOR_SURFACE })
+                                            .stroke(eframe::egui::Stroke::new(
+                                                if selected { 1.5_f32 } else { 1.0_f32 },
+                                                if selected { COLOR_ACCENT } else { COLOR_BORDER },
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.mapping_sub_tab = tab;
+                                    }
+                                }
+                            });
+                            ui.add_space(12.0);
+
+                            if self.mapping_sub_tab == MappingSubTab::Mapping {
+                                surface_frame().show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.heading(language.tr("映射草稿", "Mapping draft"));
+                                        ui.with_layout(
+                                            eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                                            |ui| {
+                                                if self.loading_button_mapping || self.applying_button_mapping {
+                                                    ui.spinner();
+                                                }
+                                                ui.monospace(if self.selected_button_mapping.is_identity() {
+                                                    language.tr("默认一对一", "Default one-to-one")
+                                                } else {
+                                                    language.tr("自定义/组合", "Custom / combo")
+                                                });
+                                            },
+                                        );
+                                    });
+                                    ui.columns(2, |columns| {
+                                        for (index, column) in columns.iter_mut().enumerate() {
+                                            column.label(
+                                                eframe::egui::RichText::new(if index == 0 {
+                                                    language.tr("物理输入", "Physical input")
+                                                } else {
+                                                    language.tr("逻辑输出", "Logical output")
+                                                })
+                                                .color(COLOR_TEXT_PRIMARY)
+                                                .strong(),
+                                            );
+                                            column.add(eframe::egui::Image::new(eframe::egui::include_image!(
+                                                "../assets/dualsense-front.svg"
+                                            ))
+                                            .max_width(430.0));
+                                        }
+                                    });
+                                });
+                                ui.add_space(12.0);
+
+                                let mapping_enabled = self.device_button_mapping.is_some()
+                                    && !self.loading_button_mapping
+                                    && !self.applying_button_mapping
+                                    && self.busy.is_none();
+                                surface_frame().show(ui, |ui| {
+                                    ui.heading(language.tr("物理输入 → 逻辑输出", "Physical input → logical output"));
+                                    ui.label(
+                                        eframe::egui::RichText::new(language.tr(
+                                            "未勾选任何输出会禁用该物理键；勾选多个输出会在同一个 HID 帧中同步按下。超过 4 个输出仅提示负载警告，不会阻止保存。",
+                                            "No target disables a source. Multiple targets are pressed atomically in one HID frame. More than four targets shows a warning but remains allowed.",
+                                        ))
+                                        .color(COLOR_TEXT_MUTED),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.add_enabled_ui(mapping_enabled, |ui| {
+                                        for source in 0..device_config::REMAP_CONTROL_COUNT {
+                                            let count = self.selected_button_mapping.target_count(source);
+                                            let summary = if count == 0 {
+                                                language.tr("已禁用", "Disabled").to_owned()
+                                            } else {
+                                                format!("{} {}", count, language.tr("个输出", "targets"))
+                                            };
+                                            eframe::egui::CollapsingHeader::new(format!(
+                                                "{}  →  {}",
+                                                remap_control_label(source, language),
+                                                summary
+                                            ))
+                                            .id_salt(format!("mapping_source_{source}"))
+                                            .show(ui, |ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for target in 0..device_config::REMAP_CONTROL_COUNT {
+                                                        let mut enabled = self
+                                                            .selected_button_mapping
+                                                            .is_target_enabled(source, target);
+                                                        if ui
+                                                            .checkbox(
+                                                                &mut enabled,
+                                                                remap_control_label(target, language),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            self.selected_button_mapping
+                                                                .set_target_enabled(source, target, enabled);
+                                                        }
+                                                    }
+                                                });
+                                                if self.selected_button_mapping.target_count(source) > 4 {
+                                                    ui.colored_label(
+                                                        COLOR_WARNING,
+                                                        language.tr(
+                                                            "该输入会同时产生超过 4 个输出，请先进行最终输出验证。",
+                                                            "This source emits more than four targets; validate the final output first.",
+                                                        ),
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    });
+                                    ui.add_space(10.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        let changed = self.device_button_mapping.as_ref().is_some_and(|current| {
+                                            current.target_masks != self.selected_button_mapping.target_masks
+                                        });
+                                        if ui
+                                            .add_enabled(mapping_enabled && changed, primary_button(language.tr(
+                                                "应用到设备并校验",
+                                                "Apply and verify",
+                                            )))
+                                            .clicked()
+                                        {
+                                            apply_mapping = true;
+                                        }
+                                        if ui
+                                            .add_enabled(mapping_enabled, eframe::egui::Button::new(language.tr(
+                                                "恢复默认映射",
+                                                "Restore defaults",
+                                            )))
+                                            .clicked()
+                                        {
+                                            reset_mapping = true;
+                                        }
+                                        if ui
+                                            .add_enabled(!self.loading_button_mapping && !self.applying_button_mapping,
+                                                eframe::egui::Button::new(language.tr("重新读取", "Read again")))
+                                            .clicked()
+                                        {
+                                            refresh_mapping = true;
+                                        }
+                                    });
+                                    if self.selected_button_mapping.imported_legacy_v2 {
+                                        ui.add_space(8.0);
+                                        notice(ui, NoticeTone::Info,
+                                            language.tr("已导入旧 19 键映射", "Legacy 19-control mapping imported"),
+                                            language.tr(
+                                                "旧版单目标映射已转换为 v3 草稿；升级到 v3.6.0 后才能写入组合键。",
+                                                "The old single-target table was converted to a v3 draft. Upgrade to v3.6.0 before writing combinations.",
+                                            ));
+                                    }
+                                    if let Some(error) = &self.button_mapping_error {
+                                        ui.add_space(8.0);
+                                        notice(ui, NoticeTone::Warning,
+                                            language.tr("映射不可用", "Mapping unavailable"), error);
+                                    }
+                                });
+                            } else if self.mapping_sub_tab == MappingSubTab::MacroEditor {
+                                surface_frame().show(ui, |ui| {
+                                    ui.heading(language.tr("宏时间轴编辑器", "Macro timeline editor"));
+                                    macro_editor_ui(
+                                        ui,
+                                        &mut self.macro_set,
+                                        &mut self.selected_macro_index,
+                                        &mut self.macro_status,
+                                        language,
+                                    );
+                                });
+                            } else {
+                                surface_frame().show(ui, |ui| {
+                                    ui.heading(language.tr("独立录制与设备宏", "Standalone recording and device macros"));
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.checkbox(
+                                            &mut self.macro_set.globally_enabled,
+                                            language.tr("时序宏总开关", "Master macro switch"),
+                                        );
+                                        ui.checkbox(
+                                            &mut self.macro_set.sequence_enabled,
+                                            language.tr("单次/按住时序宏", "One-shot / held sequences"),
+                                        );
+                                        ui.checkbox(
+                                            &mut self.macro_set.repeat_enabled,
+                                            language.tr("连发/重复/循环", "Turbo / repeat / loops"),
+                                        );
+                                        eframe::egui::ComboBox::from_id_salt("active_macro_profile")
+                                            .selected_text(format!("{} {}", language.tr("档位", "Profile"), self.macro_set.active_profile + 1))
+                                            .show_ui(ui, |ui| {
+                                                for profile in 0..macro_config::PROFILE_COUNT {
+                                                    ui.selectable_value(
+                                                        &mut self.macro_set.active_profile,
+                                                        profile,
+                                                        format!("{} {}", language.tr("档位", "Profile"), profile + 1),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        if self.loading_device_macros || self.applying_device_macros {
+                                            ui.spinner();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self.loading_device_macros
+                                                    && !self.applying_device_macros,
+                                                eframe::egui::Button::new(language.tr(
+                                                    "从设备重新读取",
+                                                    "Read from device",
+                                                )),
+                                            )
+                                            .clicked()
+                                        {
+                                            refresh_macros = true;
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self.loading_device_macros
+                                                    && !self.applying_device_macros
+                                                    && self.macro_set.validate().is_ok(),
+                                                primary_button(language.tr(
+                                                    "写入设备并校验",
+                                                    "Write and verify",
+                                                )),
+                                            )
+                                            .clicked()
+                                        {
+                                            apply_macros = true;
+                                        }
+                                        ui.monospace(format!(
+                                            "{} {}",
+                                            language.tr("设备代数", "Device generation"),
+                                            self.macro_set.generation
+                                        ));
+                                    });
+                                    if let Some(status) = &self.macro_status {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            eframe::egui::RichText::new(status)
+                                                .color(COLOR_TEXT_PRIMARY),
+                                        );
+                                    }
+                                    ui.add_space(8.0);
+                                    notice(
+                                        ui,
+                                        NoticeTone::Info,
+                                        language.tr("手柄端独立录制", "Standalone controller recording"),
+                                        language.tr(
+                                            "Create + Options 长按 2 秒进入准备；选择播放触发键；黄色倒计时 3 秒后绿灯常亮并开始录制；再次长按结束。达到 80% 容量时红灯慢闪，空间耗尽时红灯快闪。PS 长按 2 秒随时取消。",
+                                            "Hold Create + Options for 2 seconds, choose the playback trigger, then recording starts with a solid green light after a 3-second amber countdown. Hold the chord again to finish. Red flashes at 80% capacity and rapidly when full. Hold PS for 2 seconds to cancel.",
+                                        ),
+                                    );
+                                    ui.add_space(8.0);
+                                    match self.macro_set.validate() {
+                                        Ok(summary) => {
+                                            ui.label(format!(
+                                                "{} macros · {} steps · {} / {} bytes",
+                                                summary.macro_count,
+                                                summary.step_count,
+                                                summary.compiled_bytes,
+                                                macro_config::MAX_DEVICE_BYTES
+                                            ));
+                                            ui.add(
+                                                eframe::egui::ProgressBar::new(
+                                                    summary.compiled_bytes as f32 / macro_config::MAX_DEVICE_BYTES as f32,
+                                                )
+                                                .desired_width(ui.available_width().min(520.0))
+                                                .text(format!("{:.1}%", summary.compiled_bytes as f32 * 100.0 / macro_config::MAX_DEVICE_BYTES as f32)),
+                                            );
+                                        }
+                                        Err(error) => notice(
+                                            ui,
+                                            NoticeTone::Warning,
+                                            language.tr("设备宏校验失败", "Device macro validation failed"),
+                                            &format!("{error:#}"),
+                                        ),
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        eframe::egui::RichText::new(language.tr(
+                                            "设备端宏仅包含按键、摇杆、L2/R2、触摸和时间信息；不包含灯效、震动、自适应扳机、条件或动作传感器。",
+                                            "Device macros contain only buttons, sticks, L2/R2, touch, and timing. They never contain lighting, rumble, adaptive-trigger, conditional, or motion-sensor actions.",
+                                        ))
+                                        .color(COLOR_TEXT_MUTED),
+                                    );
+                                });
+                            }
+                        });
+                });
+            if refresh_mapping {
+                self.refresh_button_mapping();
+            }
+            if apply_mapping {
+                self.apply_button_mapping(self.selected_button_mapping.clone());
+            }
+            if reset_mapping {
+                self.reset_button_mapping();
+            }
+            if refresh_macros {
+                self.refresh_device_macros();
+            }
+            if apply_macros {
+                self.apply_device_macros();
+            }
+        }
+
+        if self.current_tab == AppTab::Flasher {
+            let mut ota_switch = None;
+            let mut choose_local_ota = false;
+            let mut start_local_ota = false;
+            eframe::egui::CentralPanel::default()
+                .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
+                .show(ctx, |ui| {
+            eframe::egui::ScrollArea::vertical()
+                .id_salt("flasher_page_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
             ui.heading(language.tr("固件刷写", "Firmware flasher"));
             ui.label(
                 eframe::egui::RichText::new(language.tr(
@@ -4913,6 +6758,7 @@ impl eframe::App for FlasherApp {
                     });
                     if self.firmware_mode != previous_firmware_mode {
                         self.local_firmware = None;
+                        self.local_firmware_path = None;
                     }
                     ui.end_row();
 
@@ -4984,6 +6830,9 @@ impl eframe::App for FlasherApp {
                                     .map(|set| set.label.as_str())
                                     .unwrap_or(language.tr("尚未选择", "Not selected")),
                             );
+                            if let Some(path) = &self.local_firmware_path {
+                                ui.monospace(path.display().to_string());
+                            }
                         }
                         FirmwareMode::LocalDirectory => {
                             if ui
@@ -5006,6 +6855,9 @@ impl eframe::App for FlasherApp {
                                     .map(|set| set.label.as_str())
                                     .unwrap_or(language.tr("尚未选择", "Not selected")),
                             );
+                            if let Some(path) = &self.local_firmware_path {
+                                ui.monospace(path.display().to_string());
+                            }
                         }
                     });
                     ui.end_row();
@@ -5128,6 +6980,151 @@ impl eframe::App for FlasherApp {
             });
 
             ui.add_space(12.0);
+            surface_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(language.tr("签名 OTA 升级", "Signed OTA update"));
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| {
+                            ui.monospace(
+                                self.current_build_profile()
+                                    .map(BuildProfile::label)
+                                    .unwrap_or(language.tr("未识别设备", "Device not detected")),
+                            );
+                        },
+                    );
+                });
+                ui.label(
+                    eframe::egui::RichText::new(language.tr(
+                        "无需进入 UART ISP，可在常用版与诊断版之间安全切换。升级会校验 Release、ZIP、镜像哈希和 P-256 签名，并由 A/B 分区负责试运行和失败回滚。",
+                        "Update without UART ISP and safely switch between Standard and Diagnostic. The tool verifies the Release, ZIP, image hashes, and P-256 signature; A/B slots provide trial boot and rollback.",
+                    ))
+                    .color(COLOR_TEXT_MUTED),
+                );
+                ui.add_space(6.0);
+                notice(
+                    ui,
+                    NoticeTone::Warning,
+                    language.tr("OTA 安全提示", "OTA safety"),
+                    language.tr(
+                        "升级期间会停止测试输出并短暂断开设备。请保持 USB 供电；Boot2、分区表或两槽损坏时仍需 UART 完整刷写。",
+                        "Test output stops and the device disconnects briefly during update. Keep USB powered; damaged Boot2, partition tables, or both slots still require a full UART flash.",
+                    ),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let current = self.current_build_profile();
+                    if ui
+                        .add_enabled(
+                            self.busy.is_none()
+                                && !self.guided_test.active
+                                && !self.device_test_audio_busy
+                                && !self.loading_diagnostics
+                                && current != Some(BuildProfile::Diagnostic)
+                                && self
+                                    .latest_release_for_profile(BuildProfile::Diagnostic)
+                                    .is_some(),
+                            primary_button(language.tr(
+                                "OTA 进入诊断版",
+                                "OTA to Diagnostic",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        ota_switch = Some(BuildProfile::Diagnostic);
+                    }
+                    if ui
+                        .add_enabled(
+                            self.busy.is_none()
+                                && !self.guided_test.active
+                                && !self.device_test_audio_busy
+                                && !self.loading_diagnostics
+                                && current == Some(BuildProfile::Diagnostic)
+                                && self
+                                    .latest_release_for_profile(BuildProfile::Standard)
+                                    .is_some(),
+                            eframe::egui::Button::new(language.tr(
+                                "OTA 恢复常用版",
+                                "OTA to Standard",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        ota_switch = Some(BuildProfile::Standard);
+                    }
+                    if ui
+                        .add_enabled(
+                            self.busy.is_none() && !self.loading_firmware_devices,
+                            eframe::egui::Button::new(language.tr(
+                                "重新读取设备模式",
+                                "Read device profile again",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        self.refresh_firmware_devices();
+                    }
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.busy.is_none(),
+                            eframe::egui::Button::new(language.tr(
+                                "选择本地签名 OTA ZIP…",
+                                "Choose signed local OTA ZIP…",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        choose_local_ota = true;
+                    }
+                    if let Some(info) = &self.local_ota_info {
+                        ui.monospace(format!(
+                            "{} · {} · {} · {} bytes · key {}",
+                            info.version,
+                            info.profile.localized_label(language),
+                            info.channel,
+                            info.image_size,
+                            info.key_id
+                        ));
+                    } else {
+                        ui.label(language.tr(
+                            "尚未选择本地 OTA 包",
+                            "No local OTA package selected",
+                        ));
+                    }
+                });
+                if let Some(path) = &self.local_ota_path {
+                    ui.monospace(path.display().to_string());
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.busy.is_none()
+                                && !self.guided_test.active
+                                && !self.device_test_audio_busy
+                                && !self.loading_diagnostics
+                                && self.local_ota_info.is_some(),
+                            primary_button(language.tr(
+                                "确认并开始本地 OTA",
+                                "Confirm and start local OTA",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        start_local_ota = true;
+                    }
+                    ui.label(language.tr(
+                        "只接受包含 .bin.ota 与 .ota.json 且电脑端 P-256 验签通过的 AIM61 HS ZIP。",
+                        "Only AIM61 HS ZIPs containing .bin.ota and .ota.json and passing PC-side P-256 verification are accepted.",
+                    ));
+                });
+            });
+
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let can_flash =
                     !busy && self.selected_firmware().is_some() && self.selected_port.is_some();
@@ -5192,6 +7189,16 @@ impl eframe::App for FlasherApp {
                     });
             });
             });
+            });
+            if let Some(profile) = ota_switch {
+                self.start_profile_ota(profile);
+            }
+            if choose_local_ota {
+                self.choose_local_ota_zip();
+            }
+            if start_local_ota {
+                self.start_local_ota();
+            }
         }
 
         if self.current_tab == AppTab::TestCenter {
@@ -5201,6 +7208,7 @@ impl eframe::App for FlasherApp {
             let mut reconnect = false;
             let mut tone = None;
             let mut mic_test = false;
+            let mut save_microphone_wav = false;
             let mut start_controller_tone = None;
             let mut stop_controller_tone = false;
             let mut calibration_step = None;
@@ -5209,6 +7217,10 @@ impl eframe::App for FlasherApp {
             eframe::egui::CentralPanel::default()
                 .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
                 .show(ctx, |ui| {
+                eframe::egui::ScrollArea::vertical()
+                    .id_salt("test_center_page_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.heading(language.tr(
                     "DS5 手柄功能测试中心",
                     "DS5 controller test center",
@@ -5273,28 +7285,10 @@ impl eframe::App for FlasherApp {
                 );
                 ui.add_space(12.0);
 
-                eframe::egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.vertical(|ui| {
                     surface_frame().show(ui, |ui| {
                     ui.heading(language.tr("实时输入", "Live input"));
-                    ui.horizontal_wrapped(|ui| {
-                        input_button(ui, "□ Square", input.square);
-                        input_button(ui, "× Cross", input.cross);
-                        input_button(ui, "○ Circle", input.circle);
-                        input_button(ui, "△ Triangle", input.triangle);
-                        input_button(ui, "L1", input.l1);
-                        input_button(ui, "R1", input.r1);
-                        input_button(ui, "L2", input.l2_button);
-                        input_button(ui, "R2", input.r2_button);
-                        input_button(ui, "L3", input.l3);
-                        input_button(ui, "R3", input.r3);
-                        input_button(ui, "Create", input.create);
-                        input_button(ui, "Options", input.options);
-                        input_button(ui, "PS", input.ps);
-                        input_button(ui, "Touch", input.touchpad_click);
-                        input_button(ui, "Mute", input.mute);
-                        ui.separator();
-                        ui.label(format!("D-pad: {}", dpad_name(input.dpad, language)));
-                    });
+                    controller_input_diagram(ui, &input, language);
                     ui.add_space(6.0);
                     eframe::egui::Grid::new("device_test_axes")
                         .num_columns(4)
@@ -5657,9 +7651,19 @@ impl eframe::App for FlasherApp {
                         });
                         columns[1].group(|ui| {
                             ui.strong(language.tr("自适应扳机", "Adaptive triggers"));
-                            for (id, label, value) in [
-                                ("left_trigger_preset", "L2", &mut self.device_test_output.left_trigger),
-                                ("right_trigger_preset", "R2", &mut self.device_test_output.right_trigger),
+                            for (id, label, value, force) in [
+                                (
+                                    "left_trigger_preset",
+                                    "L2",
+                                    &mut self.device_test_output.left_trigger,
+                                    &mut self.device_test_output.left_trigger_force,
+                                ),
+                                (
+                                    "right_trigger_preset",
+                                    "R2",
+                                    &mut self.device_test_output.right_trigger,
+                                    &mut self.device_test_output.right_trigger_force,
+                                ),
                             ] {
                                 ui.horizontal(|ui| {
                                     ui.label(label);
@@ -5677,14 +7681,23 @@ impl eframe::App for FlasherApp {
                                             ui.selectable_value(value, device_test::TriggerPreset::Automatic, language.tr("自动扳机", "Automatic"));
                                         });
                                 });
+                                if *value != device_test::TriggerPreset::Off {
+                                    ui.add(
+                                        eframe::egui::Slider::new(force, 0..=255)
+                                            .text(match language {
+                                                Language::ZhCn => format!("{label} 力度"),
+                                                Language::En => format!("{label} force"),
+                                            }),
+                                    );
+                                }
                             }
                             notice(
                                 ui,
                                 NoticeTone::Warning,
                                 language.tr("扳机安全提示", "Trigger safety"),
                                 language.tr(
-                                    "测试预设使用受限强度；测试后请点击“全部停止并复位”。",
-                                    "Presets use limited force. Click Stop all and reset after testing.",
+                                    "力度范围为 0–255；超过 200 只建议短时验证。引导诊断和压力测试仍固定使用低强度，测试后请点击“全部停止并复位”。",
+                                    "Force ranges from 0–255; values above 200 are recommended only for brief checks. Guided diagnostics and stress tests remain fixed at low force. Click Stop all and reset afterwards.",
                                 ),
                             );
                         });
@@ -5777,8 +7790,8 @@ impl eframe::App for FlasherApp {
                         NoticeTone::Info,
                         language.tr("Windows 音频设备", "Windows audio device"),
                         language.tr(
-                            "此区域单独测试 M61 的 USB 声卡链路。先把 DualSense Wireless Controller 设为 Windows 默认输出和输入；测试音为 2 秒，麦克风录制 5 秒后自动回放。",
-                            "This section separately tests the M61 USB audio path. Set DualSense Wireless Controller as the Windows default output and input first; tones last 2 seconds and microphone audio records for 5 seconds before playback.",
+                            "麦克风通过 WASAPI 自动选择 M61/DualSense 输入端点，不依赖 Windows 默认输入。测试音仍由 Windows 默认输出播放；录音与回放结果分别记录。",
+                            "The microphone uses WASAPI to select the M61/DualSense input endpoint and does not depend on the Windows default input. Test tones still use the default output; capture and playback results are recorded separately.",
                         ),
                     );
                     ui.horizontal(|ui| {
@@ -5797,6 +7810,12 @@ impl eframe::App for FlasherApp {
                         if ui.add_enabled(!self.device_test_audio_busy, eframe::egui::Button::new(language.tr("录音 5 秒并回放", "Record 5s and play back"))).clicked() {
                             mic_test = true;
                         }
+                        if ui.add_enabled(
+                            self.last_microphone_wav.is_some() && !self.device_test_audio_busy,
+                            eframe::egui::Button::new(language.tr("保存最近录音…", "Save latest recording…")),
+                        ).clicked() {
+                            save_microphone_wav = true;
+                        }
                     });
                     if let Some(metrics) = &self.last_microphone_metrics {
                         ui.add_space(8.0);
@@ -5810,20 +7829,28 @@ impl eframe::App for FlasherApp {
                             language.tr("最近一次麦克风信号分析", "Latest microphone signal analysis"),
                             &match self.language {
                                 Language::ZhCn => format!(
-                                    "RMS {:.2}% · 峰值 {:.2}% · 有效窗口 {} · {}{}",
+                                    "{} · {} Hz/{} 声道 · RMS {:.2}% · 峰值 {:.2}% · 有效窗口 {} · {}{} · 回放{}",
+                                    metrics.capture_endpoint,
+                                    metrics.sample_rate_hz,
+                                    metrics.channels,
                                     metrics.rms_percent,
                                     metrics.peak_percent,
                                     metrics.active_windows,
                                     if metrics.signal_detected { "检测到有效声音" } else { "信号不足" },
                                     metrics.signal_to_silence_db.map(|value| format!(" · 信噪比 {:.1} dB", value)).unwrap_or_default(),
+                                    if metrics.playback_succeeded { "成功" } else { "失败" },
                                 ),
                                 Language::En => format!(
-                                    "RMS {:.2}% · peak {:.2}% · {} active windows · {}{}",
+                                    "{} · {} Hz/{} ch · RMS {:.2}% · peak {:.2}% · {} active windows · {}{} · playback {}",
+                                    metrics.capture_endpoint,
+                                    metrics.sample_rate_hz,
+                                    metrics.channels,
                                     metrics.rms_percent,
                                     metrics.peak_percent,
                                     metrics.active_windows,
                                     if metrics.signal_detected { "signal detected" } else { "insufficient signal" },
                                     metrics.signal_to_silence_db.map(|value| format!(" · SNR {:.1} dB", value)).unwrap_or_default(),
+                                    if metrics.playback_succeeded { "passed" } else { "failed" },
                                 ),
                             },
                         );
@@ -5846,9 +7873,7 @@ impl eframe::App for FlasherApp {
                             || !self.calibration_events.is_empty()
                             || self.last_microphone_metrics.is_some()
                             || self.device_debug_metrics.sample_count > 0
-                            || self.guided_test.phases.iter().any(|phase| {
-                                phase.result != guided_test::PhaseResult::Pending
-                            })
+                            || guided_test_has_data(&self.guided_test.phases)
                             || self
                                 .runtime_diagnostics
                                 .iter()
@@ -5877,6 +7902,7 @@ impl eframe::App for FlasherApp {
                             export_complete_report = true;
                         }
                     });
+                });
                 });
             });
 
@@ -5951,6 +7977,9 @@ impl eframe::App for FlasherApp {
             if mic_test {
                 self.start_microphone_test(5);
             }
+            if save_microphone_wav {
+                self.save_microphone_wav();
+            }
         }
 
         if self.current_tab == AppTab::DeviceDebug {
@@ -5981,6 +8010,10 @@ impl eframe::App for FlasherApp {
             eframe::egui::CentralPanel::default()
                 .frame(eframe::egui::Frame::new().fill(COLOR_APP_BG).inner_margin(20))
                 .show(ctx, |ui| {
+                    eframe::egui::ScrollArea::vertical()
+                        .id_salt("device_debug_page_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
                     ui.heading(language.tr("设备调试与性能分析", "Device debug and performance"));
                     ui.label(
                         eframe::egui::RichText::new(language.tr(
@@ -6084,6 +8117,161 @@ impl eframe::App for FlasherApp {
                                 self.refresh_firmware_devices();
                             }
                         });
+                    });
+
+                    ui.add_space(12.0);
+
+                    // The editor lives on the dedicated Mapping page.  Keep
+                    // the old block excluded while the surrounding debug
+                    // layout remains otherwise unchanged.
+                    #[cfg(any())]
+                    surface_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(language.tr("19 控件按键映射", "19-control button mapping"));
+                            ui.with_layout(
+                                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                                |ui| {
+                                    if self.loading_button_mapping || self.applying_button_mapping {
+                                        ui.spinner();
+                                    }
+                                    ui.monospace(if self
+                                        .device_button_mapping
+                                        .as_ref()
+                                        .is_some_and(device_config::ButtonMapping::is_identity)
+                                    {
+                                        language.tr("默认一对一", "Default one-to-one")
+                                    } else if self.device_button_mapping.is_some() {
+                                        language.tr("已自定义", "Customized")
+                                    } else {
+                                        language.tr("未读取", "Not read")
+                                    });
+                                },
+                            );
+                        });
+                        ui.label(
+                            eframe::egui::RichText::new(language.tr(
+                                "每个左侧物理输入可映射为一个目标输入，覆盖 15 个按键和方向键四个方向。允许多个输入映射到同一目标。仅使用新版 19 控件协议，不读取旧 15 键配置。",
+                                "Map each physical input on the left to one target input. This covers 15 buttons plus all four D-pad directions. Multiple inputs may share one target. Only the new 19-control protocol is supported; legacy 15-button data is not read.",
+                            ))
+                            .color(COLOR_TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+
+                        let mapping_enabled = self.device_button_mapping.is_some()
+                            && !self.loading_button_mapping
+                            && !self.applying_button_mapping
+                            && self.busy.is_none()
+                            && !running
+                            && !self.guided_test.active
+                            && !self.device_test_audio_busy;
+                        ui.add_enabled_ui(mapping_enabled, |ui| {
+                            eframe::egui::Grid::new("button_mapping_grid")
+                                .num_columns(4)
+                                .spacing([14.0, 6.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for row in 0..10 {
+                                        for index in [row, row + 10] {
+                                            if index < device_config::REMAP_CONTROL_COUNT {
+                                                ui.label(remap_control_label(index, language));
+                                                let target =
+                                                    &mut self.selected_button_mapping.targets[index];
+                                                eframe::egui::ComboBox::from_id_salt(format!(
+                                                    "button_mapping_{index}"
+                                                ))
+                                                .width(145.0)
+                                                .selected_text(remap_control_label(
+                                                    usize::from(*target),
+                                                    language,
+                                                ))
+                                                .show_ui(ui, |ui| {
+                                                    for candidate in
+                                                        0..device_config::REMAP_CONTROL_COUNT
+                                                    {
+                                                        ui.selectable_value(
+                                                            target,
+                                                            candidate as u8,
+                                                            remap_control_label(candidate, language),
+                                                        );
+                                                    }
+                                                });
+                                            } else {
+                                                ui.label("");
+                                                ui.label("");
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let changed = self
+                                .device_button_mapping
+                                .as_ref()
+                                .is_some_and(|current| current != &self.selected_button_mapping);
+                            if ui
+                                .add_enabled(
+                                    mapping_enabled && changed,
+                                    primary_button(language.tr("应用并保存", "Apply and save")),
+                                )
+                                .clicked()
+                            {
+                                apply_button_mapping = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    mapping_enabled
+                                        && self
+                                            .device_button_mapping
+                                            .as_ref()
+                                            .is_some_and(|mapping| !mapping.is_identity()),
+                                    eframe::egui::Button::new(language.tr(
+                                        "恢复默认一对一",
+                                        "Restore one-to-one",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                reset_button_mapping = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.loading_button_mapping
+                                        && !self.applying_button_mapping,
+                                    eframe::egui::Button::new(language.tr(
+                                        "重新读取",
+                                        "Read again",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                refresh_button_mapping = true;
+                            }
+                        });
+                        if let Some(error) = &self.button_mapping_error {
+                            ui.add_space(8.0);
+                            notice(
+                                ui,
+                                NoticeTone::Warning,
+                                language.tr(
+                                    "19 控件映射不可用",
+                                    "19-control mapping unavailable",
+                                ),
+                                error,
+                            );
+                        } else if self.device_button_mapping.is_none() {
+                            ui.add_space(8.0);
+                            notice(
+                                ui,
+                                NoticeTone::Info,
+                                language.tr("请先读取设备", "Read the device first"),
+                                language.tr(
+                                    "需连接运行新版固件的 M61；旧固件不会被当作 15 键配置导入。",
+                                    "Connect an M61 running the new firmware. Legacy firmware is not imported as a 15-button configuration.",
+                                ),
+                            );
+                        }
                     });
 
                     ui.add_space(12.0);
@@ -6201,8 +8389,8 @@ impl eframe::App for FlasherApp {
                         });
                         ui.label(
                             eframe::egui::RichText::new(language.tr(
-                                "不限时长；可重复操作多次，采样充足后由用户手动进入下一项。断开设备时输出会自动停止。",
-                                "No time limit. Repeat actions as needed, then continue manually when samples are sufficient. Outputs stop on disconnect.",
+                                "不限时长；按键、方向键、摇杆、扳机、触摸和六轴输入会全程累计并自动判定。灯效、震动、扳机阻力和声音等主观输出由用户确认。",
+                                "No time limit. Buttons, D-pad, sticks, triggers, touch and six-axis input are accumulated throughout the guide and assessed automatically. Subjective LED, rumble, trigger-resistance and sound outputs remain user-confirmed.",
                             ))
                             .color(COLOR_TEXT_MUTED),
                         );
@@ -6253,12 +8441,118 @@ impl eframe::App for FlasherApp {
                                 guide_start = true;
                             }
                         } else {
+                            let automatic_phases = self
+                                .guided_test
+                                .phases
+                                .iter()
+                                .filter(|phase| phase.automatic)
+                                .collect::<Vec<_>>();
+                            let automatic_completed = automatic_phases
+                                .iter()
+                                .map(|phase| phase.completed_requirements())
+                                .sum::<usize>();
+                            let automatic_total = automatic_phases
+                                .iter()
+                                .map(|phase| phase.requirements.len())
+                                .sum::<usize>();
+                            let automatic_progress = if automatic_total == 0 {
+                                0.0
+                            } else {
+                                automatic_completed as f32 / automatic_total as f32
+                            };
+                            ui.add(
+                                eframe::egui::ProgressBar::new(automatic_progress)
+                                    .desired_width(ui.available_width().min(620.0))
+                                    .text(match self.language {
+                                        Language::ZhCn => format!(
+                                            "全部自动输入覆盖 {automatic_completed}/{automatic_total}"
+                                        ),
+                                        Language::En => format!(
+                                            "Overall automatic input coverage {automatic_completed}/{automatic_total}"
+                                        ),
+                                    }),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                for phase in automatic_phases {
+                                    let complete = phase.coverage_complete();
+                                    let percent = (phase.coverage_percent() * 100.0).round() as u32;
+                                    ui.label(
+                                        eframe::egui::RichText::new(format!(
+                                            "{} {} {percent}%",
+                                            if complete { "✓" } else { "○" },
+                                            language.tr(phase.title_zh, phase.title_en)
+                                        ))
+                                        .color(if complete {
+                                            COLOR_SUCCESS
+                                        } else {
+                                            COLOR_TEXT_MUTED
+                                        })
+                                        .background_color(if complete {
+                                            COLOR_SUCCESS_SOFT
+                                        } else {
+                                            COLOR_SURFACE_RAISED
+                                        }),
+                                    );
+                                }
+                            });
                             let phase = self.guided_test.phase();
                             ui.separator();
                             ui.strong(language.tr(phase.title_zh, phase.title_en));
                             ui.label(language.tr(phase.instruction_zh, phase.instruction_en));
                             ui.monospace(format!("Target: {}", phase.target));
-                            if !phase.samples.is_empty() {
+                            let automatic_phase = phase.automatic;
+                            if automatic_phase {
+                                let completed = phase.completed_requirements();
+                                let total = phase.requirements.len();
+                                ui.add(
+                                    eframe::egui::ProgressBar::new(phase.coverage_percent())
+                                        .desired_width(ui.available_width().min(520.0))
+                                        .text(match self.language {
+                                            Language::ZhCn => {
+                                                format!("自动覆盖 {completed}/{total}")
+                                            }
+                                            Language::En => {
+                                                format!("Automatic coverage {completed}/{total}")
+                                            }
+                                        }),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    for (key, target) in &phase.requirements {
+                                        let observed =
+                                            phase.samples.get(key).copied().unwrap_or_default();
+                                        let complete = observed >= *target;
+                                        let (symbol, color, background) = if complete {
+                                            ("✓", COLOR_SUCCESS, COLOR_SUCCESS_SOFT)
+                                        } else {
+                                            ("○", COLOR_TEXT_MUTED, COLOR_SURFACE_RAISED)
+                                        };
+                                        ui.label(
+                                            eframe::egui::RichText::new(format!(
+                                                "{symbol} {} ({observed}/{target})",
+                                                guided_requirement_label(key, language)
+                                            ))
+                                            .color(color)
+                                            .background_color(background),
+                                        );
+                                    }
+                                });
+                                let missing = phase.missing_requirements();
+                                if !missing.is_empty() {
+                                    ui.label(
+                                        eframe::egui::RichText::new(match self.language {
+                                            Language::ZhCn => format!(
+                                                "仍缺少 {} 项；完成后会自动进入下一步。",
+                                                missing.len()
+                                            ),
+                                            Language::En => format!(
+                                                "{} item(s) remain; the guide advances automatically when complete.",
+                                                missing.len()
+                                            ),
+                                        })
+                                        .color(COLOR_TEXT_MUTED),
+                                    );
+                                }
+                            } else if !phase.samples.is_empty() {
                                 ui.label(
                                     phase
                                         .samples
@@ -6305,23 +8599,39 @@ impl eframe::App for FlasherApp {
                             let phase_busy = self.guided_test.phase().id == "microphone"
                                 && self.device_test_audio_busy;
                             ui.horizontal_wrapped(|ui| {
-                                if ui.add_enabled(
-                                    self.device_test_connected && !phase_busy,
-                                    eframe::egui::Button::new(language.tr(
-                                        "通过并下一项",
-                                        "Pass and next",
-                                    )),
-                                ).clicked() {
-                                    guide_result = Some(guided_test::PhaseResult::Pass);
-                                }
-                                if ui.add_enabled(
-                                    !phase_busy,
-                                    eframe::egui::Button::new(language.tr(
-                                        "未生效并下一项",
-                                        "Not effective and next",
-                                    )),
-                                ).clicked() {
-                                    guide_result = Some(guided_test::PhaseResult::NotEffective);
+                                if automatic_phase {
+                                    if ui
+                                        .add_enabled(
+                                            !phase_busy,
+                                            eframe::egui::Button::new(language.tr(
+                                                "无法完成，记录缺失项并下一步",
+                                                "Cannot complete; record missing items and continue",
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        guide_result =
+                                            Some(guided_test::PhaseResult::NotEffective);
+                                    }
+                                } else {
+                                    if ui.add_enabled(
+                                        self.device_test_connected && !phase_busy,
+                                        eframe::egui::Button::new(language.tr(
+                                            "通过并下一项",
+                                            "Pass and next",
+                                        )),
+                                    ).clicked() {
+                                        guide_result = Some(guided_test::PhaseResult::Pass);
+                                    }
+                                    if ui.add_enabled(
+                                        !phase_busy,
+                                        eframe::egui::Button::new(language.tr(
+                                            "未生效并下一项",
+                                            "Not effective and next",
+                                        )),
+                                    ).clicked() {
+                                        guide_result = Some(guided_test::PhaseResult::NotEffective);
+                                    }
                                 }
                                 if ui.add_enabled(
                                     !phase_busy,
@@ -6352,6 +8662,33 @@ impl eframe::App for FlasherApp {
                                 }
                             });
                         }
+                        ui.separator();
+                        let guide_report_has_data = self.guided_test.active
+                            || guided_test_has_data(&self.guided_test.phases);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(
+                                    guide_report_has_data
+                                        && !self.loading_diagnostics
+                                        && !self.device_debug_final_snapshot_pending,
+                                    primary_button(language.tr(
+                                        "导出引导诊断测试报告 JSON",
+                                        "Export guided diagnostic report JSON",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                export_report = true;
+                            }
+                            ui.label(
+                                eframe::egui::RichText::new(language.tr(
+                                    "导出为统一报告；自动输入覆盖、人工输出确认、麦克风指标和已采集的 M61 快照都会保留，未完成项目会明确标记。",
+                                    "Exports the unified report with automatic input coverage, user-confirmed outputs, microphone metrics and captured M61 snapshots; unfinished items are explicitly marked.",
+                                ))
+                                .color(COLOR_TEXT_MUTED)
+                                .small(),
+                            );
+                        });
                     });
 
                     ui.add_space(12.0);
@@ -6479,7 +8816,7 @@ impl eframe::App for FlasherApp {
                     });
 
                     ui.add_space(12.0);
-                    eframe::egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.vertical(|ui| {
                         let enough_samples = metrics.sample_count >= 100;
                         let average = metrics.average_interval_ms.max(0.001);
                         let latest_runtime = self.device_debug_final.as_ref().or_else(|| {
@@ -6840,9 +9177,8 @@ impl eframe::App for FlasherApp {
                         });
 
                         ui.add_space(12.0);
-                        let has_guided_results = self.guided_test.phases.iter().any(|phase| {
-                            phase.result != guided_test::PhaseResult::Pending
-                        });
+                        let has_guided_results =
+                            guided_test_has_data(&self.guided_test.phases);
                         let has_runtime_snapshot = self
                             .runtime_diagnostics
                             .iter()
@@ -6878,6 +9214,7 @@ impl eframe::App for FlasherApp {
                             export_report = true;
                         }
                     });
+                });
                 });
 
             if start_benchmark {
@@ -6930,7 +9267,18 @@ impl eframe::App for FlasherApp {
             if let Some(result) = guide_result {
                 let phase_id = self.guided_test.phase().id;
                 self.reset_test_outputs();
-                self.guided_test.mark_and_next(result);
+                let automatically_completed = self.guided_test.mark_and_next(result);
+                if !automatically_completed.is_empty() {
+                    let names = automatically_completed
+                        .iter()
+                        .map(|(zh, en)| self.language.tr(zh, en))
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    self.device_test_status = match self.language {
+                        Language::ZhCn => format!("已自动完成：{names}"),
+                        Language::En => format!("Automatically completed: {names}"),
+                    };
+                }
                 if result == guided_test::PhaseResult::NotEffective || phase_id == "summary" {
                     self.capture_debug_snapshot();
                 }
@@ -7056,6 +9404,18 @@ impl eframe::App for FlasherApp {
                                         ));
                                         ui.end_row();
                                     });
+                            } else if report.build_profile.as_deref() == Some("standard")
+                                && report.error.is_none()
+                            {
+                                notice(
+                                    ui,
+                                    NoticeTone::Info,
+                                    language.tr("常用版已识别", "Standard identified"),
+                                    language.tr(
+                                        "该配置不生成运行快照；需要内部桥接延迟和计数器时，请安全切换到诊断版。",
+                                        "This profile does not produce runtime snapshots. Switch safely to Diagnostic for internal bridge latency and counters.",
+                                    ),
+                                );
                             } else if let Some(error) = &report.error {
                                 notice(
                                     ui,
@@ -7519,6 +9879,15 @@ mod tests {
             gui_release_label(&releases[0], Language::ZhCn),
             gui_release_label(&releases[1], Language::ZhCn)
         );
+    }
+
+    #[test]
+    fn partial_guided_input_is_exportable_before_a_phase_finishes() {
+        let mut guided = guided_test::GuidedTest::default();
+        assert!(!guided_test_has_data(&guided.phases));
+        guided.phases[1].samples.insert("cross".to_owned(), 1);
+        assert!(guided_test_has_data(&guided.phases));
+        assert_eq!(guided.phases[1].result, guided_test::PhaseResult::Pending);
     }
 
     #[test]
