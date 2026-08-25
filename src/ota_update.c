@@ -574,6 +574,14 @@ static void process_data(const uint8_t *report)
     uint32_t offset;
     uint8_t data_len;
 
+    /* A flash/header failure can leave several DATA events already queued.
+     * Preserve the first terminal error so those stale events cannot replace
+     * FLASH/HEADER with the less useful BAD_STATE code. */
+    if (ota_ctx.state == OTA_STATE_ERROR) {
+        publish_status();
+        return;
+    }
+
     if (!validate_frame(report, &error)) {
         ota_ctx.error = error;
         publish_status();

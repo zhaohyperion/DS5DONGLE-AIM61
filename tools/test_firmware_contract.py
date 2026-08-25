@@ -557,6 +557,11 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertIn("OTA_SESSION_IDLE_TIMEOUT_MS", ota)
         self.assertIn("fail_transfer(OTA_ERROR_TIMEOUT)", ota)
 
+        process_data = ota[ota.index("static void process_data") :
+                           ota.index("static bool begin_matches_live_session")]
+        self.assertIn("ota_ctx.state == OTA_STATE_ERROR", process_data)
+        self.assertIn("Preserve the first terminal error", process_data)
+
         begin = ota[ota.index("static void process_begin") :
                     ota.index("static void process_auth")]
         self.assertIn("OTA_BEGIN_SEMVER_OFFSET] == 0xFFu", begin)
@@ -569,11 +574,15 @@ class FirmwareContractTests(unittest.TestCase):
             "target_compile_definitions(app PRIVATE CONFIG_ENABLE_IMG_HASH)",
             cmake,
         )
-        self.assertIn(
-            "target_compile_definitions(libfota PRIVATE CONFIG_OTA_VERSION_CHECK)",
-            cmake,
-        )
+        self.assertNotIn("CONFIG_OTA_VERSION_CHECK", cmake)
+        self.assertIn("same-version Standard <-> Diagnostic switch", cmake)
         self.assertIn("DS5_SELECTED_VERSION_LENGTH GREATER 8", cmake)
+
+        usb = read("src/usb_gamepad.c")
+        self.assertIn("runtime_diag_compat_response_report_id", usb)
+        self.assertIn("report_id == 0xF8 || report_id == 0xF9", usb)
+        self.assertIn("runtime_diag_get_selected_report(feature_resp_buf + 1)", usb)
+        self.assertIn("RUNTIME_DIAG_SELECT_PAGE", usb)
 
 
 if __name__ == "__main__":

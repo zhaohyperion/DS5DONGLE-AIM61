@@ -3,24 +3,28 @@
 面向 Ai-M61-32S-Kit（BL618）的 DualSense / DualSense Edge 蓝牙转 USB 适配器固件，以及配套的 Windows 原生测试、诊断和刷写工具。
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
-![Firmware](https://img.shields.io/badge/firmware-v3.6.0-orange)
-![Flasher](https://img.shields.io/badge/flasher-v1.4.0-0067b8)
+![Firmware](https://img.shields.io/badge/firmware-v3.6.2-orange)
+![Flasher](https://img.shields.io/badge/flasher-v1.4.2-0067b8)
 ![USB](https://img.shields.io/badge/USB-High--Speed-success)
 
 > 本项目与 Sony Interactive Entertainment 无关。“DualSense”“DualSense Edge”和“PlayStation”是其各自权利人的商标。固件模拟 Sony USB VID/PID，请自行评估使用环境和风险。
 
-## v3.6.0 发布组成
+## v3.6.2 发布组成
 
-v3.6.0 只提供 Ai-M61 High-Speed 两种配置，USB 描述符、产品名、VID/PID 和核心转发行为保持一致：
+v3.6.2 只提供 Ai-M61 High-Speed 两种配置，USB 描述符、产品名、VID/PID 和核心转发行为保持一致：
 
 | 固件 | 文件 | 用途 |
 |---|---|---|
-| 常用版 HS | `DS5Dongle-aim61-hs-v3.6.0.zip` | 日常使用；性能优先，不创建诊断任务，也不生成 `0xFD` 快照 |
-| 诊断版 HS | `DS5Dongle-aim61-hs-diag-v3.6.0.zip` | 引导测试、内部 RX/TX/音频/队列/内存诊断和持续负载 |
+| 常用版 HS / UART 完整刷写 | `DS5Dongle-aim61-hs-standard-uart-full-v3.6.2.zip` | 首次部署或救援；包含 Boot2、分区表和应用固件 |
+| 常用版 HS / OTA | `DS5Dongle-aim61-hs-standard-ota-v3.6.2.zip` | 日常最低开销运行；仅包含签名 OTA 镜像与清单 |
+| 诊断版 HS / UART 完整刷写 | `DS5Dongle-aim61-hs-diagnostic-uart-full-v3.6.2.zip` | 通过 CH340 直接部署诊断版 |
+| 诊断版 HS / OTA | `DS5Dongle-aim61-hs-diagnostic-ota-v3.6.2.zip` | 进入诊断模式；内部 RX/TX/音频/队列/内存快照 |
 
-v3.6.0 首先作为 **Pre-release** 发布，不删除或替换 v3.5.1/v3.5.2。刷写器默认只显示最新常用版并把 v3.6.0 常用版作为 OTA 目标；诊断版位于“高级固件”。回到常用版同样使用签名 OTA。
+v3.6.2 首先作为 **Pre-release** 发布，不删除或替换 v3.5.1/v3.5.2/v3.6.0/v3.6.1。刷写器默认只显示最新常用版并把 v3.6.2 常用版作为 OTA 目标；诊断版位于“高级固件”。回到常用版同样使用签名 OTA。
 
-Windows 工具发布文件：`DS5Dongle-Flasher-Windows-v1.4.0.exe`。GitHub Release 只公开两份固件 ZIP、一个 EXE 和总 `SHA256SUMS.txt`；裸 `.bin` 仅保留在 CI 构建产物中。
+Windows 工具发布文件：`DS5Dongle-Flasher-Windows-v1.4.2.exe`。GitHub Release 公开四份用途互斥的固件 ZIP、一个 EXE 和总 `SHA256SUMS.txt`；裸 `.bin` 与 `.bin.ota` 仅保留在 CI 构建产物中。
+
+v3.6.2/v1.4.2 将快照回退改为已由真机确认可读的单次 `0xF8` 身份通道，并在快照解码和报告导出前执行数据完整性自检。Windows HID 间隔采样仍不依赖固件快照；若 3 秒内没有任何可计时报告，工具会明确停止并报错，不会继续生成零样本报告。
 
 四个页签均支持整页鼠标滚轮和滚动条浏览，在较小窗口或 Windows 高 DPI 缩放下仍可访问页面底部操作。
 
@@ -97,7 +101,7 @@ $env:BL_SDK_BASE = "C:\path\to\bouffalo_sdk"
 $env:TOOLCHAIN_PATH = "C:\path\to\toolchain_gcc_t-head_windows"
 $env:BOARD_TYPE = "aim61"
 $env:USB_SPEED = "hs"
-$env:FIRMWARE_VERSION = "3.6.0"
+$env:FIRMWARE_VERSION = "3.6.2"
 
 $env:DS5_BUILD_PROFILE = "standard"
 $env:DS5_LOG_LEVEL = "0"
@@ -112,14 +116,14 @@ $env:DS5_LOG_LEVEL = "1"
 
 ```powershell
 python tools\package_firmware.py --board aim61 --usb-speed hs --profile standard `
-  --version 3.6.0 --firmware-dir firmware\aim61 --output-dir dist
+  --version 3.6.2 --firmware-dir firmware\aim61 --output-dir dist
 python tools\package_firmware.py --board aim61 --usb-speed hs --profile diagnostic `
-  --version 3.6.0 --firmware-dir firmware\aim61 --output-dir dist
+  --version 3.6.2 --firmware-dir firmware\aim61 --output-dir dist
 ```
 
 ## 刷写与配对
 
-1. 从 [Releases](https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases) 下载 v1.4.0 工具并核对 `SHA256SUMS.txt`。
+1. 从 [Releases](https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases) 下载 v1.4.2 工具并核对 `SHA256SUMS.txt`。
 2. 按住 Ai-M61 的 **BOOT**，短按 **RESET** 后松开 BOOT，使其进入 UART ISP。
 3. 在“固件刷写”页选择 CH340 端口和完整 ZIP；工具会检查板型、HS 配置、文件大小和包内 SHA-256。
 4. 正常复位。手柄关机时长按 **PS + Create** 进入蓝牙配对。
@@ -130,7 +134,7 @@ python tools\package_firmware.py --board aim61 --usb-speed hs --profile diagnost
 
 OTA A/B 槽位位于板载 SPI Flash，不在 PSRAM。PSRAM 断电即失且不是可信启动介质，只能作为下载/诊断期间的临时缓冲。A/B 固件交换不会持续占用 CPU；只有下载、校验和写 Flash 阶段会产生短时负载。
 
-同版本 `standard ↔ diagnostic` 允许显式切换，但自动更新只跟随相同配置。v3.6.0 不自动降级；需要回退时使用高级 OTA 明确确认或 UART 完整刷写。配对、映射、宏和设置在配置切换时保留。协议细节见 [`docs/OTA.md`](docs/OTA.md)。
+同版本 `standard ↔ diagnostic` 允许显式切换，但自动更新只跟随相同配置。v3.6.2 不自动降级；需要回退时使用高级 OTA 明确确认或 UART 完整刷写。配对、映射、宏和设置在配置切换时保留。协议细节见 [`docs/OTA.md`](docs/OTA.md)。
 
 ## 测试
 

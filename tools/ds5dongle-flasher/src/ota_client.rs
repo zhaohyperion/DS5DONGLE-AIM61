@@ -42,6 +42,48 @@ const STATE_ERROR: u8 = 6;
 const CAP_SIGNATURE_REQUIRED: u32 = 1 << 8;
 const CAP_KEY_CONFIGURED: u32 = 1 << 9;
 
+fn ota_error_name(error: u8) -> &'static str {
+    match error {
+        0 => "OK",
+        1 => "BAD_MAGIC",
+        2 => "BAD_VERSION",
+        3 => "BAD_OPCODE",
+        4 => "BAD_STATE",
+        5 => "BAD_SESSION",
+        6 => "BAD_OFFSET",
+        7 => "BAD_LENGTH",
+        8 => "BAD_CRC",
+        9 => "BAD_TARGET",
+        10 => "TOO_LARGE",
+        11 => "QUEUE_FULL",
+        12 => "FLASH",
+        13 => "HASH",
+        14 => "HEADER",
+        15 => "INTERNAL",
+        16 => "AUTH_REQUIRED",
+        17 => "AUTH_FAILED",
+        18 => "KEY_MISSING",
+        19 => "TIMEOUT",
+        _ => "UNKNOWN",
+    }
+}
+
+fn ota_error_hint(error: u8) -> &'static str {
+    match error {
+        4 => "device OTA state changed unexpectedly; reconnect the device before retrying",
+        9 => {
+            "target/profile/version rejected; downgrades and reinstalling the same profile/version are blocked"
+        }
+        11 => "device receive queue overflowed; retry with the updated flasher transfer pacing",
+        12 => "inactive-slot flash erase/write failed",
+        13 => "flashed image SHA-256 verification failed",
+        14 => "device rejected the Bouffalo OTA header",
+        17 => "device rejected the release signature",
+        19 => "OTA session was inactive for too long",
+        _ => "see the OTA diagnostics documentation for this device error",
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct OtaSignature {
     algorithm: String,
@@ -152,6 +194,7 @@ fn load_ota_package(path: &Path, expected_profile: BuildProfile) -> Result<OtaPa
 
     let mut image = None;
     let mut manifest = None;
+    let mut checksum_manifest = false;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         if entry.is_dir() {
@@ -185,9 +228,19 @@ fn load_ota_package(path: &Path, expected_profile: BuildProfile) -> Result<OtaPa
             let mut bytes = Vec::with_capacity(entry.size() as usize);
             entry.read_to_end(&mut bytes)?;
             manifest = Some(bytes);
+        } else if name == "sha256sums.txt" {
+            if checksum_manifest {
+                bail!("OTA ZIP contains multiple SHA256SUMS.txt files")
+            }
+            checksum_manifest = true;
+        } else {
+            bail!("OTA ZIP contains a non-OTA file: {name}")
         }
     }
 
+    if !checksum_manifest {
+        bail!("OTA ZIP has no SHA256SUMS.txt")
+    }
     let image = image.context("firmware ZIP has no signed .bin.ota image")?;
     let manifest: OtaManifest =
         serde_json::from_slice(&manifest.context("firmware ZIP has no .ota.json manifest")?)
@@ -602,11 +655,13 @@ fn wait_status(
         };
         if status.opcode == CTRL_ERROR || status.state == STATE_ERROR || status.error != 0 {
             bail!(
-                "device rejected OTA command: error={}, state={}, accepted={}, committed={}",
+                "device rejected OTA command: {} (error={}), state={}, accepted={}, committed={}; {}",
+                ota_error_name(status.error),
                 status.error,
                 status.state,
                 status.accepted_offset,
-                status.committed_offset
+                status.committed_offset,
+                ota_error_hint(status.error)
             )
         }
         if status.opcode == CTRL_ACK
@@ -712,6 +767,14 @@ mod tests {
         assert!(parse_version("v3.5.2").is_err());
         assert!(parse_version("3.5").is_err());
         assert!(parse_version("3.5.255").is_err());
+    }
+
+    #[test]
+    fn renders_device_ota_errors_for_users() {
+        assert_eq!(ota_error_name(9), "BAD_TARGET");
+        assert_eq!(ota_error_name(12), "FLASH");
+        assert_eq!(ota_error_name(255), "UNKNOWN");
+        assert!(ota_error_hint(9).contains("profile/version"));
     }
 
     #[test]

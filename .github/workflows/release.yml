@@ -1,4 +1,4 @@
-name: Build v3.6.0 firmware and Flasher v1.4.0
+name: Build v3.6.2 firmware and Flasher v1.4.2
 
 on:
   pull_request:
@@ -54,8 +54,8 @@ jobs:
           USB_SPEED: hs
           DS5_BUILD_PROFILE: ${{ matrix.profile }}
           DS5_LOG_LEVEL: ${{ matrix.profile == 'diagnostic' && '1' || '0' }}
-          FIRMWARE_VERSION: 3.6.0
-          PROJECT_SDK_VERSION: 3.6.0
+          FIRMWARE_VERSION: 3.6.2
+          PROJECT_SDK_VERSION: 3.6.2
           OTA_P256_PUBLIC_KEY_SEC1_B64: ${{ vars.OTA_P256_PUBLIC_KEY_SEC1_B64 }}
         run: |
           if ("${{ github.event_name }}" -eq "release") {
@@ -71,12 +71,11 @@ jobs:
           .\build_windows.bat rebuild
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools\package_firmware.py --board aim61 --usb-speed hs `
-            --profile $env:DS5_BUILD_PROFILE --version 3.6.0 `
+            --profile $env:DS5_BUILD_PROFILE --version 3.6.2 `
             --firmware-dir firmware\aim61 --output-dir dist
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $suffix = if ($env:DS5_BUILD_PROFILE -eq 'diagnostic') { '-diag' } else { '' }
           Copy-Item build\build_out\ds5dongle_bl618_bl616.bin.ota `
-            "dist\DS5Dongle-aim61-hs$suffix-v3.6.0.bin.ota"
+            "dist\DS5Dongle-aim61-hs-$env:DS5_BUILD_PROFILE-v3.6.2.bin.ota"
       - uses: actions/upload-artifact@v4
         with:
           name: firmware-aim61-hs-${{ matrix.profile }}
@@ -102,16 +101,16 @@ jobs:
         env:
           M61_BLFLASHCOMMAND: ${{ github.workspace }}\dependencies\bouffalo_sdk\tools\bflb_tools\bouffalo_flash_cube\BLFlashCommand.exe
         run: |
-          python -m unittest tools.test_package_firmware tools.test_ota_release tools.test_ota_protocol tools.test_firmware_contract
+          python -m unittest tools.test_package_firmware tools.test_package_ota tools.test_ota_release tools.test_ota_protocol tools.test_firmware_contract
           cargo fmt --manifest-path tools\ds5dongle-flasher\Cargo.toml -- --check
           cargo test --locked --manifest-path tools\ds5dongle-flasher\Cargo.toml
           cargo build --locked --release --manifest-path tools\ds5dongle-flasher\Cargo.toml
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item tools\ds5dongle-flasher\target\release\ds5dongle-flasher.exe `
-            dist\DS5Dongle-Flasher-Windows-v1.4.0.exe
+            dist\DS5Dongle-Flasher-Windows-v1.4.2.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-flasher-v1.4.0
+          name: windows-flasher-v1.4.2
           path: dist/*
           if-no-files-found: error
 
@@ -127,7 +126,7 @@ jobs:
         with: {path: artifacts}
       - uses: actions/setup-python@v5
         with: {python-version: "3.13"}
-      - name: Sign profile-bound OTA metadata and place it inside each ZIP
+      - name: Sign and create profile-bound OTA-only ZIPs
         shell: pwsh
         env:
           OTA_P256_PRIVATE_KEY_B64: ${{ secrets.OTA_P256_PRIVATE_KEY_B64 }}
@@ -156,21 +155,22 @@ jobs:
           }
           $channel = if ('${{ github.event.release.prerelease }}' -eq 'true') { 'beta' } else { 'stable' }
           foreach ($profile in @('standard', 'diagnostic')) {
-            $suffix = if ($profile -eq 'diagnostic') { '-diag' } else { '' }
-            $zip = Get-ChildItem artifacts -Recurse -File -Filter "DS5Dongle-aim61-hs$suffix-v3.6.0.zip" | Select-Object -First 1
-            $image = Get-ChildItem artifacts -Recurse -File -Filter "DS5Dongle-aim61-hs$suffix-v3.6.0.bin.ota" | Select-Object -First 1
-            if (-not $zip -or -not $image) { throw "missing $profile firmware artifact" }
-            $manifest = Join-Path $env:RUNNER_TEMP "DS5Dongle-aim61-hs-$profile-v3.6.0.ota.json"
-            $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/$($zip.Name)"
+            $uart = Get-ChildItem artifacts -Recurse -File -Filter "DS5Dongle-aim61-hs-$profile-uart-full-v3.6.2.zip" | Select-Object -First 1
+            $image = Get-ChildItem artifacts -Recurse -File -Filter "DS5Dongle-aim61-hs-$profile-v3.6.2.bin.ota" | Select-Object -First 1
+            if (-not $uart -or -not $image) { throw "missing $profile firmware artifact" }
+            $manifest = Join-Path $image.DirectoryName "DS5Dongle-aim61-hs-$profile-v3.6.2.ota.json"
+            $otaName = "DS5Dongle-aim61-hs-$profile-ota-v3.6.2.zip"
+            $otaArchive = Join-Path $image.DirectoryName $otaName
+            $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/$otaName"
             python tools\ota_release.py generate --image $image.FullName --manifest $manifest `
-              --channel $channel --version 3.6.0 --usb-speed hs --profile $profile `
+              --channel $channel --version 3.6.2 --usb-speed hs --profile $profile `
               --url $url --private-key $privateKey --key-id $env:OTA_P256_KEY_ID
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             python tools\ota_release.py verify --image $image.FullName --manifest $manifest `
               --public-key $publicPem --expected-key-id $env:OTA_P256_KEY_ID
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            python tools\repack_firmware_zip.py --archive $zip.FullName `
-              --ota-image $image.FullName --ota-manifest $manifest
+            python tools\package_ota_zip.py --archive $otaArchive `
+              --image $image.FullName --manifest $manifest
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Assemble the intentionally small public asset set
@@ -179,15 +179,19 @@ jobs:
           New-Item -ItemType Directory -Force release | Out-Null
           Get-ChildItem artifacts -Recurse -File | Where-Object {
             $_.Name -in @(
-              'DS5Dongle-aim61-hs-v3.6.0.zip',
-              'DS5Dongle-aim61-hs-diag-v3.6.0.zip',
-              'DS5Dongle-Flasher-Windows-v1.4.0.exe'
+              'DS5Dongle-aim61-hs-standard-uart-full-v3.6.2.zip',
+              'DS5Dongle-aim61-hs-standard-ota-v3.6.2.zip',
+              'DS5Dongle-aim61-hs-diagnostic-uart-full-v3.6.2.zip',
+              'DS5Dongle-aim61-hs-diagnostic-ota-v3.6.2.zip',
+              'DS5Dongle-Flasher-Windows-v1.4.2.exe'
             )
           } | Copy-Item -Destination release
           $required = @(
-            'DS5Dongle-aim61-hs-v3.6.0.zip',
-            'DS5Dongle-aim61-hs-diag-v3.6.0.zip',
-            'DS5Dongle-Flasher-Windows-v1.4.0.exe'
+            'DS5Dongle-aim61-hs-standard-uart-full-v3.6.2.zip',
+            'DS5Dongle-aim61-hs-standard-ota-v3.6.2.zip',
+            'DS5Dongle-aim61-hs-diagnostic-uart-full-v3.6.2.zip',
+            'DS5Dongle-aim61-hs-diagnostic-ota-v3.6.2.zip',
+            'DS5Dongle-Flasher-Windows-v1.4.2.exe'
           )
           foreach ($name in $required) {
             if (-not (Test-Path "release\$name")) { throw "missing release asset: $name" }

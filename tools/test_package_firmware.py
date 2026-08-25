@@ -40,13 +40,21 @@ class PackageFirmwareTests(unittest.TestCase):
                 check=True,
             )
             package = next(output.glob("*.zip"))
+            expected_name = (
+                f"DS5Dongle-{board}-{usb_speed}-{profile}"
+                "-uart-full-v1.2.3.zip"
+            )
+            self.assertEqual(package.name, expected_name)
             with zipfile.ZipFile(package) as archive:
                 manifest = json.loads(archive.read("firmware.json"))
+                self.assertEqual(manifest["package_kind"], "uart-full")
                 self.assertEqual(manifest["board"], board)
                 self.assertEqual(manifest["usb_speed"], usb_speed)
                 self.assertEqual(manifest["profile"], profile)
                 self.assertIn(firmware_name, archive.namelist())
                 self.assertIn("firmware.json", archive.read("SHA256SUMS.txt").decode())
+                self.assertFalse(any(name.endswith(".bin.ota") for name in archive.namelist()))
+                self.assertFalse(any(name.endswith(".ota.json") for name in archive.namelist()))
 
     def test_aim61_default_package_contains_manifest_and_checksums(self):
         self.assert_package("aim61", "fs")

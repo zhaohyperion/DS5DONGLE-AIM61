@@ -1535,6 +1535,14 @@ void usb_gamepad_get_link_status(struct usb_gamepad_link_status *out)
 /* +1 for Report ID prefix required by CherryUSB */
 static uint8_t feature_resp_buf[FEATURE_DATA_MAX + 1];
 static uint8_t kbd_idle_report[USB_KBD_EP_MPS];
+#if DS5_DIAGNOSTIC_BUILD
+/* Windows can retain an old preparsed HID descriptor that has no usable
+ * 0xFD entry.  The long-standing 0xF8 identity report is known to remain
+ * readable on those device instances.  A page selector sent through 0xF8
+ * arms exactly one diagnostic response, after which normal firmware-identity
+ * reads resume.  0xF9 remains accepted for compatibility with v3.6.1 tools. */
+static volatile uint8_t runtime_diag_compat_response_report_id;
+#endif
 
 static bool is_dongle_cmd(uint8_t report_id)
 {
@@ -1659,6 +1667,15 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             *len  = 1 + cfg_len;
             LOG_ISR("[USB-ISR] GET_REPORT(0xF7) config %u bytes\n", cfg_len);
         } else if (report_id == 0xF8) {
+#if DS5_DIAGNOSTIC_BUILD
+            if (runtime_diag_compat_response_report_id == report_id) {
+                runtime_diag_compat_response_report_id = 0;
+                runtime_diag_get_selected_report(feature_resp_buf + 1);
+                *data = feature_resp_buf;
+                *len = 1 + RUNTIME_DIAG_REPORT_SIZE;
+                return;
+            }
+#endif
             uint16_t ver_len = strlen(OTA_FIRMWARE_VERSION);
             if (ver_len > FEATURE_DATA_MAX - 1u)
                 ver_len = FEATURE_DATA_MAX - 1u;
@@ -1674,6 +1691,15 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             *len  = 1 + ver_len;
             LOG_ISR("[USB-ISR] GET_REPORT(0xF8) firmware version\n");
         } else if (report_id == 0xF9) {
+#if DS5_DIAGNOSTIC_BUILD
+            if (runtime_diag_compat_response_report_id == report_id) {
+                runtime_diag_compat_response_report_id = 0;
+                runtime_diag_get_selected_report(feature_resp_buf + 1);
+                *data = feature_resp_buf;
+                *len = 1 + RUNTIME_DIAG_REPORT_SIZE;
+                return;
+            }
+#endif
             extern int8_t bt_hid_host_get_cached_rssi(void);
             extern uint8_t get_battery_level(void);
             extern uint8_t get_battery_state(void);
@@ -1791,6 +1817,15 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         return;
     }
 #if DS5_DIAGNOSTIC_BUILD
+    if ((report_id == 0xF8 || report_id == 0xF9) && report_type == 0x03 &&
+        payload_len >= RUNTIME_DIAG_SELECT_SIZE &&
+        (payload[0] == RUNTIME_DIAG_SELECT_PAGE ||
+         payload[0] == RUNTIME_DIAG_SET_SESSION)) {
+        bool accepted = runtime_diag_select_page_from_isr(payload, payload_len);
+        runtime_diag_compat_response_report_id =
+            accepted && payload[0] == RUNTIME_DIAG_SELECT_PAGE ? report_id : 0;
+        return;
+    }
     if (report_id == RUNTIME_DIAG_REPORT_ID && report_type == 0x03) {
         /* Selection is intentionally global and harmless: bounded validation
          * plus one atomic byte store, including during OTA maintenance. */

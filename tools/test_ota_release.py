@@ -48,10 +48,13 @@ class OtaReleaseTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('FIRMWARE_VERSION: 3.6.0', workflow)
-        self.assertIn('PROJECT_SDK_VERSION: 3.6.0', workflow)
+        self.assertIn('FIRMWARE_VERSION: 3.6.2', workflow)
+        self.assertIn('PROJECT_SDK_VERSION: 3.6.2', workflow)
         self.assertIn('profile: [standard, diagnostic]', workflow)
-        self.assertIn('DS5Dongle-aim61-hs$suffix-v3.6.0.bin.ota', workflow)
+        self.assertIn(
+            'DS5Dongle-aim61-hs-$env:DS5_BUILD_PROFILE-v3.6.2.bin.ota',
+            workflow,
+        )
         self.assertIn("foreach ($profile in @('standard', 'diagnostic'))", workflow)
         self.assertIn('--profile $profile', workflow)
         self.assertIn("secrets.OTA_P256_PRIVATE_KEY_B64", workflow)
@@ -69,7 +72,12 @@ class OtaReleaseTests(unittest.TestCase):
         self.assertIn("if ($configuredHash -ne $derivedHash)", workflow)
         self.assertIn("path: dist/*", workflow)
         self.assertIn("runs-on: windows-2025", workflow)
-        self.assertIn("tools\\repack_firmware_zip.py", workflow)
+        self.assertIn("tools\\package_ota_zip.py", workflow)
+        self.assertIn("-standard-uart-full-v3.6.2.zip", workflow)
+        self.assertIn("-diagnostic-uart-full-v3.6.2.zip", workflow)
+        self.assertIn("-standard-ota-v3.6.2.zip", workflow)
+        self.assertIn("-diagnostic-ota-v3.6.2.zip", workflow)
+        self.assertNotIn("repack_firmware_zip.py", workflow)
         self.assertNotIn("ED25519", workflow.upper())
 
     def test_parses_raw_header_and_checks_both_hashes(self) -> None:

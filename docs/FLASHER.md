@@ -1,6 +1,6 @@
-# DS5Dongle Windows 工具中心 v1.4.0
+# DS5Dongle Windows 工具中心 v1.4.2
 
-`DS5Dongle-Flasher-Windows-v1.4.0.exe` 是 DS5DONGLE-AIM61 的单文件 Windows 原生工具。公开配置网站已下线，仓库不再包含配置网页代码；测试、映射与宏、诊断、OTA 配置切换和 UART 恢复都在本机完成，诊断数据不会自动上传。
+`DS5Dongle-Flasher-Windows-v1.4.2.exe` 是 DS5DONGLE-AIM61 的单文件 Windows 原生工具。公开配置网站已下线，仓库不再包含配置网页代码；测试、映射与宏、诊断、OTA 配置切换和 UART 恢复都在本机完成，诊断数据不会自动上传。
 
 ## 四个页签
 
@@ -42,7 +42,7 @@
 
 ### 4. 固件刷写
 
-默认在线列表只显示最新 **AIM61 High-Speed Standard（常用版）**。勾选“高级固件（显示诊断版）”后才显示 Diagnostic ZIP。也可选择本地完整 ZIP 或解包目录；工具会显示实际来源路径，且两者同样强制要求 `SHA256SUMS.txt`。
+默认在线 UART 列表只显示最新 **AIM61 High-Speed Standard（常用版）`uart-full`**。勾选“高级固件（显示诊断版）”后才显示 Diagnostic `uart-full` ZIP。也可选择本地完整 ZIP 或解包目录；工具会显示实际来源路径，且两者同样强制要求 `SHA256SUMS.txt`。带 `ota` 标识的资产不会进入 UART 列表。
 
 完整 UART 包必须包含：
 
@@ -52,7 +52,7 @@
 - `partition.bin`；
 - 与清单的板型、速度和配置一致的应用 `.bin`。
 
-工具拒绝路径穿越、重复文件、异常尺寸、SHA-256 不匹配、清单/文件名不一致以及不完整 Release。在线资产还必须带 GitHub 提供的 SHA-256 digest。
+工具拒绝路径穿越、重复文件、异常尺寸、SHA-256 不匹配、清单/文件名不一致、混入 `.bin.ota`/`.ota.json` 以及不完整 Release。在线资产还必须带 GitHub 提供的 SHA-256 digest。
 
 UART 恢复步骤：
 
@@ -72,23 +72,25 @@ UART 恢复步骤：
 
 - Standard 与 Diagnostic 使用相同 HID 描述符长度，防止 Windows 在同 VID/PID 下缓存旧的 Feature Report 能力；Standard 不创建诊断任务、不响应 `0xFD`，也不采集内部桥接计时，适合日常最低开销运行；
 - Diagnostic 仅在主机显式开启会话时每秒生成 `0xFD` 快照；
-- “进入诊断模式（OTA）”和“恢复常用版（OTA）”使用 Release ZIP 内的签名 `.bin.ota` 与清单；切换前自动停止所有测试输出；
+- “进入诊断模式（OTA）”和“恢复常用版（OTA）”只使用 Release 中带 `ota` 标识的纯 OTA ZIP；切换前自动停止所有测试输出；
 - “选择本地签名 OTA ZIP”支持手动选择官方/CI 签名包；选择时即在电脑端校验 ZIP 结构、目标、RAW 头、正文 SHA-256 和固定 P-256 公钥签名，确认执行前再校验一次以防文件被替换；
 - 同版本 `standard ↔ diagnostic` 允许切换。设备再次校验板型、HS、版本策略、正文 SHA-256 和 P-256 签名后才切换 A/B 槽；重启后工具等待 USB 重新枚举并核对版本/配置，诊断版还必须成功读取 `0xFD` 才报告完成。
 
 ## 运行态信息与诊断
 
-`0xF8` Feature Report 返回 `版本|配置`，例如 `3.6.0|standard`。Standard 与 Diagnostic 都支持读取身份；只有 Diagnostic 响应 `0xFD` v2 快照。v3.6.0 同时根据版本生成 USB `bcdDevice`（3.6.0 为 3.60），促使 Windows 丢弃旧固件缓存的 HID 预解析数据。旧固件返回单独版本或 v1 快照时，工具按兼容模式显示，缺失字段标记为“不支持”，不会伪造为零；若 Windows 仍返回全零 `0xFD`，工具会明确提示删除旧 HID 设备实例后重连。
+`0xF8` Feature Report 通常返回 `版本|配置`，例如 `3.6.2|standard`。Standard 与 Diagnostic 都支持读取身份；Diagnostic 响应 `0xFD` v2 快照。v3.6.2 在 `0xFD` 返回全零时，通过当前真机已确认可读的 `0xF8` 通道发送选择命令；紧随其后的一次 `0xF8` GET 返回快照页，然后立即恢复固件身份语义。旧固件返回单独版本或 v1 快照时，工具按兼容模式显示，缺失字段标记为“不支持”，不会伪造为零。
+
+性能压力测试的 Windows HID 间隔采样与固件快照完全解耦。引导式诊断未手动结束时，启动性能测试会安全结束引导输出、保留已经取得的结果并立即开始计时；快照失败只影响 M61 内部计数，不会阻止 HID 性能样本。若 3 秒内没有可计时报告，v1.4.2 会停止测试并给出明确错误。快照页和报告导出都会先做数据自检；启动占位页、页数/标志不完整、零时长却存在样本等矛盾数据会被拒绝，部分报告会列出实际存在和缺失的数据区段。
 
 CLI：
 
 ```powershell
-.\DS5Dongle-Flasher-Windows-v1.4.0.exe --device-info
-.\DS5Dongle-Flasher-Windows-v1.4.0.exe --diagnostics
-.\DS5Dongle-Flasher-Windows-v1.4.0.exe --list
-.\DS5Dongle-Flasher-Windows-v1.4.0.exe --list-releases --board aim61 --usb-speed hs
-.\DS5Dongle-Flasher-Windows-v1.4.0.exe --verify-release --release v3.6.0 --board aim61 --usb-speed hs
-.\DS5Dongle-Flasher-Windows-v1.4.0.exe --release v3.6.0 --board aim61 --usb-speed hs --port COM3 --dry-run
+.\DS5Dongle-Flasher-Windows-v1.4.2.exe --device-info
+.\DS5Dongle-Flasher-Windows-v1.4.2.exe --diagnostics
+.\DS5Dongle-Flasher-Windows-v1.4.2.exe --list
+.\DS5Dongle-Flasher-Windows-v1.4.2.exe --list-releases --board aim61 --usb-speed hs
+.\DS5Dongle-Flasher-Windows-v1.4.2.exe --verify-release --release v3.6.2 --board aim61 --usb-speed hs
+.\DS5Dongle-Flasher-Windows-v1.4.2.exe --release v3.6.2 --board aim61 --usb-speed hs --port COM3 --dry-run
 ```
 
 CLI 的自动选择同样优先最新 AIM61 HS Standard。诊断版的显式选择和应用级 OTA 主要通过 GUI 完成。
@@ -97,15 +99,15 @@ CLI 的自动选择同样优先最新 AIM61 HS Standard。诊断版的显式选�
 
 ```powershell
 python tools\package_firmware.py --board aim61 --usb-speed hs `
-  --profile standard --version 3.6.0 `
+  --profile standard --version 3.6.2 `
   --firmware-dir firmware\aim61 --output-dir dist
 
 python tools\package_firmware.py --board aim61 --usb-speed hs `
-  --profile diagnostic --version 3.6.0 `
+  --profile diagnostic --version 3.6.2 `
   --firmware-dir firmware\aim61 --output-dir dist
 ```
 
-完整 UART ZIP 与应用级 `.bin.ota` 不可互换。Boot2、分区表或两槽均损坏时，应用级 OTA 无法救援，必须使用 UART 完整刷写。
+完整 `uart-full` ZIP 与签名 `ota` ZIP 不可互换。Boot2、分区表或两槽均损坏时，应用级 OTA 无法救援，必须使用 UART 完整刷写。
 
 ## 构建刷写器
 

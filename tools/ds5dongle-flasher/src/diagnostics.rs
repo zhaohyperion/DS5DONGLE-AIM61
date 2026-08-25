@@ -8,6 +8,7 @@ use super::{
 };
 
 pub const REPORT_ID: u8 = 0xfd;
+const FALLBACK_REPORT_ID: u8 = 0xf8;
 const REPORT_SIZE: usize = 63;
 const WIRE_REPORT_SIZE: usize = REPORT_SIZE + 1;
 const CRC_OFFSET: usize = 59;
@@ -112,10 +113,16 @@ pub fn probe_runtime_diagnostics() -> Result<Vec<DeviceDiagnostic>> {
                 if let Some((version, profile)) = read_firmware_identity(&device) {
                     report.firmware_version = Some(version);
                     report.build_profile = Some(profile.clone());
-                    if profile != "standard" {
-                        match capture_snapshot(&device) {
+                    match profile.as_str() {
+                        "diagnostic" => match capture_snapshot(&device) {
                             Ok(snapshot) => report.snapshot = Some(snapshot),
                             Err(error) => report.error = Some(format!("{error:#}")),
+                        },
+                        "standard" => {}
+                        unknown => {
+                            report.error = Some(format!(
+                                "firmware identity returned unsupported build profile '{unknown}'; runtime snapshot capture was not attempted"
+                            ));
                         }
                     }
                 } else {
@@ -157,18 +164,37 @@ fn read_firmware_identity(device: &hidapi::HidDevice) -> Option<(String, String)
 
 #[cfg(windows)]
 fn capture_snapshot(device: &hidapi::HidDevice) -> Result<DiagnosticSnapshot> {
-    let protocol_version = read_protocol_version(device)?;
+    let primary = read_protocol_version(device).and_then(|protocol_version| {
+        capture_snapshot_over_report(device, REPORT_ID, protocol_version)
+    });
+    match primary {
+        Ok(snapshot) => Ok(snapshot),
+        Err(primary_error) => capture_snapshot_over_report(device, FALLBACK_REPORT_ID, 2)
+            .with_context(|| {
+                format!(
+                    "0xFD diagnostic transport failed ({primary_error:#}); the one-shot 0xF8 identity-channel fallback also failed"
+                )
+            }),
+    }
+}
+
+#[cfg(windows)]
+fn capture_snapshot_over_report(
+    device: &hidapi::HidDevice,
+    report_id: u8,
+    protocol_version: u8,
+) -> Result<DiagnosticSnapshot> {
     if protocol_version >= 2 {
         send_feature_report_with_retry(
             device,
-            &session_report(protocol_version, true),
+            &session_report(report_id, protocol_version, true),
             "start the diagnostic session",
         )?;
         std::thread::sleep(std::time::Duration::from_millis(1100));
     }
-    let result = capture_snapshot_with_protocol(device, protocol_version);
+    let result = capture_snapshot_with_protocol(device, report_id, protocol_version);
     if protocol_version >= 2 {
-        let _ = device.send_feature_report(&session_report(protocol_version, false));
+        let _ = device.send_feature_report(&session_report(report_id, protocol_version, false));
     }
     result
 }
@@ -219,16 +245,17 @@ fn read_protocol_version(device: &hidapi::HidDevice) -> Result<u8> {
 #[cfg(windows)]
 fn read_selected_page(
     device: &hidapi::HidDevice,
+    report_id: u8,
     protocol_version: u8,
     page_index: usize,
 ) -> Result<DiagnosticPage> {
     let mut last_error = String::new();
     for attempt in 1..=READ_ATTEMPTS {
-        let selector = selector_report(protocol_version, page_index as u8);
+        let selector = selector_report(report_id, protocol_version, page_index as u8);
         match device.send_feature_report(&selector) {
             Ok(_) => {
                 let mut report = [0_u8; WIRE_REPORT_SIZE];
-                report[0] = REPORT_ID;
+                report[0] = report_id;
                 match device.get_feature_report(&mut report) {
                     Ok(length) => match decode_page(&report[..length]) {
                         Ok(page) => return Ok(page),
@@ -251,6 +278,7 @@ fn read_selected_page(
 #[cfg(windows)]
 fn capture_snapshot_with_protocol(
     device: &hidapi::HidDevice,
+    report_id: u8,
     protocol_version: u8,
 ) -> Result<DiagnosticSnapshot> {
     for _attempt in 0..4 {
@@ -262,7 +290,7 @@ fn capture_snapshot_with_protocol(
         let mut expected_monotonic = None;
 
         while page_index < page_count {
-            let page = read_selected_page(device, protocol_version, page_index)?;
+            let page = read_selected_page(device, report_id, protocol_version, page_index)?;
             if page.index != page_index {
                 inconsistent = true;
                 break;
@@ -283,24 +311,56 @@ fn capture_snapshot_with_protocol(
         }
 
         if !inconsistent && pages.len() == page_count {
-            return decode_snapshot(&pages);
+            let snapshot = decode_snapshot(&pages)?;
+            validate_runtime_snapshot(&snapshot)?;
+            return Ok(snapshot);
         }
     }
     bail!("diagnostic snapshot changed during paged capture; retry")
 }
 
-fn selector_report(protocol_version: u8, page_index: u8) -> [u8; WIRE_REPORT_SIZE] {
+pub fn validate_runtime_snapshot(snapshot: &DiagnosticSnapshot) -> Result<()> {
+    if snapshot.build_profile != "diagnostic" {
+        bail!("runtime snapshot does not identify the diagnostic profile");
+    }
+    if snapshot.raw_pages.len() < REQUIRED_PAGES {
+        bail!(
+            "runtime snapshot contains only {} page(s); at least {REQUIRED_PAGES} are required",
+            snapshot.raw_pages.len()
+        );
+    }
+    if snapshot.snapshot_seq == 0 || snapshot.monotonic_ms == 0 || snapshot.uptime_ms == 0 {
+        bail!(
+            "runtime snapshot is only the boot placeholder (sequence={}, monotonic_ms={}, uptime_ms={})",
+            snapshot.snapshot_seq,
+            snapshot.monotonic_ms,
+            snapshot.uptime_ms
+        );
+    }
+    if snapshot.raw_flags & 0x03 != 0x03 {
+        bail!(
+            "runtime snapshot is not marked valid and coherent (flags=0x{:02x})",
+            snapshot.raw_flags
+        );
+    }
+    if snapshot.raw_pages.iter().any(|page| page.is_empty()) {
+        bail!("runtime snapshot contains an empty decoded page");
+    }
+    Ok(())
+}
+
+fn selector_report(report_id: u8, protocol_version: u8, page_index: u8) -> [u8; WIRE_REPORT_SIZE] {
     let mut report = [0_u8; WIRE_REPORT_SIZE];
-    report[0] = REPORT_ID;
+    report[0] = report_id;
     report[1] = 0x01;
     report[2] = protocol_version;
     report[3] = page_index;
     report
 }
 
-fn session_report(protocol_version: u8, active: bool) -> [u8; WIRE_REPORT_SIZE] {
+fn session_report(report_id: u8, protocol_version: u8, active: bool) -> [u8; WIRE_REPORT_SIZE] {
     let mut report = [0_u8; WIRE_REPORT_SIZE];
-    report[0] = REPORT_ID;
+    report[0] = report_id;
     report[1] = 0x02;
     report[2] = protocol_version;
     report[3] = u8::from(active);
@@ -308,13 +368,32 @@ fn session_report(protocol_version: u8, active: bool) -> [u8; WIRE_REPORT_SIZE] 
 }
 
 fn decode_page(source: &[u8]) -> Result<DiagnosticPage> {
-    if !source.is_empty() && source.iter().all(|byte| *byte == 0) {
+    let requested_report_id = source
+        .first()
+        .copied()
+        .filter(|report_id| matches!(*report_id, REPORT_ID | FALLBACK_REPORT_ID))
+        .unwrap_or(REPORT_ID);
+    let all_zero_payload = !source.is_empty()
+        && (source.iter().all(|byte| *byte == 0)
+            || matches!(
+                source,
+                [report_id, payload @ ..]
+                    if matches!(*report_id, REPORT_ID | FALLBACK_REPORT_ID)
+                        && payload.len() == REPORT_SIZE
+                        && payload.iter().all(|byte| *byte == 0)
+            ));
+    if all_zero_payload {
         bail!(
-            "the Windows HID stack returned an all-zero 0xFD report; its cached Standard-profile report descriptor is stale. Close controller tools, reconnect M61, and retry"
+            "the Windows HID stack returned an all-zero 0x{requested_report_id:02X} report; no usable runtime snapshot data is present on this transport. Close controller tools, reconnect M61, and retry"
         );
     }
     let frame = match source {
-        [REPORT_ID, payload @ ..] if payload.len() == REPORT_SIZE => payload,
+        [report_id, payload @ ..]
+            if matches!(*report_id, REPORT_ID | FALLBACK_REPORT_ID)
+                && payload.len() == REPORT_SIZE =>
+        {
+            payload
+        }
         [b'D', b'G', ..] if source.len() == WIRE_REPORT_SIZE => &source[..REPORT_SIZE],
         _ if source.len() == REPORT_SIZE => source,
         _ => {
@@ -535,20 +614,50 @@ mod tests {
 
     #[test]
     fn diagnostic_selector_uses_the_full_hid_report_length() {
-        let selector = selector_report(2, 5);
+        let selector = selector_report(REPORT_ID, 2, 5);
         assert_eq!(selector.len(), 64);
         assert_eq!(&selector[..4], &[REPORT_ID, 0x01, 0x02, 5]);
         assert!(selector[4..].iter().all(|byte| *byte == 0));
+
+        let fallback = selector_report(FALLBACK_REPORT_ID, 2, 5);
+        assert_eq!(fallback.len(), 64);
+        assert_eq!(&fallback[..4], &[FALLBACK_REPORT_ID, 0x01, 0x02, 5]);
+        assert!(fallback[4..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
-    fn classifies_windows_all_zero_feature_report_as_stale_descriptor() {
-        let error = decode_page(&[0_u8; WIRE_REPORT_SIZE]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("cached Standard-profile report descriptor")
-        );
+    fn decodes_cache_safe_f8_prefixed_diagnostic_page() {
+        let page = make_page(0, 6, 42, 123_456, &[1, 2, 3]);
+        let mut prefixed = vec![FALLBACK_REPORT_ID];
+        prefixed.extend_from_slice(&page);
+        let decoded = decode_page(&prefixed).unwrap();
+        assert_eq!(decoded.index, 0);
+        assert_eq!(decoded.snapshot_seq, 42);
+        assert_eq!(decoded.data, [1, 2, 3]);
+    }
+
+    #[test]
+    fn rejects_all_zero_feature_reports_before_snapshot_decode() {
+        for report in [
+            [0_u8; WIRE_REPORT_SIZE],
+            {
+                let mut report = [0_u8; WIRE_REPORT_SIZE];
+                report[0] = REPORT_ID;
+                report
+            },
+            {
+                let mut report = [0_u8; WIRE_REPORT_SIZE];
+                report[0] = FALLBACK_REPORT_ID;
+                report
+            },
+        ] {
+            let error = decode_page(&report).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no usable runtime snapshot data is present")
+            );
+        }
     }
 
     #[test]
@@ -584,6 +693,26 @@ mod tests {
         assert_eq!(snapshot.ota_state, 2);
         assert_eq!(snapshot.raw_pages.len(), 6);
         assert_eq!(snapshot.bridge_latency_samples, None);
+        validate_runtime_snapshot(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn rejects_boot_placeholder_as_report_data() {
+        let data = vec![vec![0_u8; DATA_SIZE]; REQUIRED_PAGES];
+        let pages = data
+            .iter()
+            .enumerate()
+            .map(|(index, data)| {
+                decode_page(&make_page(index as u8, REQUIRED_PAGES as u8, 0, 0, data)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let snapshot = decode_snapshot(&pages).unwrap();
+        assert!(
+            validate_runtime_snapshot(&snapshot)
+                .unwrap_err()
+                .to_string()
+                .contains("boot placeholder")
+        );
     }
 
     #[test]

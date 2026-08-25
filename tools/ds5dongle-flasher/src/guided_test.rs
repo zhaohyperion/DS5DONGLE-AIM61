@@ -132,6 +132,17 @@ impl GuidedTest {
         phase.note.clear();
     }
 
+    pub fn finish_summary(&mut self) -> bool {
+        if !self.active || self.phase().id != "summary" {
+            return false;
+        }
+        let phase = self.phase_mut();
+        phase.result = PhaseResult::Pass;
+        phase.result_source = ResultSource::Automatic;
+        self.active = false;
+        true
+    }
+
     pub fn require_input_resync(&mut self) {
         self.synchronize_next_input = true;
         self.touch_traces = [None, None];
@@ -556,6 +567,18 @@ fn phase_catalog() -> Vec<PhaseRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_is_a_cleanup_step_and_finishes_automatically() {
+        let mut guide = GuidedTest::default();
+        guide.start();
+        guide.current = guide.phases.len() - 1;
+        assert!(guide.finish_summary());
+        assert!(!guide.active);
+        assert_eq!(guide.phase().result, PhaseResult::Pass);
+        assert_eq!(guide.phase().result_source, ResultSource::Automatic);
+        assert!(!guide.finish_summary());
+    }
 
     #[test]
     fn repeated_button_presses_are_counted() {

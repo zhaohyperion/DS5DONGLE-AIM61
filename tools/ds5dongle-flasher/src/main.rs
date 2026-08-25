@@ -115,6 +115,7 @@ struct FlashRelease {
     board: Board,
     usb_speed: UsbSpeed,
     profile: BuildProfile,
+    package_kind: PackageKind,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -122,6 +123,12 @@ struct FlashRelease {
 enum BuildProfile {
     Standard,
     Diagnostic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageKind {
+    UartFull,
+    Ota,
 }
 
 impl BuildProfile {
@@ -388,6 +395,7 @@ fn run() -> Result<()> {
     if let Some(speed) = options.usb_speed {
         releases.retain(|release| release.usb_speed == speed);
     }
+    releases.retain(|release| release.package_kind == PackageKind::UartFull);
     if releases.is_empty() {
         bail!("no firmware release matches the requested board/USB mode");
     }
@@ -536,7 +544,7 @@ fn print_help() {
            --baud RATE       460800 (default) or 115200\n  \
            --list            List detected M61 CH340 devices\n  \
            --device-info     Read running DS5DONGLE-AIM61 firmware information over USB HID\n  \
-           --diagnostics     Capture CH340 status and the native 0xFD runtime diagnostic snapshot\n  \
+           --diagnostics     Capture CH340 status and the native runtime snapshot (0xFD/0xF8)\n  \
            --list-releases   List complete firmware Releases\n  \
            --release TAG     Select a Release without the menu\n  \
            --verify-release  Download and verify a Release without flashing\n  \
@@ -666,7 +674,7 @@ fn sha256_digest(asset: &GithubAsset) -> Option<&str> {
     asset.digest.as_deref()?.strip_prefix("sha256:")
 }
 
-fn asset_variant(name: &str) -> Option<(Board, UsbSpeed, BuildProfile)> {
+fn asset_variant(name: &str) -> Option<(Board, UsbSpeed, BuildProfile, PackageKind)> {
     let lower = name.to_ascii_lowercase();
     if !lower.starts_with("ds5dongle-") || !lower.ends_with(".zip") {
         return None;
@@ -687,12 +695,21 @@ fn asset_variant(name: &str) -> Option<(Board, UsbSpeed, BuildProfile)> {
     } else {
         return None;
     };
-    let profile = if lower.contains("-diag-") {
+    let profile = if lower.contains("-diagnostic-") {
         BuildProfile::Diagnostic
-    } else {
+    } else if lower.contains("-standard-") {
         BuildProfile::Standard
+    } else {
+        return None;
     };
-    Some((board, speed, profile))
+    let package_kind = if lower.contains("-uart-full-") {
+        PackageKind::UartFull
+    } else if lower.contains("-ota-") {
+        PackageKind::Ota
+    } else {
+        return None;
+    };
+    Some((board, speed, profile, package_kind))
 }
 
 fn fetch_flash_releases(client: &Client) -> Result<Vec<FlashRelease>> {
@@ -714,7 +731,7 @@ fn fetch_flash_releases(client: &Client) -> Result<Vec<FlashRelease>> {
             .iter()
             .filter(|asset| sha256_digest(asset).is_some())
         {
-            let Some((board, usb_speed, profile)) = asset_variant(&asset.name) else {
+            let Some((board, usb_speed, profile, package_kind)) = asset_variant(&asset.name) else {
                 continue;
             };
             releases.push(FlashRelease {
@@ -730,12 +747,17 @@ fn fetch_flash_releases(client: &Client) -> Result<Vec<FlashRelease>> {
                 board,
                 usb_speed,
                 profile,
+                package_kind,
             });
         }
     }
 
     if releases.is_empty() {
-        bail!("no Release contains verified DS5Dongle-<board>-<fs|hs>-*.zip assets");
+        bail!(
+            "no GitHub Release contains digest-verified \
+             DS5Dongle-<board>-<fs|hs>-<standard|diagnostic>-<uart-full|ota>-v<version>.zip \
+             assets; publish the new split packages or choose a local ZIP"
+        );
     }
     Ok(releases)
 }
@@ -778,9 +800,18 @@ fn preferred_release_index(releases: &[FlashRelease]) -> Option<usize> {
             release.board == Board::Aim61
                 && release.usb_speed == UsbSpeed::Hs
                 && release.profile == BuildProfile::Standard
+                && release.package_kind == PackageKind::UartFull
         })
-        .or_else(|| releases.iter().position(|release| !release.prerelease))
-        .or_else(|| (!releases.is_empty()).then_some(0))
+        .or_else(|| {
+            releases.iter().position(|release| {
+                release.package_kind == PackageKind::UartFull && !release.prerelease
+            })
+        })
+        .or_else(|| {
+            releases
+                .iter()
+                .position(|release| release.package_kind == PackageKind::UartFull)
+        })
 }
 
 fn diagnostic_release_index(releases: &[FlashRelease]) -> Option<usize> {
@@ -791,6 +822,7 @@ fn diagnostic_release_index(releases: &[FlashRelease]) -> Option<usize> {
         release.board == Board::Aim61
             && release.usb_speed == UsbSpeed::Hs
             && release.profile == BuildProfile::Diagnostic
+            && release.package_kind == PackageKind::UartFull
     };
 
     preferred_tag
@@ -1068,15 +1100,19 @@ fn read_firmware_zip(path: &Path, require_manifest: bool) -> Result<FirmwareSet>
         else {
             continue;
         };
+        let lower_name = file_name.to_ascii_lowercase();
+        if lower_name.ends_with(".bin.ota") || lower_name.ends_with(".ota.json") {
+            bail!("UART full-flash ZIP must not contain OTA-only file: {file_name}");
+        }
         let size = usize::try_from(entry.size()).context("ZIP entry is too large")?;
         if size > MAX_FIRMWARE_BYTES {
             bail!("ZIP entry is too large: {file_name}");
         }
-        if files.contains_key(&file_name.to_ascii_lowercase()) {
+        if files.contains_key(&lower_name) {
             bail!("duplicate ZIP filename: {file_name}");
         }
         files.insert(
-            file_name.to_ascii_lowercase(),
+            lower_name,
             read_zip_entry_limited(&mut entry, MAX_FIRMWARE_BYTES)?,
         );
     }
@@ -1690,6 +1726,9 @@ fn write_firmware_set(runtime: &RuntimeDirectory, set: &FirmwareSet) -> Result<(
 }
 
 fn prepare_runtime(client: &Client, release: &FlashRelease) -> Result<RuntimeDirectory> {
+    if release.package_kind != PackageKind::UartFull {
+        bail!("refusing to use a non-UART package for complete flashing");
+    }
     let runtime = create_runtime_base()?;
     let archive_path = runtime.path.join(&release.archive.name);
     download_release_asset(client, &release.archive, &archive_path)?;
@@ -3230,15 +3269,18 @@ impl FlasherApp {
     }
 
     fn start_debug_benchmark(&mut self) {
-        if self.loading_diagnostics {
-            self.status = self
-                .language
-                .tr(
-                    "正在采集运行快照，请完成后再启动压力测试。",
-                    "A runtime snapshot is in progress; start the stress test after it finishes.",
-                )
-                .to_owned();
-            return;
+        if self.guided_test.active {
+            self.reset_test_outputs();
+            self.guided_test.active = false;
+            self.guided_test.require_input_resync();
+            self.append_log(
+                self.language
+                    .tr(
+                        "启动性能测试时已结束引导流程，并保留现有引导结果。",
+                        "Starting the performance test ended the guide and preserved its current results.",
+                    )
+                    .to_owned(),
+            );
         }
         self.ensure_device_session();
         let Some(session) = &self.device_test_session else {
@@ -3267,7 +3309,33 @@ impl FlasherApp {
                 self.device_debug_next_snapshot = Some(Instant::now() + Duration::from_secs(5));
                 self.device_debug_alert_snapshot_max_ms = 0.0;
                 self.device_debug_last_alert_snapshot = None;
-                self.capture_debug_snapshot();
+                /* Snapshot capture is optional telemetry.  An in-flight or
+                 * unavailable 0xFD/0xF8 diagnostic channel must never prevent
+                 * Windows HID interval sampling from starting. */
+                if !self.loading_diagnostics {
+                    self.capture_debug_snapshot();
+                }
+                self.status = match self.language {
+                    Language::ZhCn => format!(
+                        "性能压力测试已启动：{} 分钟，{} Hz 输出负载。",
+                        self.device_debug_duration_secs / 60,
+                        if self.device_debug_stress_enabled {
+                            self.device_debug_stress_rate_hz
+                        } else {
+                            0
+                        }
+                    ),
+                    Language::En => format!(
+                        "Performance stress test started: {} min, {} Hz output load.",
+                        self.device_debug_duration_secs / 60,
+                        if self.device_debug_stress_enabled {
+                            self.device_debug_stress_rate_hz
+                        } else {
+                            0
+                        }
+                    ),
+                };
+                self.append_log(self.status.clone());
             }
             Err(error) => {
                 self.device_debug_started = None;
@@ -3344,6 +3412,112 @@ impl FlasherApp {
     }
 
     fn export_debug_report(&mut self) {
+        if self.loading_diagnostics || self.device_debug_final_snapshot_pending {
+            self.status = self
+                .language
+                .tr(
+                    "报告自检未通过：运行快照仍在采集中，请等待完成后再导出。",
+                    "Report self-check failed: a runtime snapshot is still being captured. Wait for it to finish before exporting.",
+                )
+                .to_owned();
+            self.append_log(self.status.clone());
+            return;
+        }
+
+        let guided_data = guided_test_has_data(&self.guided_test.phases);
+        let performance_data = self.device_debug_metrics.sample_count > 0;
+        let stick_data = self.controller_analyzer.left.samples() > 0
+            || self.controller_analyzer.right.samples() > 0;
+        let microphone_data = self.last_microphone_metrics.is_some();
+        let runtime_data = self.device_debug_baseline.is_some()
+            || self.device_debug_final.is_some()
+            || !self.device_debug_runtime_samples.is_empty()
+            || self
+                .runtime_diagnostics
+                .iter()
+                .any(|report| report.snapshot.is_some());
+        let mut available_sections = Vec::new();
+        let mut missing_sections = Vec::new();
+        for (available, name) in [
+            (guided_data, "guidedControllerTest"),
+            (performance_data, "performanceBenchmark"),
+            (runtime_data, "runtimeSnapshots"),
+            (stick_data, "stickAnalysis"),
+            (microphone_data, "microphoneCapture"),
+        ] {
+            if available {
+                available_sections.push(name);
+            } else {
+                missing_sections.push(name);
+            }
+        }
+        if available_sections.is_empty() {
+            self.status = self
+                .language
+                .tr(
+                    "报告自检未通过：当前没有任何实际测试数据，已取消导出。",
+                    "Report self-check failed: no measured test data is available; export was cancelled.",
+                )
+                .to_owned();
+            self.append_log(self.status.clone());
+            return;
+        }
+
+        let mut integrity_errors = Vec::new();
+        if performance_data && self.device_debug_metrics.elapsed_ms == 0 {
+            integrity_errors.push("HID samples exist but elapsedMs is zero".to_owned());
+        }
+        if !performance_data && self.device_debug_metrics.stress_output_reports > 0 {
+            integrity_errors.push("stress output reports exist without HID samples".to_owned());
+        }
+        if let Some(metrics) = &self.last_microphone_metrics
+            && (metrics.duration_ms == 0
+                || metrics.sample_rate_hz == 0
+                || metrics.channels == 0
+                || metrics.bits_per_sample == 0)
+        {
+            integrity_errors.push("microphone capture metadata is incomplete".to_owned());
+        }
+        for (label, snapshot) in self
+            .device_debug_baseline
+            .iter()
+            .map(|snapshot| ("runtimeBaseline", snapshot))
+            .chain(
+                self.device_debug_runtime_samples
+                    .iter()
+                    .map(|snapshot| ("runtimeSample", snapshot)),
+            )
+            .chain(
+                self.device_debug_final
+                    .iter()
+                    .map(|snapshot| ("runtimeFinal", snapshot)),
+            )
+            .chain(self.runtime_diagnostics.iter().filter_map(|report| {
+                report
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| ("runtimeDiagnostic", snapshot))
+            }))
+        {
+            if let Err(error) = diagnostics::validate_runtime_snapshot(snapshot) {
+                integrity_errors.push(format!("{label}: {error:#}"));
+            }
+        }
+        if !integrity_errors.is_empty() {
+            self.status = match self.language {
+                Language::ZhCn => format!(
+                    "报告自检未通过：检测到不一致数据，已取消导出：{}",
+                    integrity_errors.join("；")
+                ),
+                Language::En => format!(
+                    "Report self-check failed; inconsistent data was found and export was cancelled: {}",
+                    integrity_errors.join("; ")
+                ),
+            };
+            self.append_log(self.status.clone());
+            return;
+        }
+
         let filename = format!("DS5Dongle-test-report-{}.json", diagnostics::now_unix_ms());
         let Some(path) = rfd::FileDialog::new()
             .set_title(
@@ -3472,6 +3646,13 @@ impl FlasherApp {
             "reportKind": "unifiedControllerAndDongleTest",
             "createdAtUnixMs": diagnostics::now_unix_ms(),
             "flasherVersion": FLASHER_VERSION,
+            "dataSelfCheck": {
+                "performed": true,
+                "status": if missing_sections.is_empty() { "complete" } else { "partial" },
+                "availableSections": available_sections,
+                "missingSections": missing_sections,
+                "integrityErrors": integrity_errors,
+            },
             "summaryZhCn": summary_zh_cn,
             "privacy": {
                 "devicePathsIncluded": false,
@@ -3641,6 +3822,7 @@ impl FlasherApp {
                 release.board == Board::Aim61
                     && release.usb_speed == UsbSpeed::Hs
                     && release.profile == profile
+                    && release.package_kind == PackageKind::Ota
             })
             .cloned()
     }
@@ -4586,7 +4768,7 @@ impl FlasherApp {
                                 "0xFD 运行态诊断完成：{captured} 份 CRC32 分页快照校验通过。"
                             ),
                             Language::En => format!(
-                                "0xFD runtime diagnostics completed: {captured} CRC32-protected paged snapshot(s) validated."
+                                "Runtime diagnostics completed: {captured} CRC32-protected 0xFD/0xF8 paged snapshot(s) validated."
                             ),
                         });
                     } else if self.runtime_diagnostics.is_empty() {
@@ -5752,7 +5934,11 @@ fn build_unified_report_summary_zh_cn(
                 &mut untested_items,
                 format!("引导项目“{}”尚未完成", phase.title_zh),
             ),
-            _ => {}
+            guided_test::PhaseResult::Pass => push_unique(
+                &mut completed_items,
+                format!("引导项目“{}”", phase.title_zh),
+            ),
+            guided_test::PhaseResult::Pending => {}
         }
     }
 
@@ -5865,7 +6051,7 @@ fn build_unified_report_summary_zh_cn(
         "pass" => ("通过", "要求的测试数据完整，已执行项目未发现明确异常。"),
         "fail" => (
             "未通过",
-            "检测到明确异常或摇杆达到建议校准阈值，请按建议复测并处理。",
+            "检测到明确未生效项目；只有报告列出的实测异常需要处理，未测试项目不能据此判定硬件故障。",
         ),
         _ => (
             "警告",
@@ -6195,6 +6381,21 @@ impl eframe::App for FlasherApp {
                     )
                     .to_owned()
             };
+        }
+        let benchmark_has_no_samples = self.device_debug_started.is_some_and(|started| {
+            debug_now.duration_since(started) >= Duration::from_secs(3)
+                && self.device_debug_metrics.sample_count == 0
+        });
+        if benchmark_has_no_samples {
+            self.stop_debug_benchmark(false);
+            self.status = self
+                .language
+                .tr(
+                    "性能测试启动失败：3 秒内没有收到可计时的 HID 报告，已停止而不是继续生成空报告。请重新连接手柄后重试。",
+                    "Performance test startup failed: no timed HID report arrived within 3 seconds. The test stopped instead of producing an empty report. Reconnect the controller and retry.",
+                )
+                .to_owned();
+            self.append_log(self.status.clone());
         }
         let new_severe_gap = self.device_debug_metrics.maximum_interval_ms >= 20.0
             && (self.device_debug_alert_snapshot_max_ms < 20.0
@@ -8050,8 +8251,8 @@ impl eframe::App for FlasherApp {
                         });
                         ui.label(
                             eframe::egui::RichText::new(language.tr(
-                                "常用版关闭运行诊断采样以获得最低开销；诊断版开放 0xFD 快照和 M61 内部转发延迟。两者可通过签名 OTA 来回切换。",
-                                "Standard disables runtime diagnostic sampling for minimum overhead. Diagnostic enables 0xFD snapshots and internal M61 bridge latency. Signed OTA can switch both ways.",
+                                "常用版关闭运行诊断采样以获得最低开销；诊断版开放 M61 快照和内部转发延迟，并在 0xFD 失效时通过一次性 0xF8 响应自动回退。两者可通过签名 OTA 来回切换。",
+                                "Standard disables runtime diagnostic sampling for minimum overhead. Diagnostic enables M61 snapshots and internal bridge latency, with a one-shot 0xF8 fallback when 0xFD fails. Signed OTA can switch both ways.",
                             ))
                             .color(COLOR_TEXT_MUTED),
                         );
@@ -8716,9 +8917,7 @@ impl eframe::App for FlasherApp {
                                     .add_enabled(
                                         self.device_test_connected
                                             && !extreme_duration_blocked
-                                            && !self.guided_test.active
                                             && !self.device_test_audio_busy
-                                            && !self.loading_diagnostics
                                             && self.device_test_controller_tone.is_none(),
                                         primary_button(language.tr("开始压力测试", "Start stress test")),
                                     )
@@ -8769,6 +8968,20 @@ impl eframe::App for FlasherApp {
                             .color(COLOR_TEXT_MUTED)
                             .small(),
                         );
+                        if self.guided_test.active {
+                            notice(
+                                ui,
+                                NoticeTone::Info,
+                                language.tr(
+                                    "可直接开始性能测试",
+                                    "Performance test can start now",
+                                ),
+                                language.tr(
+                                    "开始后会结束当前引导流程并保留已经取得的结果，不再因引导尚未结束而锁住性能采样。",
+                                    "Starting ends the current guide while preserving collected results; an unfinished guide no longer blocks performance sampling.",
+                                ),
+                            );
+                        }
                         if self.device_debug_stress_enabled {
                             notice(
                                 ui,
@@ -8990,8 +9203,8 @@ impl eframe::App for FlasherApp {
                                     .add_enabled(
                                         !self.loading_diagnostics,
                                         eframe::egui::Button::new(language.tr(
-                                            "立即采集 0xFD",
-                                            "Capture 0xFD now",
+                                            "立即采集 M61 快照",
+                                            "Capture M61 snapshot now",
                                         )),
                                     )
                                     .clicked()
@@ -9268,6 +9481,7 @@ impl eframe::App for FlasherApp {
                 let phase_id = self.guided_test.phase().id;
                 self.reset_test_outputs();
                 let automatically_completed = self.guided_test.mark_and_next(result);
+                let summary_completed = self.guided_test.finish_summary();
                 if !automatically_completed.is_empty() {
                     let names = automatically_completed
                         .iter()
@@ -9279,7 +9493,10 @@ impl eframe::App for FlasherApp {
                         Language::En => format!("Automatically completed: {names}"),
                     };
                 }
-                if result == guided_test::PhaseResult::NotEffective || phase_id == "summary" {
+                if result == guided_test::PhaseResult::NotEffective
+                    || phase_id == "summary"
+                    || summary_completed
+                {
                     self.capture_debug_snapshot();
                 }
                 if !self.guided_test.active {
@@ -9704,6 +9921,7 @@ mod tests {
             board,
             usb_speed,
             profile: BuildProfile::Standard,
+            package_kind: PackageKind::UartFull,
         }
     }
 
@@ -9805,14 +10023,36 @@ mod tests {
     #[test]
     fn parses_release_asset_board_and_speed() {
         assert_eq!(
-            asset_variant("DS5Dongle-lctech616-fs-v3.15.zip"),
-            Some((Board::Lctech616, UsbSpeed::Fs, BuildProfile::Standard))
+            asset_variant("DS5Dongle-lctech616-fs-standard-uart-full-v3.15.zip"),
+            Some((
+                Board::Lctech616,
+                UsbSpeed::Fs,
+                BuildProfile::Standard,
+                PackageKind::UartFull
+            ))
         );
         assert_eq!(
-            asset_variant("DS5Dongle-aim61-hs-v3.15.zip"),
-            Some((Board::Aim61, UsbSpeed::Hs, BuildProfile::Standard))
+            asset_variant("DS5Dongle-aim61-hs-diagnostic-ota-v3.15.zip"),
+            Some((
+                Board::Aim61,
+                UsbSpeed::Hs,
+                BuildProfile::Diagnostic,
+                PackageKind::Ota
+            ))
         );
+        assert_eq!(asset_variant("DS5Dongle-aim61-hs-v3.15.zip"), None);
+        assert_eq!(asset_variant("DS5Dongle-aim61-hs-standard-v3.15.zip"), None);
         assert_eq!(asset_variant("firmware.zip"), None);
+    }
+
+    #[test]
+    fn uart_release_preference_never_selects_ota_assets() {
+        let mut releases = vec![
+            test_release("v3.6.0", Board::Aim61, UsbSpeed::Hs, false),
+            test_release("v3.6.0", Board::Aim61, UsbSpeed::Hs, false),
+        ];
+        releases[0].package_kind = PackageKind::Ota;
+        assert_eq!(preferred_release_index(&releases), Some(1));
     }
 
     #[test]

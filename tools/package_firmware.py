@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a deterministic, self-describing DS5Dongle flash ZIP."""
+"""Create a deterministic, self-describing UART full-flash ZIP."""
 from __future__ import annotations
 
 import argparse
@@ -43,6 +43,7 @@ def main() -> int:
 
     manifest = {
         "schema": 1, "project": "DS5Dongle", "version": args.version,
+        "package_kind": "uart-full",
         "board": args.board, "usb_speed": args.usb_speed,
         "profile": args.profile, "diagnostics_protocol": 2 if args.profile == "diagnostic" else None,
         "chip": "bl616",
@@ -60,8 +61,10 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     version = args.version.removeprefix("v")
-    profile_name = "-diag" if args.profile == "diagnostic" else ""
-    output = args.output_dir / f"DS5Dongle-{args.board}-{args.usb_speed}{profile_name}-v{version}.zip"
+    output = args.output_dir / (
+        f"DS5Dongle-{args.board}-{args.usb_speed}-{args.profile}"
+        f"-uart-full-v{version}.zip"
+    )
     timestamp = (2026, 1, 1, 0, 0, 0)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name, data in sorted(payloads.items()):
