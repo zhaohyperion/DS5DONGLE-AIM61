@@ -68,10 +68,10 @@ jobs:
             [IO.File]::WriteAllBytes($keyPath, $key)
             $env:DS5_OTA_PUBLIC_KEY_FILE = $keyPath
           }
-          .\build_windows.bat rebuild 2>&1 | Tee-Object -FilePath build\firmware-build.log
+          .\build_windows.bat rebuild 2>&1 | Tee-Object -FilePath firmware-build.log
           $buildExit = $LASTEXITCODE
           if ($buildExit -ne 0) { exit $buildExit }
-          python tools\check_firmware_warnings.py build\firmware-build.log
+          python tools\check_firmware_warnings.py firmware-build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools\package_firmware.py --board aim61 --usb-speed hs `
             --profile $env:DS5_BUILD_PROFILE --version 3.6.3 `
