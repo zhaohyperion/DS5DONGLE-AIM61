@@ -22,7 +22,8 @@
 #define MACRO_MAX_STEPS   1024u
 #define MACRO_QUEUE_DEPTH 4u
 #define MACRO_RECORD_BYTES 7600u
-#define MACRO_RECORD_WARN_BYTES (MACRO_RECORD_BYTES * 4u / 5u)
+#define MACRO_INDEX_NONE 0xFFu
+#define MACRO_PLAYBACK_RESYNC_US 20000ULL
 
 enum macro_command {
     MACRO_CMD_BEGIN       = 0x01,
@@ -32,6 +33,7 @@ enum macro_command {
     MACRO_CMD_READ_SELECT = 0x05,
     MACRO_CMD_CONTROL     = 0x06,
     MACRO_CMD_STOP        = 0x07,
+    MACRO_CMD_ERASE       = 0x08,
 };
 
 enum macro_state {
@@ -39,6 +41,7 @@ enum macro_state {
     MACRO_STATE_RECEIVING = 1,
     MACRO_STATE_READY     = 2,
     MACRO_STATE_ERROR     = 3,
+    MACRO_STATE_ERASED    = 4,
 };
 
 enum macro_error {
@@ -109,19 +112,28 @@ static uint8_t g_state;
 static uint8_t g_error;
 static uint32_t g_raw_mask;
 static uint32_t g_previous_raw_mask;
-static uint64_t g_press_us[REMAP_BTN_COUNT];
 static uint64_t g_last_release_us[REMAP_BTN_COUNT];
-static uint32_t g_long_fired_mask;
+static uint64_t g_long_due_us[REMAP_BTN_COUNT];
+static uint8_t g_pending_long_macro[REMAP_BTN_COUNT];
+static uint32_t g_long_pending_mask;
+static uint8_t g_trigger_head[4][REMAP_BTN_COUNT];
+static uint8_t g_trigger_next[MACRO_MAX_COUNT];
 static uint32_t g_rng = 0x61A1C35Du;
 static uint64_t g_ps_press_us;
 static bool g_ps_emergency_fired;
 static macro_playback_t g_playback;
 static QueueHandle_t g_command_queue;
+static StaticQueue_t g_command_queue_control;
+static uint8_t g_command_queue_storage[
+    MACRO_QUEUE_DEPTH * sizeof(macro_command_frame_t)];
 static uint8_t g_status[MACRO_REPORT_SIZE];
 static uint8_t g_record_program[MACRO_RECORD_BYTES] DS5_PSRAM_COLD_DATA;
 static recorded_state_t g_record_previous;
+static recorded_state_t g_record_encoded;
 static uint16_t g_record_len;
 static uint16_t g_record_steps;
+static uint16_t g_record_byte_limit;
+static uint16_t g_record_step_limit;
 static uint8_t g_record_trigger;
 static uint8_t g_recorder_state;
 static uint64_t g_recorder_deadline_us;
@@ -129,6 +141,7 @@ static uint64_t g_record_last_us;
 static uint64_t g_record_chord_press_us;
 static bool g_record_chord_latched;
 static bool g_record_have_state;
+static bool g_record_encoded_state;
 static bool g_record_finalize_pending;
 static bool g_record_warned;
 static enum led_pattern g_record_restore_led;
@@ -142,6 +155,7 @@ static enum led_pattern g_management_restore_led;
 static bool validate_blob(const uint8_t *blob, uint16_t length);
 static bool persist_transfer(void);
 static const uint8_t *descriptor_at(uint16_t index);
+static void rebuild_trigger_index(void);
 
 static uint16_t read16(const uint8_t *p)
 {
@@ -209,7 +223,8 @@ static void publish_status(void)
                   (g_recorder_state == RECORDER_ACTIVE ? 0x04u : 0u);
     write32(snapshot + 8, g_generation);
     write16(snapshot + 12, g_active_len);
-    write16(snapshot + 14, g_read_offset);
+    write16(snapshot + 14,
+            g_state == MACRO_STATE_RECEIVING ? g_received : g_read_offset);
     snapshot[16] = 0;
     if (g_read_offset < g_active_len) {
         uint16_t remain = g_active_len - g_read_offset;
@@ -240,6 +255,7 @@ static void recorder_cancel(void)
     g_recorder_state = RECORDER_IDLE;
     g_record_len = g_record_steps = 0;
     g_record_have_state = false;
+    g_record_encoded_state = false;
     g_record_finalize_pending = false;
     g_record_chord_latched = true;
     recorder_restore_led();
@@ -250,26 +266,75 @@ static bool recorder_append_state(const recorded_state_t *state, uint32_t durati
 {
     while (duration_ms) {
         const uint16_t slice = duration_ms > 65535u ? 65535u : (uint16_t)duration_ms;
-        if ((uint32_t)g_record_len + 27u > MACRO_RECORD_BYTES) return false;
+        const bool write_mask = !g_record_encoded_state ||
+                                state->mask != g_record_encoded.mask;
+        const bool write_axes = !g_record_encoded_state ||
+                                memcmp(state->axes, g_record_encoded.axes,
+                                       sizeof(state->axes)) != 0;
+        const bool write_touches = !g_record_encoded_state ||
+                                   memcmp(state->touches,
+                                          g_record_encoded.touches,
+                                          sizeof(state->touches)) != 0;
+        const uint16_t needed = 5u + (write_mask ? 4u : 0u) +
+                                (write_axes ? 7u : 0u) +
+                                (write_touches ? 11u : 0u);
+        if (g_record_steps >= g_record_step_limit ||
+            (uint32_t)g_record_len + needed > g_record_byte_limit) return false;
         uint8_t *out = g_record_program + g_record_len;
-        *out++ = 0x01;
-        *out++ = (uint8_t)state->mask;
-        *out++ = (uint8_t)(state->mask >> 8);
-        *out++ = (uint8_t)(state->mask >> 16);
-        *out++ = 0x02;
-        memcpy(out, state->axes, 6);
-        out += 6;
-        *out++ = 0x03;
-        memcpy(out, state->touches, 10);
-        out += 10;
+        if (write_mask) {
+            *out++ = 0x01;
+            *out++ = (uint8_t)state->mask;
+            *out++ = (uint8_t)(state->mask >> 8);
+            *out++ = (uint8_t)(state->mask >> 16);
+        }
+        if (write_axes) {
+            *out++ = 0x02;
+            memcpy(out, state->axes, sizeof(state->axes));
+            out += sizeof(state->axes);
+        }
+        if (write_touches) {
+            *out++ = 0x03;
+            memcpy(out, state->touches, sizeof(state->touches));
+            out += sizeof(state->touches);
+        }
         *out++ = 0x04;
         write16(out, slice);
         write16(out + 2, 0);
-        g_record_len += 27;
+        g_record_len += needed;
         g_record_steps++;
+        g_record_encoded = *state;
+        g_record_encoded_state = true;
         duration_ms -= slice;
     }
     return true;
+}
+
+static bool recorder_prepare_limits(uint8_t trigger)
+{
+    const uint16_t old_count = g_active_len >= MACRO_HEADER_SIZE ?
+                               read16(g_active_blob + 12) : 0;
+    const uint8_t profile = blob_profile();
+    uint16_t kept_count = 0;
+    uint16_t kept_steps = 0;
+    uint32_t kept_program = 0;
+    for (uint16_t i = 0; i < old_count; ++i) {
+        const uint8_t *d = descriptor_at(i);
+        if (d[4] == profile && d[5] == trigger) continue;
+        kept_count++;
+        kept_steps += read16(d + 16);
+        kept_program += read16(d + 20);
+    }
+    if (kept_count >= MACRO_MAX_COUNT || kept_steps >= MACRO_MAX_STEPS)
+        return false;
+    const uint32_t fixed = MACRO_HEADER_SIZE +
+                           (uint32_t)(kept_count + 1u) * MACRO_DESC_SIZE +
+                           kept_program;
+    if (fixed + 5u > MACRO_MAX_BYTES) return false;
+    uint32_t available = MACRO_MAX_BYTES - fixed;
+    if (available > MACRO_RECORD_BYTES) available = MACRO_RECORD_BYTES;
+    g_record_byte_limit = (uint16_t)available;
+    g_record_step_limit = (uint16_t)(MACRO_MAX_STEPS - kept_steps);
+    return g_record_byte_limit >= 5u && g_record_step_limit != 0u;
 }
 
 static bool recorder_build_blob(void)
@@ -278,20 +343,22 @@ static bool recorder_build_blob(void)
                                read16(g_active_blob + 12) : 0;
     const uint16_t old_desc_len = g_active_len >= MACRO_HEADER_SIZE ?
                                   read16(g_active_blob + 16) : 0;
-    const uint16_t old_program_len = g_active_len >= MACRO_HEADER_SIZE ?
-                                     read16(g_active_blob + 18) : 0;
     const uint8_t profile = blob_profile();
     uint16_t kept = 0;
+    uint32_t kept_program_len = 0;
     uint32_t next_id = 1;
     for (uint16_t i = 0; i < old_count; ++i) {
         const uint8_t *d = descriptor_at(i);
         const uint32_t id = read32(d);
         if (id >= next_id) next_id = id + 1u;
-        if (!(d[4] == profile && d[5] == g_record_trigger)) kept++;
+        if (!(d[4] == profile && d[5] == g_record_trigger)) {
+            kept++;
+            kept_program_len += read16(d + 20);
+        }
     }
     const uint16_t new_count = kept + 1u;
     const uint16_t new_desc_len = new_count * MACRO_DESC_SIZE;
-    if ((uint32_t)MACRO_HEADER_SIZE + new_desc_len + old_program_len +
+    if ((uint32_t)MACRO_HEADER_SIZE + new_desc_len + kept_program_len +
         g_record_len > MACRO_MAX_BYTES) return false;
 
     memset(g_transfer.data, 0, MACRO_HEADER_SIZE);
@@ -362,6 +429,8 @@ static void recorder_finish_deferred(uint64_t now_us)
     }
     macro_engine_stop_all();
     if (g_record_steps && recorder_build_blob()) {
+        g_state = MACRO_STATE_READY;
+        g_error = MACRO_ERROR_NONE;
         led_status_set(LED_GREEN_BLINK_TRIPLE);
         LOG_INF("[MACRO] Standalone recording saved: trigger=%u steps=%u bytes=%u\n",
                 g_record_trigger, g_record_steps, g_record_len);
@@ -377,17 +446,17 @@ static void recorder_finish_deferred(uint64_t now_us)
 static void management_mark_dirty(void)
 {
     if (g_active_len < MACRO_HEADER_SIZE) return;
-    write32(g_active_blob + 8, g_generation + 1u);
-    write32(g_active_blob + 20,
-            crc32_ieee(g_active_blob + MACRO_HEADER_SIZE,
-                       g_active_len - MACRO_HEADER_SIZE));
     g_management_dirty = true;
     publish_status();
 }
 
 static void management_persist_deferred(void)
 {
-    if (!g_management_dirty || g_state == MACRO_STATE_RECEIVING) return;
+    /* Coalesce all changes made during one management session into a single
+     * A/B transaction. This both reduces flash wear and keeps the live blob's
+     * generation unchanged until the transaction is committed. */
+    if (!g_management_dirty || g_management_mode ||
+        g_state == MACRO_STATE_RECEIVING) return;
     g_management_dirty = false;
     memcpy(g_transfer.data, g_active_blob, g_active_len);
     g_pending_generation = g_generation + 1u;
@@ -540,8 +609,13 @@ static bool validate_blob(const uint8_t *blob, uint16_t length)
             playback > 5u || (uint32_t)offset + program_len > programs ||
             !validate_program(program_base + offset, program_len, step_count))
             return false;
+        const uint16_t trigger_param = read16(d + 10);
+        if ((trigger_mode == 2u &&
+             (trigger_param < 200u || trigger_param > 3000u)) ||
+            (trigger_mode == 3u &&
+             (trigger_param < 100u || trigger_param > 600u))) return false;
         if (trigger == REMAP_BTN_PS && trigger_mode == 2u &&
-            read16(d + 10) >= 2000u) return false;
+            trigger_param >= 2000u) return false;
         if (playback == 5u && (read16(d + 14) < 1u || read16(d + 14) > 50u))
             return false;
     }
@@ -559,7 +633,8 @@ static bool load_slot(const char *key, uint8_t slot)
         got != offsetof(macro_store_t, data) + g_transfer.length ||
         crc32_ieee(g_transfer.data, g_transfer.length) != g_transfer.crc32 ||
         !validate_blob(g_transfer.data, g_transfer.length)) return false;
-    if (g_active_len == 0 || g_transfer.generation > g_generation) {
+    if (g_active_len == 0 ||
+        (int32_t)(g_transfer.generation - g_generation) > 0) {
         memcpy(g_active_blob, g_transfer.data, g_transfer.length);
         g_active_len = g_transfer.length;
         g_generation = g_transfer.generation;
@@ -580,12 +655,49 @@ static bool persist_transfer(void)
     const size_t store_len = offsetof(macro_store_t, data) + g_expected_len;
     if (ef_set_env_blob(key, &g_transfer, store_len) != EF_NO_ERR) return false;
     size_t saved = 0;
-    if (ef_get_env_blob(key, NULL, 0, &saved) != 0 || saved != store_len)
+    const size_t got = ef_get_env_blob(key, &g_transfer, sizeof(g_transfer), &saved);
+    if (got != store_len || saved != store_len ||
+        g_transfer.magic != MACRO_STORE_MAGIC ||
+        g_transfer.generation != g_pending_generation ||
+        g_transfer.length != g_expected_len ||
+        g_transfer.crc32 != g_expected_crc ||
+        crc32_ieee(g_transfer.data, g_transfer.length) != g_transfer.crc32 ||
+        !validate_blob(g_transfer.data, g_transfer.length))
         return false;
     memcpy(g_active_blob, g_transfer.data, g_expected_len);
     g_active_len = g_expected_len;
     g_generation = g_pending_generation;
     g_active_slot = new_slot;
+    rebuild_trigger_index();
+    return true;
+}
+
+static bool erase_persistent_macros(void)
+{
+    /* Delete the inactive copy first. If power is lost before the active copy
+     * is removed, the last committed generation still boots normally. */
+    const char *inactive = g_active_slot == 1u ? MACRO_STORE_KEY_B :
+                                                 MACRO_STORE_KEY_A;
+    const char *active = g_active_slot == 1u ? MACRO_STORE_KEY_A :
+                                               MACRO_STORE_KEY_B;
+    if (ef_del_env(inactive) != EF_NO_ERR ||
+        ef_del_env(active) != EF_NO_ERR) return false;
+
+    memset(g_active_blob, 0, sizeof(g_active_blob));
+    memset(&g_transfer, 0, sizeof(g_transfer));
+    memset(&g_playback, 0, sizeof(g_playback));
+    g_active_len = 0;
+    g_generation = 0;
+    g_active_slot = 0;
+    g_received = 0;
+    g_expected_len = 0;
+    g_expected_crc = 0;
+    g_pending_generation = 0;
+    g_read_offset = 0;
+    g_state = MACRO_STATE_IDLE;
+    g_error = MACRO_ERROR_NONE;
+    g_management_dirty = false;
+    rebuild_trigger_index();
     return true;
 }
 
@@ -596,9 +708,63 @@ static const uint8_t *descriptor_at(uint16_t index)
     return g_active_blob + MACRO_HEADER_SIZE + index * MACRO_DESC_SIZE;
 }
 
+static void rebuild_trigger_index(void)
+{
+    memset(g_trigger_head, MACRO_INDEX_NONE, sizeof(g_trigger_head));
+    memset(g_trigger_next, MACRO_INDEX_NONE, sizeof(g_trigger_next));
+    memset(g_pending_long_macro, MACRO_INDEX_NONE,
+           sizeof(g_pending_long_macro));
+    memset(g_long_due_us, 0, sizeof(g_long_due_us));
+    g_long_pending_mask = 0;
+    if (g_active_len < MACRO_HEADER_SIZE) return;
+    const uint16_t count = read16(g_active_blob + 12);
+    /* Insert in reverse so every per-trigger list preserves descriptor order. */
+    for (int16_t i = (int16_t)count - 1; i >= 0; --i) {
+        const uint8_t *d = descriptor_at((uint16_t)i);
+        if (!d || d[4] >= 4u || d[5] >= REMAP_BTN_COUNT) continue;
+        g_trigger_next[i] = g_trigger_head[d[4]][d[5]];
+        g_trigger_head[d[4]][d[5]] = (uint8_t)i;
+    }
+}
+
+static bool descriptor_runtime_enabled(const uint8_t *d)
+{
+    if (!d || !(d[8] & 0x01u)) return false;
+    if (d[7] <= 1u) return (blob_flags() & 0x02u) != 0;
+    return (blob_flags() & 0x04u) != 0;
+}
+
+static void schedule_long_trigger(uint8_t trigger, uint64_t now_us)
+{
+    uint8_t selected = MACRO_INDEX_NONE;
+    uint16_t selected_ms = UINT16_MAX;
+    for (uint8_t i = g_trigger_head[blob_profile()][trigger];
+         i != MACRO_INDEX_NONE; i = g_trigger_next[i]) {
+        const uint8_t *d = descriptor_at(i);
+        if (d[6] != 2u || !descriptor_runtime_enabled(d)) continue;
+        const uint16_t threshold_ms = read16(d + 10);
+        if (threshold_ms < selected_ms) {
+            selected = i;
+            selected_ms = threshold_ms;
+        }
+    }
+    const uint32_t bit = 1u << trigger;
+    if (selected == MACRO_INDEX_NONE) {
+        g_long_pending_mask &= ~bit;
+        g_pending_long_macro[trigger] = MACRO_INDEX_NONE;
+        return;
+    }
+    g_pending_long_macro[trigger] = selected;
+    g_long_due_us[trigger] = now_us + (uint64_t)selected_ms * 1000ULL;
+    g_long_pending_mask |= bit;
+}
+
 void macro_engine_stop_all(void)
 {
     memset(&g_playback, 0, sizeof(g_playback));
+    g_long_pending_mask = 0;
+    memset(g_pending_long_macro, MACRO_INDEX_NONE,
+           sizeof(g_pending_long_macro));
     publish_status();
 }
 
@@ -620,14 +786,12 @@ static void start_macro(uint16_t index, bool held, uint64_t now_us)
 static bool trigger_macro(uint8_t trigger, uint8_t event, uint64_t interval_us,
                           bool held, uint64_t now_us)
 {
-    if (g_active_len < MACRO_HEADER_SIZE || !(blob_flags() & 0x01u)) return false;
-    const uint16_t count = read16(g_active_blob + 12);
-    for (uint16_t i = 0; i < count; ++i) {
+    if (g_active_len < MACRO_HEADER_SIZE || trigger >= REMAP_BTN_COUNT ||
+        !(blob_flags() & 0x01u)) return false;
+    for (uint8_t i = g_trigger_head[blob_profile()][trigger];
+         i != MACRO_INDEX_NONE; i = g_trigger_next[i]) {
         const uint8_t *d = descriptor_at(i);
-        if (!d || d[4] != blob_profile() || d[5] != trigger || !(d[8] & 0x01u))
-            continue;
-        if ((d[7] <= 1u && !(blob_flags() & 0x02u)) ||
-            (d[7] >= 2u && !(blob_flags() & 0x04u))) continue;
+        if (!descriptor_runtime_enabled(d)) continue;
         const bool trigger_match = d[6] == event ||
                                    (event == 0u && d[6] == 4u);
         if (trigger_match &&
@@ -708,6 +872,15 @@ void macro_engine_observe_raw(const uint8_t *payload, uint64_t now_us)
                     break;
                 }
             }
+            if (!recorder_prepare_limits(g_record_trigger)) {
+                led_status_set(LED_RED_BLINK_FAST);
+                g_recorder_state = RECORDER_SAVED;
+                g_recorder_deadline_us = now_us + 1500000ULL;
+                publish_status();
+                LOG_WRN("[MACRO] Recorder has no room for trigger=%u\n",
+                        g_record_trigger);
+                return;
+            }
             g_recorder_state = RECORDER_COUNTDOWN;
             g_recorder_deadline_us = now_us + 3000000ULL;
             led_status_set(LED_YELLOW_SOLID);
@@ -719,6 +892,7 @@ void macro_engine_observe_raw(const uint8_t *payload, uint64_t now_us)
         g_recorder_state = RECORDER_ACTIVE;
         g_record_len = g_record_steps = 0;
         g_record_have_state = false;
+        g_record_encoded_state = false;
         g_record_warned = false;
         led_status_set(LED_GREEN_SOLID);
         LOG_INF("[MACRO] Standalone recording started\n");
@@ -751,32 +925,34 @@ void macro_engine_observe_raw(const uint8_t *payload, uint64_t now_us)
          g_recorder_state != RECORDER_SAVED) ||
         g_active_len < MACRO_HEADER_SIZE || !(blob_flags() & 0x01u)) return;
 
-    for (uint8_t id = 0; id < REMAP_BTN_COUNT; ++id) {
+    uint32_t interesting = pressed | released | g_long_pending_mask;
+    while (interesting) {
+        const uint8_t id = (uint8_t)__builtin_ctz(interesting);
         const uint32_t bit = 1u << id;
+        interesting &= ~bit;
         if (pressed & bit) {
             const uint64_t since_release = now_us - g_last_release_us[id];
-            g_press_us[id] = now_us;
-            g_long_fired_mask &= ~bit;
             bool double_started = false;
             if (g_last_release_us[id] != 0 && since_release <= 600000ULL)
                 double_started = trigger_macro(id, 3u, since_release, true, now_us);
             if (!double_started)
                 (void)trigger_macro(id, 0u, 0u, true, now_us);
+            schedule_long_trigger(id, now_us);
         }
-        if ((g_raw_mask & bit) && !(g_long_fired_mask & bit)) {
-            const uint16_t count = g_active_len >= MACRO_HEADER_SIZE ?
-                                   read16(g_active_blob + 12) : 0;
-            for (uint16_t i = 0; i < count; ++i) {
-                const uint8_t *d = descriptor_at(i);
-                if (d && d[4] == blob_profile() && d[5] == id && d[6] == 2u &&
-                    now_us - g_press_us[id] >= (uint64_t)read16(d + 10) * 1000ULL) {
-                    g_long_fired_mask |= bit;
-                    start_macro(i, true, now_us);
-                    break;
-                }
+        if ((g_long_pending_mask & bit) && (g_raw_mask & bit) &&
+            now_us >= g_long_due_us[id]) {
+            const uint8_t index = g_pending_long_macro[id];
+            const uint8_t *d = descriptor_at(index);
+            g_long_pending_mask &= ~bit;
+            g_pending_long_macro[id] = MACRO_INDEX_NONE;
+            if (d && d[4] == blob_profile() && d[5] == id && d[6] == 2u &&
+                descriptor_runtime_enabled(d)) {
+                start_macro(index, true, now_us);
             }
         }
         if (released & bit) {
+            g_long_pending_mask &= ~bit;
+            g_pending_long_macro[id] = MACRO_INDEX_NONE;
             g_last_release_us[id] = now_us;
             (void)trigger_macro(id, 1u, 0u, false, now_us);
             if (g_playback.active) {
@@ -824,7 +1000,8 @@ void macro_engine_record_mapped(const uint8_t *payload, uint64_t now_us)
     }
     g_record_previous = current;
     g_record_last_us = now_us;
-    if (!g_record_warned && g_record_len >= MACRO_RECORD_WARN_BYTES) {
+    if (!g_record_warned &&
+        g_record_len >= (uint16_t)((uint32_t)g_record_byte_limit * 4u / 5u)) {
         g_record_warned = true;
         led_status_set(LED_RED_BLINK_SLOW);
     }
@@ -836,59 +1013,66 @@ static bool playback_next_step(uint64_t now_us)
     if (!d) return false;
     const uint16_t desc_bytes = read16(g_active_blob + 16);
     const uint8_t *program = g_active_blob + MACRO_HEADER_SIZE + desc_bytes;
-    while (g_playback.cursor < g_playback.program_end) {
-        const uint8_t op = program[g_playback.cursor++];
-        if (op == 0x01) {
-            g_playback.digital_mask = read24(program + g_playback.cursor);
-            g_playback.cursor += 3;
-        } else if (op == 0x02) {
-            memcpy(g_playback.axes, program + g_playback.cursor, 6);
-            g_playback.axis_valid = 1;
-            g_playback.cursor += 6;
-        } else if (op == 0x03) {
-            memcpy(g_playback.touches, program + g_playback.cursor, 10);
-            g_playback.touch_valid = true;
-            g_playback.cursor += 10;
-        } else if (op == 0x04) {
-            uint32_t duration = read16(program + g_playback.cursor);
-            const uint16_t random_extra = read16(program + g_playback.cursor + 2);
-            g_playback.cursor += 4;
-            if (random_extra) {
-                g_rng = g_rng * 1664525u + 1013904223u;
-                duration += g_rng % ((uint32_t)random_extra + 1u);
+    for (;;) {
+        while (g_playback.cursor < g_playback.program_end) {
+            const uint8_t op = program[g_playback.cursor++];
+            if (op == 0x01) {
+                g_playback.digital_mask = read24(program + g_playback.cursor);
+                g_playback.cursor += 3;
+            } else if (op == 0x02) {
+                memcpy(g_playback.axes, program + g_playback.cursor, 6);
+                g_playback.axis_valid = 1;
+                g_playback.cursor += 6;
+            } else if (op == 0x03) {
+                memcpy(g_playback.touches, program + g_playback.cursor, 10);
+                g_playback.touch_valid = true;
+                g_playback.cursor += 10;
+            } else if (op == 0x04) {
+                uint32_t duration = read16(program + g_playback.cursor);
+                const uint16_t random_extra = read16(program + g_playback.cursor + 2);
+                g_playback.cursor += 4;
+                if (random_extra) {
+                    g_rng = g_rng * 1664525u + 1013904223u;
+                    duration += g_rng % ((uint32_t)random_extra + 1u);
+                }
+                g_playback.deadline_us += (uint64_t)duration * 1000ULL;
+                return true;
+            } else {
+                return false;
             }
-            g_playback.deadline_us = now_us + (uint64_t)duration * 1000ULL;
-            return true;
-        } else return false;
-    }
+        }
 
-    uint16_t gap_ms = read16(d + 14);
-    bool restart = false;
-    switch (d[7]) {
-    case 0: restart = false; break;
-    case 1: restart = g_playback.trigger_held; break;
-    case 2:
-        if (g_playback.repeats_left > 1u) {
-            g_playback.repeats_left--;
-            restart = true;
+        uint16_t gap_ms = read16(d + 14);
+        bool restart = false;
+        switch (d[7]) {
+        case 0: restart = false; break;
+        case 1: restart = g_playback.trigger_held; break;
+        case 2:
+            if (g_playback.repeats_left > 1u) {
+                g_playback.repeats_left--;
+                restart = true;
+            }
+            break;
+        case 3: restart = g_playback.trigger_held; break;
+        case 4: restart = true; break;
+        case 5:
+            if (g_playback.repeats_left == 0u || g_playback.repeats_left > 1u) {
+                if (g_playback.repeats_left > 1u) g_playback.repeats_left--;
+                restart = true;
+                const uint16_t hz = read16(d + 14);
+                gap_ms = hz ? (uint16_t)(1000u / hz) : 20u;
+            }
+            break;
+        default: break;
         }
-        break;
-    case 3: restart = g_playback.trigger_held; break;
-    case 4: restart = true; break;
-    case 5:
-        if (g_playback.repeats_left == 0u || g_playback.repeats_left > 1u) {
-            if (g_playback.repeats_left > 1u) g_playback.repeats_left--;
-            restart = true;
-            const uint16_t hz = read16(d + 14);
-            gap_ms = hz ? (uint16_t)(1000u / hz) : 20u;
-        }
-        break;
-    default: break;
+        if (!restart) return false;
+        g_playback.cursor = read16(d + 18);
+        g_playback.deadline_us += (uint64_t)gap_ms * 1000ULL;
+        if (g_playback.deadline_us > now_us) return true;
+        /* A zero/already-expired repeat gap may enter the next cycle now, but
+         * this call still stops at its first WAIT. Every state is therefore
+         * emitted in at least one USB report instead of being skipped. */
     }
-    if (!restart) return false;
-    g_playback.cursor = read16(d + 18);
-    g_playback.deadline_us = now_us + (uint64_t)gap_ms * 1000ULL;
-    return true;
 }
 
 void macro_engine_apply(uint8_t *payload, uint64_t now_us)
@@ -902,9 +1086,16 @@ void macro_engine_apply(uint8_t *payload, uint64_t now_us)
         return;
     }
     if (!g_playback.active) return;
-    if (now_us >= g_playback.deadline_us && !playback_next_step(now_us)) {
-        macro_engine_stop_all();
-        return;
+    if (now_us >= g_playback.deadline_us) {
+        /* Preserve the absolute timeline for normal sub-report jitter. After a
+         * real >=20 ms stall, resync instead of skipping macro states or
+         * spending unbounded time catching up. */
+        if (now_us - g_playback.deadline_us >= MACRO_PLAYBACK_RESYNC_US)
+            g_playback.deadline_us = now_us;
+        if (!playback_next_step(now_us)) {
+            macro_engine_stop_all();
+            return;
+        }
     }
     const uint8_t *d = descriptor_at(g_playback.descriptor_index);
     uint32_t physical = remap_logical_mask(payload);
@@ -935,6 +1126,9 @@ void macro_engine_on_disconnect(void)
 {
     macro_engine_stop_all();
     g_raw_mask = g_previous_raw_mask = 0;
+    g_long_pending_mask = 0;
+    memset(g_pending_long_macro, MACRO_INDEX_NONE,
+           sizeof(g_pending_long_macro));
     g_ps_press_us = 0;
     g_ps_emergency_fired = false;
     if (g_management_mode) {
@@ -949,8 +1143,10 @@ int macro_engine_init(void)
     memset(g_active_blob, 0, sizeof(g_active_blob));
     memset(&g_transfer, 0, sizeof(g_transfer));
     memset(&g_playback, 0, sizeof(g_playback));
-    memset(g_press_us, 0, sizeof(g_press_us));
     memset(g_last_release_us, 0, sizeof(g_last_release_us));
+    memset(g_long_due_us, 0, sizeof(g_long_due_us));
+    memset(g_pending_long_macro, MACRO_INDEX_NONE,
+           sizeof(g_pending_long_macro));
     g_active_len = 0;
     g_generation = 0;
     g_active_slot = 0;
@@ -958,7 +1154,10 @@ int macro_engine_init(void)
     g_error = MACRO_ERROR_NONE;
     (void)load_slot(MACRO_STORE_KEY_A, 1);
     (void)load_slot(MACRO_STORE_KEY_B, 2);
-    g_command_queue = xQueueCreate(MACRO_QUEUE_DEPTH, sizeof(macro_command_frame_t));
+    rebuild_trigger_index();
+    g_command_queue = xQueueCreateStatic(
+        MACRO_QUEUE_DEPTH, sizeof(macro_command_frame_t),
+        g_command_queue_storage, &g_command_queue_control);
     if (!g_command_queue) return -1;
     g_state = g_active_len ? MACRO_STATE_READY : MACRO_STATE_IDLE;
     publish_status();
@@ -1092,6 +1291,22 @@ static void handle_command(const uint8_t p[MACRO_REPORT_SIZE])
         macro_engine_stop_all();
         g_error = MACRO_ERROR_NONE;
         g_state = g_active_len ? MACRO_STATE_READY : MACRO_STATE_IDLE;
+    } else if (command == MACRO_CMD_ERASE) {
+        const uint32_t expected = read32(p + 4);
+        if (expected != g_generation || g_state == MACRO_STATE_RECEIVING) {
+            set_error(expected != g_generation ? MACRO_ERROR_STALE :
+                                                   MACRO_ERROR_FRAME);
+            return;
+        }
+        macro_engine_stop_all();
+        if (g_recorder_state != RECORDER_IDLE) recorder_cancel();
+        if (g_management_mode) management_exit();
+        if (!erase_persistent_macros()) {
+            set_error(MACRO_ERROR_STORAGE);
+            return;
+        }
+        g_state = MACRO_STATE_ERASED;
+        LOG_INF("[MACRO] Persistent A/B macro storage erased\n");
     } else {
         set_error(MACRO_ERROR_FRAME);
         return;

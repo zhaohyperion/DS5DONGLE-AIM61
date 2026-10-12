@@ -610,6 +610,37 @@ fn wait_for_state(device: &hidapi::HidDevice, expected: &[u8]) -> Result<DeviceM
 }
 
 #[cfg(windows)]
+fn wait_for_transfer_offset(
+    device: &hidapi::HidDevice,
+    expected_offset: u16,
+    allow_legacy_without_ack: bool,
+) -> Result<bool> {
+    for poll in 0..80 {
+        let (status, _) = read_status(device)?;
+        if status.state == 3 {
+            bail!("设备拒绝宏数据块，错误码 {}", status.error);
+        }
+        if status.state == 1 && status.offset == expected_offset {
+            return Ok(true);
+        }
+        /* Macro protocol v3 firmware released before acknowledged chunks kept
+         * this field at zero while receiving. Detect it only on the first
+         * chunk after a generous processing window and retain paced upload. */
+        if allow_legacy_without_ack
+            && expected_offset != 0
+            && poll >= 20
+            && status.state == 1
+            && status.offset == 0
+            && status.error == 0
+        {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    bail!("等待设备接收宏数据超时，目标偏移 {expected_offset}")
+}
+
+#[cfg(windows)]
 pub fn read_device_macro_set() -> Result<MacroSet> {
     let device = open_macro_device()?;
     let (initial, _) = read_status(&device)?;
@@ -667,20 +698,34 @@ pub fn write_device_macro_set(set: &MacroSet) -> Result<MacroSet> {
     begin[8..12].copy_from_slice(&new_generation.to_le_bytes());
     begin[12..14].copy_from_slice(&(blob.len() as u16).to_le_bytes());
     begin[14..18].copy_from_slice(&hasher.finalize().to_le_bytes());
-    send_macro_frame(&device, &begin)?;
-    wait_for_state(&device, &[1])?;
+    let transfer = (|| -> Result<DeviceMacroStatus> {
+        send_macro_frame(&device, &begin)?;
+        wait_for_transfer_offset(&device, 0, false)?;
 
-    for (index, chunk) in blob.chunks(56).enumerate() {
-        let offset = index * 56;
-        let mut frame = macro_frame(0x02);
-        frame[4..6].copy_from_slice(&(offset as u16).to_le_bytes());
-        frame[6] = chunk.len() as u8;
-        frame[7..7 + chunk.len()].copy_from_slice(chunk);
-        send_macro_frame(&device, &frame)?;
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut acknowledged_chunks = true;
+        for (index, chunk) in blob.chunks(56).enumerate() {
+            let offset = index * 56;
+            let mut frame = macro_frame(0x02);
+            frame[4..6].copy_from_slice(&(offset as u16).to_le_bytes());
+            frame[6] = chunk.len() as u8;
+            frame[7..7 + chunk.len()].copy_from_slice(chunk);
+            send_macro_frame(&device, &frame)?;
+            if acknowledged_chunks {
+                acknowledged_chunks =
+                    wait_for_transfer_offset(&device, (offset + chunk.len()) as u16, index == 0)?;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        send_macro_frame(&device, &macro_frame(0x03))?;
+        wait_for_state(&device, &[2])
+    })();
+    if transfer.is_err() {
+        /* A transport interruption must not leave the device stuck in the
+         * receiving state. The committed A/B copy remains untouched. */
+        let _ = send_macro_frame(&device, &macro_frame(0x04));
     }
-    send_macro_frame(&device, &macro_frame(0x03))?;
-    let committed = wait_for_state(&device, &[2])?;
+    let committed = transfer?;
     if committed.generation != new_generation || usize::from(committed.length) != blob.len() {
         bail!("设备宏提交后的长度或代数验证失败");
     }
@@ -689,6 +734,37 @@ pub fn write_device_macro_set(set: &MacroSet) -> Result<MacroSet> {
 
 #[cfg(not(windows))]
 pub fn write_device_macro_set(_set: &MacroSet) -> Result<MacroSet> {
+    bail!("设备宏仅支持 Windows")
+}
+
+#[cfg(windows)]
+pub fn clear_device_macro_storage() -> Result<MacroSet> {
+    let device = open_macro_device()?;
+    let (current, _) = read_status(&device)?;
+    let mut erase = macro_frame(0x08);
+    erase[4..8].copy_from_slice(&current.generation.to_le_bytes());
+    send_macro_frame(&device, &erase)?;
+    /* The USB callback only enqueues the command. Give the USB task one
+     * scheduling interval before interpreting a pre-existing error state. */
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    let erased = wait_for_state(&device, &[4])?;
+    if erased.length != 0 || erased.generation != 0 {
+        bail!(
+            "设备报告宏存储已清除，但状态未复位（长度 {}，代数 {}）",
+            erased.length,
+            erased.generation
+        );
+    }
+    drop(device);
+    let verified = read_device_macro_set()?;
+    if !verified.macros.is_empty() || verified.generation != 0 {
+        bail!("清除后回读仍发现设备宏数据");
+    }
+    Ok(verified)
+}
+
+#[cfg(not(windows))]
+pub fn clear_device_macro_storage() -> Result<MacroSet> {
     bail!("设备宏仅支持 Windows")
 }
 
@@ -739,6 +815,20 @@ mod tests {
         };
         set.macros.push(definition);
         assert!(set.validate().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_command_is_explicit_and_generation_guarded() {
+        let generation = 0x1234_5678_u32;
+        let mut frame = macro_frame(0x08);
+        frame[4..8].copy_from_slice(&generation.to_le_bytes());
+        assert_eq!(&frame[..4], &[b'M', b'C', DEVICE_FORMAT_VERSION, 0x08]);
+        assert_eq!(
+            u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+            generation
+        );
+        assert!(frame[8..].iter().all(|byte| *byte == 0));
     }
 
     #[test]

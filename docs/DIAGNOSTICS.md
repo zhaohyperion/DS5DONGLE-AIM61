@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File tools\m61-diagnostics.ps1 -SelfTest
 
 ## Firmware logging policy
 
-The v3.6.2 standard profile uses custom `LOG_LEVEL=0` and has no `0xFD` handler, publisher task, diagnostic report banks, or periodic diagnostic work. Standard and Diagnostic deliberately reserve the same `0xFD` descriptor entry so Windows cannot reuse incompatible HID preparsed data under the shared VID/PID. The diagnostic profile normally uses level 1. Detailed snapshots are produced only while a host has activated a diagnostic session.
+The v3.6.3 standard profile uses custom `LOG_LEVEL=0` and has no `0xFD` handler, publisher task, diagnostic report banks, or periodic diagnostic work. Standard and Diagnostic deliberately reserve the same `0xFD` descriptor entry so Windows cannot reuse incompatible HID preparsed data under the shared VID/PID. The diagnostic profile normally uses level 1. Detailed snapshots are produced only while a host has activated a diagnostic session.
 
 The following paths must never print or hex-dump payloads:
 
@@ -62,9 +62,9 @@ For AI-M61, native USB still requires the USB_DM/USB_DP/GND wiring described in 
 
 Runtime diagnostics use local vendor Feature Report `0xFD`. It is deliberately separate from configuration reports `0xF6`-`0xF9`, remapping `0xFB`, and OTA reports `0xFA`/`0xFC`; it is never forwarded to the controller. Both profiles reserve the same descriptor declaration for Windows compatibility, but only the **diagnostic firmware profile** implements its SET/GET handler and snapshot task. The standard profile is identified through `0xF8`, so the host never probes `0xFD` on it.
 
-The USB `bcdDevice` value is derived from the firmware version (v3.6.2 becomes 3.62). This invalidates Windows HID descriptor caches left by pre-v3.6 profile switches. v3.6.2 also provides a one-shot diagnostic page over the existing, Windows-readable `0xF8` identity feature report after a diagnostic selector command. The native tool automatically uses this cache-safe fallback when `0xFD` is unavailable or all-zero; the next `0xF8` GET returns to its ordinary firmware-identity meaning. Firmware still accepts the v3.6.1 `0xF9` selector for old-tool compatibility, but v1.4.2 no longer relies on `0xF9` GET.
+The USB `bcdDevice` value is derived from the firmware version (v3.6.3 becomes 3.63). This invalidates Windows HID descriptor caches left by pre-v3.6 profile switches. v3.6.3 also provides a one-shot diagnostic page over the existing, Windows-readable `0xF8` identity feature report after a diagnostic selector command. The native tool automatically uses this cache-safe fallback when `0xFD` is unavailable or all-zero; the next `0xF8` GET returns to its ordinary firmware-identity meaning. Firmware still accepts the v3.6.1 `0xF9` selector for old-tool compatibility, but v1.4.3 no longer relies on `0xF9` GET.
 
-Every captured snapshot is self-checked before use. The host first requires an explicit Diagnostic firmware identity, then requires a complete page set (seven pages for current firmware, while retaining six-page legacy compatibility), valid/coherent flags, non-zero sequence and running-time fields, and non-empty decoded pages. All-zero transport responses and boot placeholder snapshots are rejected instead of being written into a report as valid data.
+Every captured snapshot is self-checked before use. The host first requires an explicit Diagnostic firmware identity, then requires a complete page set (nine pages for current firmware, while retaining six-, seven-, and eight-page legacy compatibility), valid/coherent flags, non-zero sequence and running-time fields, and non-empty decoded pages. All-zero transport responses and boot placeholder snapshots are rejected instead of being written into a report as valid data.
 
 The layouts below describe the 63-byte payload of Feature Report `0xFD`. CherryUSB internally prefixes that payload with the report ID, so the firmware class callback returns 64 bytes. Native host APIs may expose that prefix differently; it is never part of the CRC.
 
@@ -81,7 +81,7 @@ Page zero is selected after boot. Select another page with:
 
 ```text
 sendFeatureReport(0xFD, [0x01, 0x02, page])
-                         |     |     +-- page 0..6
+                         |     |     +-- page 0..8
                          |     +-------- protocol version 2
                          +-------------- SELECT_PAGE opcode
 ```
@@ -92,15 +92,15 @@ The selector is device-global, so two host readers can race. A reader must valid
 
 ### Common response header
 
-While a v2 session is active, the dedicated low-priority `diag` task builds all seven pages in an inactive bank and atomically publishes the complete bank once per second. When no session is active it returns without sampling. Every page in one snapshot has the same sequence and monotonic time. The task runs at FreeRTOS priority 1 with 1024 RV32 stack words (4 KiB), below LED, microphone, audio, Bluetooth, OTA, USB, and timer work.
+While a v2 session is active, the dedicated low-priority `diag` task builds all nine pages in an inactive bank and atomically publishes the complete bank once per second. When no session is active it returns without sampling. Every page in one snapshot has the same sequence and monotonic time. The task runs at FreeRTOS priority 1 with 1024 RV32 stack words (4 KiB), below LED, microphone, audio, Bluetooth, OTA, USB, and timer work.
 
 | Payload bytes | Type | Meaning |
 | --- | --- | --- |
 | `0..1` | ASCII | Magic `DG` |
 | `2` | `u8` | Protocol version, currently `2` |
 | `3` | `u8` | Header length, `16` |
-| `4` | `u8` | Page index, `0..6` |
-| `5` | `u8` | Page count, `7` |
+| `4` | `u8` | Page index, `0..8` |
+| `5` | `u8` | Page count, `9` |
 | `6` | `u8` | Used page-data bytes, at most `43` |
 | `7` | bitset | Snapshot flags |
 | `8..11` | `u32 LE` | Snapshot sequence |
@@ -139,7 +139,7 @@ All offsets below are relative to payload byte 16, the start of page data.
 | `29` | `u32` | Invalid SELECT count |
 | `33` | `u32` | Publish interval in milliseconds |
 
-Health bits are USB configured, BT connected, Edge controller, speaker active, microphone active, OTA maintenance, PSRAM present, and USB suspended in bits 0 through 7. USB lifecycle bits are configured, suspended, maintenance, Edge descriptor mode, HID IN busy, and keyboard interface registered in bits 0 through 5. Capability bits are paging, CRC32, coherent snapshots, monotonic time, read-only telemetry, SELECT_PAGE, and bridge-latency timing in bits 0 through 6.
+Health bits are USB configured, BT connected, Edge controller, speaker active, microphone active, OTA maintenance, PSRAM present, and USB suspended in bits 0 through 7. USB lifecycle bits are configured, suspended, maintenance, Edge descriptor mode, HID IN busy, and keyboard interface registered in bits 0 through 5. Capability bits are paging, CRC32, coherent snapshots, monotonic time, read-only telemetry, SELECT_PAGE, bridge-latency timing, and microphone-pipeline timing in bits 0 through 7.
 
 ### Page 1: USB and Bluetooth traffic (`data_len=43`)
 
@@ -177,7 +177,7 @@ Health bits are USB configured, BT connected, Edge controller, speaker active, m
 | `41` | `u8` | BT control queue high-water mark |
 | `42` | bitset | Bit 0 indicates at least one Opus encode error |
 
-The aggregate at offset 0 is a trend indicator, not a packet count: it sums USB errors, BT pressure/failures, PCM loss/starvation/overrun, and microphone under/overrun counters modulo `2^32`.
+The aggregate at offset 0 is a trend indicator, not a packet count: it sums USB errors, BT pressure/failures, PCM loss/starvation/overrun, microphone ring/endpoint errors, rejected/late/failed speaker processing, and microphone queue/decode errors modulo `2^32`.
 
 ### Page 3: audio processing timing (`data_len=41`)
 
@@ -195,7 +195,7 @@ The aggregate at offset 0 is a trend indicator, not a packet count: it sums USB 
 | `36,38` | `u16,u16` | Opus p99 and maximum microseconds |
 | `40` | bitset | Saturation flags for block, resampler, and Opus timing |
 
-Timing values saturate at `65535` microseconds rather than wrapping. Saturation bits 0, 1, and 2 correspond to the three timing families. The diagnostic getter masks interrupts only while copying thirteen aligned counters/sample/max scalars. Its bucketed p99 estimates scan the single-writer cumulative histograms afterwards in low-priority context; they can include one newer audio sample without delaying the realtime producer. The existing full statistics API remains available to non-realtime callers for a strictly consistent export.
+Timing values saturate at `65535` microseconds rather than wrapping. Saturation bits 0, 1, and 2 correspond to the three timing families. The diagnostic getter masks interrupts only while copying aligned counter/sample/max scalars. Its bucketed p99 estimates scan the single-writer cumulative histograms afterwards in low-priority context; they can include one newer audio sample without delaying the realtime producer. The existing full statistics API remains available to non-realtime callers for a strictly consistent export.
 
 ### Page 4: audio pipeline (`data_len=41`)
 
@@ -252,8 +252,53 @@ Memory/status bit 0 means the internal SDK memory-manager values are valid, bit 
 
 This page measures only controller input reports that complete a USB IN transfer. The start timestamp is taken at the firmware's Bluetooth HID input callback, after lower radio/L2CAP processing; the endpoint timestamp is the M61 USB transfer-complete callback, before Windows application scheduling. Reports replaced by the depth-one latest-state queues are visible through the traffic/coalescing counters on page 1 but do not become latency samples. P95/P99 are realtime-safe histogram upper bounds, and all microsecond fields saturate at `65535` with the corresponding flag set.
 
+### Page 7: controller microphone pipeline (`data_len=26`)
+
+| Offset | Type | Meaning |
+| --- | --- | --- |
+| `0` | `u32` | Bluetooth Opus microphone frames accepted by the firmware |
+| `4` | `u32` | Frames decoded successfully |
+| `8` | `u32` | Full microphone queue events where the oldest frame was replaced |
+| `12` | `u32` | Opus decoder errors |
+| `16` | `u32` | Microphone Opus queue high-water mark |
+| `20,22` | `u16,u16` | Opus decode P99 and maximum microseconds |
+| `24` | `u8` | Microphone-pipeline schema version, currently `1` |
+| `25` | bitset | Decode timing saturation, bit 0 |
+
+This page separates Bluetooth delivery and Opus decoding from the USB microphone ring and endpoint counters on page 4. A received/decoded gap with queue overruns points to decoder scheduling pressure; decoder errors point to payload/codec state; page-4 underruns with clean page-7 counters point farther downstream at the USB microphone cadence or host capture path. Older six- and seven-page snapshots remain readable and export these fields as unsupported rather than zero.
+
+### Page 8: scheduler and bridge queue headroom (`data_len=43`)
+
+| Offset | Type | Meaning |
+| --- | --- | --- |
+| `0` | `u8` | Page-layout version, currently `1` |
+| `1` | bitset | Bit 0 means interval CPU values are valid |
+| `2` | `u8` | Task count, currently `7` |
+| `4..17` | `u16[7]` | Minimum free stack words for BT, USB, audio, microphone, LED, OTA, and diagnostics tasks |
+| `18..31` | `u16[7]` | Per-task CPU use in per-mille over the previous publish interval |
+| `32..38` | `u8[7]` | Current task priorities in the same order |
+| `39` | `u8` | Current depth-one Bluetooth-input bridge queue depth |
+| `40` | `u8` | Current USB-output bridge queue depth |
+| `41` | `u8` | Bluetooth-input bridge queue high-water mark since boot |
+| `42` | `u8` | USB-output bridge queue high-water mark since boot |
+
+An unavailable task is encoded as `0xffff` for stack/CPU and `0xff` for priority. CPU accounting and stack scanning are compiled only into the Diagnostic profile. The first snapshot after boot has no previous CPU interval, so its CPU-valid bit is clear. Older six-, seven-, and eight-page snapshots remain readable and export scheduler fields as unsupported.
+
+### Host-side headroom assessment
+
+The native test center derives a `runtimeHealthAssessment` from the latest valid snapshot and includes the same structured result in the combined JSON report. These are conservative investigation thresholds, not proof of a hardware fault:
+
+| Signal | Warning | Critical |
+| --- | ---: | ---: |
+| Per-task minimum free stack | `<256` words (1 KiB) | `<128` words (512 B) |
+| Per-task one-second CPU share | `>=85%` | `>=95%` |
+| Internal bridge P99, with at least 100 samples | `>=5 ms` | `>=10 ms` |
+| Valid minimum internal heap | `<32 KiB` | `<16 KiB` |
+
+Reaching the five-entry USB-output bridge queue capacity is reported as a warning, and any saturated bridge timing field is critical. The depth-one Bluetooth-input queue intentionally keeps only the newest controller state, so a peak depth of one is normal and is not flagged. Invalid heap telemetry is displayed as unavailable instead of being interpreted as zero. A result should be confirmed across a complete five-minute run before changing task priorities, stack sizes, or queue capacities.
+
 ## Runtime cost and safety
 
-USB, Bluetooth, audio, and OTA hot paths only capture monotonic timestamps and update fixed-size aligned counters/histograms. They never format pages, calculate diagnostic CRCs, or print periodic diagnostics. Once per second, the priority-1 `diag` task copies the counters, samples heap and link state, formats seven pages, computes seven CRCs, and publishes one bank index after a RISC-V memory fence. Level-3 aggregate logs also run from this task every ten seconds. The next update writes the other bank.
+USB, Bluetooth, audio, and OTA hot paths only capture monotonic timestamps and update fixed-size aligned counters/histograms. They never format pages, calculate diagnostic CRCs, or print periodic diagnostics. Once per second, the priority-1 `diag` task copies the counters, samples heap, scheduler and link state, formats nine pages, computes nine CRCs, and publishes one bank index after a RISC-V memory fence. Level-3 aggregate logs also run from this task every ten seconds. The next update writes the other bank. Periodic diagnostic and LED work uses `vTaskDelayUntil`, preventing execution time from accumulating as cadence drift.
 
 `runtime_diag_init()` prepares CRC-valid, zero-length sequence-0 pages before task startup. The optional task is allocated last, after bridge, audio, indicator, and OTA workers. If its 4 KiB stack cannot be allocated, boot emits one bounded error and continues the controller bridge; hosts keep receiving those sequence-0 pages instead of triggering work in EP0. `0xFD` remains available during OTA maintenance because its callbacks do not touch flash, hashes, queues, or the controller.

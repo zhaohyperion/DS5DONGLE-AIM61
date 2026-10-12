@@ -58,6 +58,13 @@
 
 #define USB_OUTPUT_BUF_SZ    64  /* Report ID (1) + SetStateData (up to 63 for DSE) */
 
+#if DS5_DIAGNOSTIC_BUILD
+uint32_t ds5_runtime_stats_counter(void)
+{
+    return (uint32_t)bflb_mtimer_get_time_us();
+}
+#endif
+
 typedef struct {
     uint32_t connection_epoch;
     uint64_t received_us;
@@ -75,7 +82,21 @@ typedef struct {
 
 static QueueHandle_t input_queue;
 static QueueHandle_t output_queue;
+static StaticQueue_t input_queue_control;
+static StaticQueue_t output_queue_control;
+static uint8_t input_queue_storage[INPUT_QUEUE_ITEM_SZ];
+static uint8_t output_queue_storage[5u * OUTPUT_QUEUE_ITEM_SZ];
+static TaskHandle_t bt_task_handle;
 static TaskHandle_t usb_task_handle;
+static TaskHandle_t audio_task_handle;
+static TaskHandle_t mic_task_handle;
+static TaskHandle_t led_task_handle;
+static TaskHandle_t ota_task_handle;
+#if DS5_DIAGNOSTIC_BUILD
+static TaskHandle_t diag_task_handle;
+static volatile uint8_t input_queue_high_water;
+static volatile uint8_t output_queue_high_water;
+#endif
 static volatile bool ds5_connected = false;
 static volatile bool ever_connected = false;
 static volatile bool battery_low = false;
@@ -451,6 +472,9 @@ static void on_hid_input(const uint8_t *data, uint16_t len)
         }
         memcpy(item.report, data, DS5_BT_INPUT_REPORT_SIZE);
         xQueueOverwrite(input_queue, &item);
+#if DS5_DIAGNOSTIC_BUILD
+        input_queue_high_water = 1u;
+#endif
     }
 }
 
@@ -674,6 +698,11 @@ static void on_usb_output(const uint8_t *data, uint16_t len)
         }
         out_isr_tick = xTaskGetTickCountFromISR();
         xQueueSendToBackFromISR(output_queue, &item, &task_woken);
+#if DS5_DIAGNOSTIC_BUILD
+        UBaseType_t depth = uxQueueMessagesWaitingFromISR(output_queue);
+        if (depth > output_queue_high_water)
+            output_queue_high_water = (uint8_t)depth;
+#endif
         portYIELD_FROM_ISR(task_woken);
     }
 }
@@ -1301,6 +1330,7 @@ static void diagnostics_log_runtime(void)
 static void diagnostics_task(void *arg)
 {
     (void)arg;
+    TickType_t last_wake = xTaskGetTickCount();
 #if LOG_LEVEL >= 3
     uint64_t last_log_us = bflb_mtimer_get_time_us();
 #endif
@@ -1309,6 +1339,10 @@ static void diagnostics_task(void *arg)
             (unsigned)DIAG_TASK_PRIORITY);
     for (;;) {
         uint64_t now_us = bflb_mtimer_get_time_us();
+        runtime_diag_set_bridge_queue_stats(
+            (uint8_t)uxQueueMessagesWaiting(input_queue),
+            (uint8_t)uxQueueMessagesWaiting(output_queue),
+            input_queue_high_water, output_queue_high_water);
         runtime_diag_task_update(now_us);
 #if LOG_LEVEL >= 3
         if ((now_us - last_log_us) >= DIAG_RUNTIME_LOG_US) {
@@ -1316,7 +1350,8 @@ static void diagnostics_task(void *arg)
             diagnostics_log_runtime();
         }
 #endif
-        vTaskDelay(pdMS_TO_TICKS(RUNTIME_DIAG_PUBLISH_INTERVAL_MS));
+        vTaskDelayUntil(&last_wake,
+                        pdMS_TO_TICKS(RUNTIME_DIAG_PUBLISH_INTERVAL_MS));
     }
 }
 #endif
@@ -1334,7 +1369,11 @@ static void usb_task(void *arg)
 
     usb_gamepad_set_dse_mode(should_use_dse());
     usb_gamepad_set_polling_rate(config_polling_mode());
-    usb_gamepad_init(on_usb_output);
+    if (usb_gamepad_init(on_usb_output) != 0) {
+        LOG_ERR("[USB_TASK] USB initialization failed; task stopped\n");
+        vTaskDelete(NULL);
+        return;
+    }
     usb_gamepad_set_suspend_hooks(usb_wake_on_suspend,
                                   usb_wake_on_resume,
                                   usb_wake_on_configured);
@@ -1632,9 +1671,10 @@ static void usb_task(void *arg)
 static void led_task(void *arg)
 {
     (void)arg;
+    TickType_t last_wake = xTaskGetTickCount();
     for (;;) {
         led_status_tick();
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(50));
     }
 }
 
@@ -1738,10 +1778,14 @@ int main(void)
     bool audio_ok = (audio_init() == 0);
     LOG_INF("[B] audio: %s\n", audio_ok ? "OK" : "FAIL");
 
-    input_queue = xQueueCreate(1, INPUT_QUEUE_ITEM_SZ);
+    input_queue = xQueueCreateStatic(1, INPUT_QUEUE_ITEM_SZ,
+                                     input_queue_storage,
+                                     &input_queue_control);
     /* Depth-1 latest-state queue.  Each BT input carries its connection epoch;
      * usb_task is the only publisher to the USB HID mailbox. */
-    output_queue = xQueueCreate(5, OUTPUT_QUEUE_ITEM_SZ);
+    output_queue = xQueueCreateStatic(5, OUTPUT_QUEUE_ITEM_SZ,
+                                      output_queue_storage,
+                                      &output_queue_control);
     if (!input_queue || !output_queue) {
         LOG_ERR("[B] queue alloc FAIL\n");
         while (1) {}
@@ -1757,30 +1801,49 @@ int main(void)
     runtime_diag_init();
 #endif
 
-    xTaskCreate(bt_task,    "bt",    BT_TASK_STACK_SIZE,
-                NULL, BT_TASK_PRIORITY, NULL);
-    xTaskCreate(usb_task,  "usb",   USB_TASK_STACK_SIZE,
-                NULL, USB_TASK_PRIORITY, &usb_task_handle);
-    if (audio_ok) {
-        xTaskCreate(audio_task, "audio", AUDIO_TASK_STACK_SIZE,
-                    NULL, AUDIO_TASK_PRIORITY, NULL);
-        xTaskCreate(audio_mic_task, "mic", MIC_TASK_STACK_SIZE,
-                    NULL, MIC_TASK_PRIORITY, NULL);
+    if (xTaskCreate(bt_task, "bt", BT_TASK_STACK_SIZE,
+                    NULL, BT_TASK_PRIORITY, &bt_task_handle) != pdPASS ||
+        xTaskCreate(usb_task, "usb", USB_TASK_STACK_SIZE,
+                    NULL, USB_TASK_PRIORITY, &usb_task_handle) != pdPASS) {
+        LOG_ERR("[B] required bridge task creation failed\n");
+        while (1) {}
     }
-    xTaskCreate(led_task,  "led",   LED_TASK_STACK_SIZE,
-                NULL, LED_TASK_PRIORITY, NULL);
+    if (audio_ok) {
+        if (xTaskCreate(audio_task, "audio", AUDIO_TASK_STACK_SIZE,
+                        NULL, AUDIO_TASK_PRIORITY,
+                        &audio_task_handle) != pdPASS ||
+            xTaskCreate(audio_mic_task, "mic", MIC_TASK_STACK_SIZE,
+                        NULL, MIC_TASK_PRIORITY,
+                        &mic_task_handle) != pdPASS) {
+            LOG_ERR("[B] required audio task creation failed\n");
+            while (1) {}
+        }
+    }
+    if (xTaskCreate(led_task, "led", LED_TASK_STACK_SIZE,
+                    NULL, LED_TASK_PRIORITY, &led_task_handle) != pdPASS) {
+        LOG_ERR("[B] LED task creation failed; bridge continues\n");
+    }
     if (ota_ok &&
         xTaskCreate(ota_update_task, "ota", OTA_TASK_STACK_SIZE,
-                    NULL, OTA_TASK_PRIORITY, NULL) != pdPASS) {
+                    NULL, OTA_TASK_PRIORITY, &ota_task_handle) != pdPASS) {
         LOG_ERR("[B] OTA task alloc FAIL\n");
     }
     /* Create optional diagnostics last so it can never consume memory needed
      * by bridge, audio, indicator, or OTA workers. */
 #if DS5_DIAGNOSTIC_BUILD
     if (xTaskCreate(diagnostics_task, "diag", DIAG_TASK_STACK_DEPTH,
-                    NULL, DIAG_TASK_PRIORITY, NULL) != pdPASS) {
+                    NULL, DIAG_TASK_PRIORITY, &diag_task_handle) != pdPASS) {
         LOG_ERR("[B] diagnostics task alloc FAIL; bridge continues\n");
     }
+    runtime_diag_set_task_handle(RUNTIME_DIAG_TASK_BT, bt_task_handle);
+    runtime_diag_set_task_handle(RUNTIME_DIAG_TASK_USB, usb_task_handle);
+    runtime_diag_set_task_handle(RUNTIME_DIAG_TASK_AUDIO,
+                                 audio_task_handle);
+    runtime_diag_set_task_handle(RUNTIME_DIAG_TASK_MIC, mic_task_handle);
+    runtime_diag_set_task_handle(RUNTIME_DIAG_TASK_LED, led_task_handle);
+    runtime_diag_set_task_handle(RUNTIME_DIAG_TASK_OTA, ota_task_handle);
+    runtime_diag_set_task_handle(RUNTIME_DIAG_TASK_DIAGNOSTICS,
+                                 diag_task_handle);
 #endif
     LOG_INF("[B] init done, starting scheduler\n");
     vTaskStartScheduler();

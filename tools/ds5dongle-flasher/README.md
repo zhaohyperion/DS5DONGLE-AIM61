@@ -1,6 +1,6 @@
 # DS5Dongle AIM61 Tool Center
 
-Windows-native GUI/CLI for DS5DONGLE-AIM61. Version 1.4.2 provides a white high-contrast interface with four tabs:
+Windows-native GUI/CLI for DS5DONGLE-AIM61. Version 1.4.3 provides a white high-contrast interface with four tabs:
 
 1. Test center for live DualSense input, lights, bounded rumble, independently adjustable L2/R2 adaptive-trigger force, controller audio and real UAC microphone recording/playback.
 2. Button mapping for v3 19-control one-to-many mappings, synchronous combinations, macro timelines and standalone recordings.

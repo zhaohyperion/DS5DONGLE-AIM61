@@ -1,6 +1,6 @@
-# DS5Dongle Windows 工具中心 v1.4.2
+# DS5Dongle Windows 工具中心 v1.4.3
 
-`DS5Dongle-Flasher-Windows-v1.4.2.exe` 是 DS5DONGLE-AIM61 的单文件 Windows 原生工具。公开配置网站已下线，仓库不再包含配置网页代码；测试、映射与宏、诊断、OTA 配置切换和 UART 恢复都在本机完成，诊断数据不会自动上传。
+`DS5Dongle-Flasher-Windows-v1.4.3.exe` 是 DS5DONGLE-AIM61 的单文件 Windows 原生工具。公开配置网站已下线，仓库不再包含配置网页代码；测试、映射与宏、诊断、OTA 配置切换和 UART 恢复都在本机完成，诊断数据不会自动上传。
 
 ## 四个页签
 
@@ -22,7 +22,11 @@
 
 同页的宏编辑器支持 4 个设备档位、按下/释放/长按/双击/按住触发，单次、按住、定次重复、按住循环、开关循环和 1–50 Hz 连发。宏步骤可包含按键、摇杆、扳机、双触摸点和随机附加时长，不记录灯效、震动、自适应扳机、声音、六轴或条件。设备只运行一个宏，新宏打断旧宏；物理 PS 长按 2 秒始终急停。
 
-不开工具也可用 Create+Options 长按 2 秒进入独立录制：选择触发键后黄灯倒计时 3 秒，绿灯亮起开始录制；再次按组合键结束。Mute+Options 长按 2 秒进入设备宏管理。录制内容存入事务式 A/B PSM 文件，并可在工具中读取修改。
+固件按“档位 + 物理触发键”预建紧凑索引，普通约 750 Hz 转发不遍历整张宏表；长按只在按下瞬间选择最近到期的有效宏。播放期限沿原始时间线推进以避免小幅调度误差累积；遇到 ≥20 ms 停顿时重同步，但每个宏状态仍至少输出一帧，不以“追赶”为由跳过短按。工具上传每个数据块都会等待设备偏移确认，失败发送 ABORT，提交后固件从 Flash 完整回读校验后才启用新宏；旧版宏 v3 固件没有偏移确认时会自动回退到兼容的节流传输。
+
+不开工具也可用 Create+Options 长按 2 秒进入独立录制：选择触发键后先核算替换旧宏后的实际字节和步骤余量，黄灯倒计时 3 秒，绿灯亮起开始录制；再次按组合键结束。录制只写入发生变化的按键、摇杆/扳机或触摸字段，长静止段只保存等待时长。Mute+Options 长按 2 秒进入设备宏管理；同一次管理会话的多项修改在退出时合并为一次 A/B 写入。录制内容存入事务式 A/B PSM 文件，并可在工具中读取修改。
+
+“录制与设备宏”提供单独的“清除设备宏数据”操作。二次确认后，固件先停止播放/录制，再按非活动槽、活动槽的顺序删除 `macro_store_a` 和 `macro_store_b`，清空当前 RAM 宏，并通过 `0xFE` 状态及再次读取确认设备为空。该操作只释放设备上的宏持久化存储，不删除 19 控件映射、固件或电脑中已导出的 JSON 文件；宏引擎的固定运行缓冲仍随固件保留。
 
 ### 3. 设备调试
 
@@ -78,19 +82,19 @@ UART 恢复步骤：
 
 ## 运行态信息与诊断
 
-`0xF8` Feature Report 通常返回 `版本|配置`，例如 `3.6.2|standard`。Standard 与 Diagnostic 都支持读取身份；Diagnostic 响应 `0xFD` v2 快照。v3.6.2 在 `0xFD` 返回全零时，通过当前真机已确认可读的 `0xF8` 通道发送选择命令；紧随其后的一次 `0xF8` GET 返回快照页，然后立即恢复固件身份语义。旧固件返回单独版本或 v1 快照时，工具按兼容模式显示，缺失字段标记为“不支持”，不会伪造为零。
+`0xF8` Feature Report 通常返回 `版本|配置`，例如 `3.6.3|standard`。Standard 与 Diagnostic 都支持读取身份；Diagnostic 响应 `0xFD` v2 快照。v3.6.3 在 `0xFD` 返回全零时，通过当前真机已确认可读的 `0xF8` 通道发送选择命令；紧随其后的一次 `0xF8` GET 返回快照页，然后立即恢复固件身份语义。旧固件返回单独版本或 v1 快照时，工具按兼容模式显示，缺失字段标记为“不支持”，不会伪造为零。
 
-性能压力测试的 Windows HID 间隔采样与固件快照完全解耦。引导式诊断未手动结束时，启动性能测试会安全结束引导输出、保留已经取得的结果并立即开始计时；快照失败只影响 M61 内部计数，不会阻止 HID 性能样本。若 3 秒内没有可计时报告，v1.4.2 会停止测试并给出明确错误。快照页和报告导出都会先做数据自检；启动占位页、页数/标志不完整、零时长却存在样本等矛盾数据会被拒绝，部分报告会列出实际存在和缺失的数据区段。
+性能压力测试的 Windows HID 间隔采样与固件快照完全解耦。引导式诊断未手动结束时，启动性能测试会安全结束引导输出、保留已经取得的结果并立即开始计时；快照失败只影响 M61 内部计数，不会阻止 HID 性能样本。若 3 秒内没有可计时报告，v1.4.3 会停止测试并给出明确错误。快照页和报告导出都会先做数据自检；启动占位页、页数/标志不完整、零时长却存在样本等矛盾数据会被拒绝，部分报告会列出实际存在和缺失的数据区段。
 
 CLI：
 
 ```powershell
-.\DS5Dongle-Flasher-Windows-v1.4.2.exe --device-info
-.\DS5Dongle-Flasher-Windows-v1.4.2.exe --diagnostics
-.\DS5Dongle-Flasher-Windows-v1.4.2.exe --list
-.\DS5Dongle-Flasher-Windows-v1.4.2.exe --list-releases --board aim61 --usb-speed hs
-.\DS5Dongle-Flasher-Windows-v1.4.2.exe --verify-release --release v3.6.2 --board aim61 --usb-speed hs
-.\DS5Dongle-Flasher-Windows-v1.4.2.exe --release v3.6.2 --board aim61 --usb-speed hs --port COM3 --dry-run
+.\DS5Dongle-Flasher-Windows-v1.4.3.exe --device-info
+.\DS5Dongle-Flasher-Windows-v1.4.3.exe --diagnostics
+.\DS5Dongle-Flasher-Windows-v1.4.3.exe --list
+.\DS5Dongle-Flasher-Windows-v1.4.3.exe --list-releases --board aim61 --usb-speed hs
+.\DS5Dongle-Flasher-Windows-v1.4.3.exe --verify-release --release v3.6.3 --board aim61 --usb-speed hs
+.\DS5Dongle-Flasher-Windows-v1.4.3.exe --release v3.6.3 --board aim61 --usb-speed hs --port COM3 --dry-run
 ```
 
 CLI 的自动选择同样优先最新 AIM61 HS Standard。诊断版的显式选择和应用级 OTA 主要通过 GUI 完成。
@@ -99,11 +103,11 @@ CLI 的自动选择同样优先最新 AIM61 HS Standard。诊断版的显式选�
 
 ```powershell
 python tools\package_firmware.py --board aim61 --usb-speed hs `
-  --profile standard --version 3.6.2 `
+  --profile standard --version 3.6.3 `
   --firmware-dir firmware\aim61 --output-dir dist
 
 python tools\package_firmware.py --board aim61 --usb-speed hs `
-  --profile diagnostic --version 3.6.2 `
+  --profile diagnostic --version 3.6.3 `
   --firmware-dir firmware\aim61 --output-dir dist
 ```
 

@@ -41,9 +41,23 @@
 #define SINC_LEFT_PAD   (SINC_HALF_TAPS - 1)
 #define SINC_RIGHT_PAD  (SINC_TAPS - SINC_HALF_TAPS - 1)
 
+#if DS5_DIAGNOSTIC_BUILD || LOG_LEVEL >= 3
+#define AUDIO_RUNTIME_TELEMETRY 1
+#else
+#define AUDIO_RUNTIME_TELEMETRY 0
+#endif
+
+#if AUDIO_RUNTIME_TELEMETRY
 #define AUDIO_TIMING_BUCKET_US 250u
 #define AUDIO_TIMING_BUCKETS   64u
-#define AUDIO_BLOCK_DEADLINE_US 10667u /* 512 samples / 48 kHz */
+/* The USB producer clock is the pacing source: 512 / 48 kHz = 10.667 ms.
+ * Use a compile-time ceiling rather than a hand-maintained literal. Sending
+ * each 480-sample Opus frame every 10 ms would run 6.67% too fast and causes
+ * periodic controller-buffer pressure. This timing fact is independently
+ * corroborated by GeorgLegato/LinuxAudio4Dualsense5. */
+#define AUDIO_BLOCK_DEADLINE_US \
+    ((INPUT_FRAME_SAMPLES * 1000000u + USB_AUDIO_SAMPLE_RATE - 1u) / \
+     USB_AUDIO_SAMPLE_RATE)
 
 typedef struct {
     uint64_t total_us;
@@ -64,7 +78,14 @@ typedef struct {
     audio_timing_accum_t block;
     audio_timing_accum_t resample;
     audio_timing_accum_t encode;
+    uint32_t mic_frames_received;
+    uint32_t mic_frames_decoded;
+    uint32_t mic_queue_overruns;
+    uint32_t mic_decode_errors;
+    uint32_t mic_queue_high_water;
+    audio_timing_accum_t mic_decode;
 } audio_runtime_internal_t;
+#endif
 
 static uint8_t audio_seq;   /* sequence counter for 0x39 audio report */
 
@@ -84,6 +105,8 @@ static volatile bool mic_status_pending;  /* deferred: send 0x32 to controller *
 static volatile uint32_t mic_status_generation;
 
 static QueueHandle_t mic_queue;
+static StaticQueue_t mic_queue_control;
+static uint8_t mic_queue_storage[MIC_QUEUE_DEPTH * MIC_OPUS_SIZE];
 
 static int16_t  spk_resamp[OPUS_FRAME_SAMPLES * 2];
 static bool     mic_first_frame;
@@ -98,7 +121,9 @@ static uint32_t speaker_generation;
 static uint32_t speaker_next_sequence;
 static bool     pair_speaker_valid;
 static bool     pair_speaker_enabled;
+#if AUDIO_RUNTIME_TELEMETRY
 static audio_runtime_internal_t runtime_stats;
+#endif
 
 /* Double-frame buffers for 0x39 report (2x haptics + 2x opus per packet) */
 static uint8_t  opus_slots[2][OPUS_OUT_SIZE];
@@ -115,6 +140,7 @@ static ATTR_DTCM_SECTION int16_t sinc_coeff_q15[RESAMP_PHASES][SINC_TAPS];
 static ATTR_DTCM_SECTION uint16_t sinc_center[OPUS_FRAME_SAMPLES];
 static ATTR_DTCM_SECTION uint8_t sinc_phase[OPUS_FRAME_SAMPLES];
 
+#if AUDIO_RUNTIME_TELEMETRY
 static void audio_timing_record(audio_timing_accum_t *timing,
                                 uint32_t elapsed_us)
 {
@@ -150,6 +176,7 @@ static uint32_t audio_timing_p99(const audio_timing_accum_t *timing)
 {
     return audio_timing_p99_samples(timing, timing->samples);
 }
+#endif
 
 static void resamp_sinc_init(void)
 {
@@ -387,7 +414,8 @@ int audio_init(void)
         decoder = NULL;
     }
 
-    mic_queue = xQueueCreate(MIC_QUEUE_DEPTH, MIC_OPUS_SIZE);
+    mic_queue = xQueueCreateStatic(MIC_QUEUE_DEPTH, MIC_OPUS_SIZE,
+                                   mic_queue_storage, &mic_queue_control);
     if (!mic_queue) {
         LOG_ERR("[AUDIO] mic_queue create failed\n");
     }
@@ -416,7 +444,9 @@ int audio_init(void)
     speaker_next_sequence = 0;
     pair_speaker_valid = false;
     pair_speaker_enabled = false;
+#if AUDIO_RUNTIME_TELEMETRY
     memset(&runtime_stats, 0, sizeof(runtime_stats));
+#endif
     memset(opus_slots, 0, sizeof(opus_slots));
     memset(haptic_slots, 0, sizeof(haptic_slots));
 
@@ -463,7 +493,9 @@ static void reset_speaker_pipeline_task(void)
     memset(haptic_slots, 0, sizeof(haptic_slots));
     if (encoder)
         opus_encoder_ctl(encoder, OPUS_RESET_STATE);
+#if AUDIO_RUNTIME_TELEMETRY
     runtime_stats.pipeline_resets++;
+#endif
 }
 
 static void service_speaker_reset_task(void)
@@ -581,7 +613,9 @@ void audio_task(void *arg)
             continue;
         }
 
+#if AUDIO_RUNTIME_TELEMETRY
         uint64_t block_started_us = bflb_mtimer_get_time_us();
+#endif
         /* A close/reopen may have raced the queue handoff. */
         if (encoder_reset_pending)
             service_speaker_reset_task();
@@ -599,7 +633,9 @@ void audio_task(void *arg)
                 speaker_sequence_valid = true;
             } else if (speaker_generation != block.generation ||
                        speaker_next_sequence != block.sequence) {
+#if AUDIO_RUNTIME_TELEMETRY
                 runtime_stats.discontinuities++;
+#endif
                 reset_speaker_pipeline_task();
                 speaker_generation = block.generation;
                 speaker_next_sequence = block.sequence;
@@ -654,24 +690,32 @@ void audio_task(void *arg)
 
             bool frame_ok = true;
             if (pair_speaker_enabled) {
+#if AUDIO_RUNTIME_TELEMETRY
                 uint64_t stage_started_us = bflb_mtimer_get_time_us();
+#endif
                 resample_512_480(spk_raw, spk_resamp);
+#if AUDIO_RUNTIME_TELEMETRY
                 uint64_t stage_finished_us = bflb_mtimer_get_time_us();
                 audio_timing_record(&runtime_stats.resample,
                     (uint32_t)(stage_finished_us - stage_started_us));
 
                 stage_started_us = stage_finished_us;
+#endif
                 int encoded = opus_encode(encoder, spk_resamp,
                                           OPUS_FRAME_SAMPLES,
                                           opus_slots[slot], OPUS_OUT_SIZE);
+#if AUDIO_RUNTIME_TELEMETRY
                 stage_finished_us = bflb_mtimer_get_time_us();
                 audio_timing_record(&runtime_stats.encode,
                     (uint32_t)(stage_finished_us - stage_started_us));
+#endif
 
                 /* DS5 CBR packets are exactly 200 bytes. A short packet is
                  * not raw PCM and must never be padded into a fake frame. */
                 if (encoded != OPUS_OUT_SIZE) {
+#if AUDIO_RUNTIME_TELEMETRY
                     runtime_stats.encode_errors++;
+#endif
                     frame_ok = false;
                 }
             } else {
@@ -689,15 +733,21 @@ void audio_task(void *arg)
                 reset_speaker_pipeline_task();
             } else if (current &&
                        bt_hid_host_get_state() == BT_HID_STATE_CONNECTED) {
+#if AUDIO_RUNTIME_TELEMETRY
                 runtime_stats.frames_processed++;
+#endif
                 speaker_next_sequence = block.sequence + 1u;
                 if (slot == 1) {
                     if (send_audio_report(pair_speaker_enabled) == 0) {
+#if AUDIO_RUNTIME_TELEMETRY
                         runtime_stats.pairs_submitted++;
+#endif
                         frame_slot = 0;
                         pair_speaker_valid = false;
                     } else {
+#if AUDIO_RUNTIME_TELEMETRY
                         runtime_stats.pairs_rejected++;
+#endif
                         /* Sequence/counter were not committed. Opus state did
                          * advance, so restart prediction before another pair. */
                         reset_speaker_pipeline_task();
@@ -714,11 +764,13 @@ void audio_task(void *arg)
                 reset_speaker_pipeline_task();
         }
 
+#if AUDIO_RUNTIME_TELEMETRY
         uint32_t block_elapsed_us = (uint32_t)(
             bflb_mtimer_get_time_us() - block_started_us);
         audio_timing_record(&runtime_stats.block, block_elapsed_us);
         if (block_elapsed_us > AUDIO_BLOCK_DEADLINE_US)
             runtime_stats.deadline_misses++;
+#endif
     }
 }
 
@@ -767,13 +819,24 @@ void audio_mic_feed(const uint8_t *opus_data, uint16_t len)
     if (!mic_enabled || !mic_queue) return;
     if (len < MIC_OPUS_SIZE) return;
 
+#if AUDIO_RUNTIME_TELEMETRY
+    runtime_stats.mic_frames_received++;
+#endif
     uint8_t frame[MIC_OPUS_SIZE];
     memcpy(frame, opus_data, MIC_OPUS_SIZE);
     if (xQueueSend(mic_queue, frame, 0) != pdTRUE) {
+#if AUDIO_RUNTIME_TELEMETRY
+        runtime_stats.mic_queue_overruns++;
+#endif
         uint8_t discard[MIC_OPUS_SIZE];
         xQueueReceive(mic_queue, discard, 0);
         xQueueSend(mic_queue, frame, 0);
     }
+#if AUDIO_RUNTIME_TELEMETRY
+    UBaseType_t depth = uxQueueMessagesWaiting(mic_queue);
+    if (depth > runtime_stats.mic_queue_high_water)
+        runtime_stats.mic_queue_high_water = depth;
+#endif
 }
 
 void audio_set_mic_active(bool active)
@@ -802,6 +865,7 @@ bool audio_mic_active(void)
     return mic_enabled;
 }
 
+#if AUDIO_RUNTIME_TELEMETRY
 static void audio_timing_export(const audio_timing_accum_t *source,
                                 uint32_t *last, uint32_t *average,
                                 uint32_t *maximum, uint32_t *p99)
@@ -812,18 +876,20 @@ static void audio_timing_export(const audio_timing_accum_t *source,
     *maximum = source->max_us;
     *p99 = audio_timing_p99(source);
 }
+#endif
 
 void audio_get_runtime_stats(audio_runtime_stats_t *stats)
 {
     if (!stats)
         return;
 
+    memset(stats, 0, sizeof(*stats));
+#if AUDIO_RUNTIME_TELEMETRY
     audio_runtime_internal_t snapshot;
     taskENTER_CRITICAL();
     snapshot = runtime_stats;
     taskEXIT_CRITICAL();
 
-    memset(stats, 0, sizeof(*stats));
     stats->frames_processed = snapshot.frames_processed;
     stats->pairs_submitted = snapshot.pairs_submitted;
     stats->pairs_rejected = snapshot.pairs_rejected;
@@ -846,6 +912,7 @@ void audio_get_runtime_stats(audio_runtime_stats_t *stats)
                         &stats->encode_us_average,
                         &stats->encode_us_max,
                         &stats->encode_us_p99);
+#endif
 }
 
 void audio_get_runtime_diag_stats(audio_runtime_diag_stats_t *stats)
@@ -853,12 +920,15 @@ void audio_get_runtime_diag_stats(audio_runtime_diag_stats_t *stats)
     if (!stats)
         return;
 
+    memset(stats, 0, sizeof(*stats));
+#if AUDIO_RUNTIME_TELEMETRY
     audio_runtime_diag_stats_t snapshot = {0};
     uint32_t block_samples;
     uint32_t resample_samples;
     uint32_t encode_samples;
+    uint32_t mic_decode_samples;
 
-    /* Keep interrupt masking bounded to thirteen aligned scalar loads.  The
+    /* Keep interrupt masking bounded to aligned scalar loads only.  The
      * large cumulative histograms are single-writer, monotonically increasing
      * data owned by audio_task.  Scanning them below may include the next
      * sample, which is acceptable for their bucketed low-rate p99 estimate and
@@ -877,6 +947,13 @@ void audio_get_runtime_diag_stats(audio_runtime_diag_stats_t *stats)
     snapshot.resample_us_max = runtime_stats.resample.max_us;
     encode_samples = runtime_stats.encode.samples;
     snapshot.encode_us_max = runtime_stats.encode.max_us;
+    snapshot.mic_frames_received = runtime_stats.mic_frames_received;
+    snapshot.mic_frames_decoded = runtime_stats.mic_frames_decoded;
+    snapshot.mic_queue_overruns = runtime_stats.mic_queue_overruns;
+    snapshot.mic_decode_errors = runtime_stats.mic_decode_errors;
+    snapshot.mic_queue_high_water = runtime_stats.mic_queue_high_water;
+    mic_decode_samples = runtime_stats.mic_decode.samples;
+    snapshot.mic_decode_us_max = runtime_stats.mic_decode.max_us;
     taskEXIT_CRITICAL();
 
     snapshot.block_us_p99 =
@@ -885,7 +962,11 @@ void audio_get_runtime_diag_stats(audio_runtime_diag_stats_t *stats)
         audio_timing_p99_samples(&runtime_stats.resample, resample_samples);
     snapshot.encode_us_p99 =
         audio_timing_p99_samples(&runtime_stats.encode, encode_samples);
+    snapshot.mic_decode_us_p99 =
+        audio_timing_p99_samples(&runtime_stats.mic_decode,
+                                 mic_decode_samples);
     *stats = snapshot;
+#endif
 }
 
 /* ---- Mic decode task: runs independently at lower priority than audio_task ----
@@ -917,8 +998,15 @@ void audio_mic_task(void *arg)
         if (!decoder || !mic_enabled)
             continue;
 
+#if AUDIO_RUNTIME_TELEMETRY
+        uint64_t decode_started_us = bflb_mtimer_get_time_us();
+#endif
         int decoded = opus_decode(decoder, mic_opus_buf, MIC_OPUS_SIZE,
                                   mic_mono, OPUS_FRAME_SAMPLES, 0);
+#if AUDIO_RUNTIME_TELEMETRY
+        audio_timing_record(&runtime_stats.mic_decode,
+            (uint32_t)(bflb_mtimer_get_time_us() - decode_started_us));
+#endif
         /* A close/reset during decode invalidates both decoder history and the
          * output. The mic task alone performs the actual decoder reset. */
         if (decoder_reset_pending || !mic_enabled) {
@@ -926,9 +1014,15 @@ void audio_mic_task(void *arg)
             continue;
         }
         if (decoded <= 0) {
+#if AUDIO_RUNTIME_TELEMETRY
+            runtime_stats.mic_decode_errors++;
+#endif
             LOG_ERR("[MIC] Opus decode error: %d\n", decoded);
             continue;
         }
+#if AUDIO_RUNTIME_TELEMETRY
+        runtime_stats.mic_frames_decoded++;
+#endif
         if (!mic_first_frame) {
             mic_first_frame = true;
             LOG_INF("[AUDIO] First mic frame decoded (%d samples)\n", decoded);

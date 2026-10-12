@@ -162,6 +162,19 @@ struct Status {
     window: u8,
 }
 
+/// Small transport boundary around the OTA state machine.
+///
+/// The production implementation talks to the Windows HID device. Tests use
+/// an in-memory scripted transport so every protocol failure can be exercised
+/// without a controller or an AIM61 board connected.
+trait OtaTransport {
+    fn send_feature(&mut self, wire: &[u8; WIRE_REPORT_SIZE]) -> Result<()>;
+    fn send_output(&mut self, wire: &[u8; WIRE_REPORT_SIZE]) -> Result<()>;
+    fn read_status(&mut self) -> Result<Status>;
+    fn monotonic(&self) -> Duration;
+    fn sleep(&mut self, duration: Duration);
+}
+
 pub fn update_from_zip(
     archive_path: &Path,
     expected_profile: BuildProfile,
@@ -483,7 +496,21 @@ fn update_device(package: &OtaPackage, progress: &mut impl FnMut(String)) -> Res
         "unable to open the gamepad HID interface; close Steam, DS4Windows and the test session",
     )?;
 
-    let caps = read_status(&device)?;
+    let mut transport = HidOtaTransport {
+        device,
+        started_at: Instant::now(),
+    };
+    run_update(&mut transport, package, new_session_id(), progress)
+}
+
+fn run_update(
+    transport: &mut impl OtaTransport,
+    package: &OtaPackage,
+    session: u32,
+    progress: &mut impl FnMut(String),
+) -> Result<()> {
+    let caps = transport.read_status()?;
+
     if caps.state != STATE_IDLE || caps.board != 1 || caps.speed != 1 {
         bail!(
             "device is busy or is not AIM61 High-Speed (state={})",
@@ -498,7 +525,6 @@ fn update_device(package: &OtaPackage, progress: &mut impl FnMut(String)) -> Res
         bail!("device OTA capabilities/key configuration do not accept this signed image")
     }
 
-    let session = new_session_id();
     let result = (|| -> Result<()> {
         let mut begin = [0_u8; 43];
         begin[0] = 1;
@@ -512,24 +538,20 @@ fn update_device(package: &OtaPackage, progress: &mut impl FnMut(String)) -> Res
             BuildProfile::Standard => 0,
             BuildProfile::Diagnostic => 1,
         };
-        send_feature(
-            &device,
-            &frame(CTRL_BEGIN, session, package.image.len() as u32, &begin)?,
-        )?;
-        wait_status(&device, session, Duration::from_secs(3), |status| {
+        transport.send_feature(&frame(
+            CTRL_BEGIN,
+            session,
+            package.image.len() as u32,
+            &begin,
+        )?)?;
+        wait_status(transport, session, Duration::from_secs(3), |status| {
             status.state == STATE_AUTHORIZING
         })?;
         progress("Device accepted BEGIN; authorizing signed image".to_owned());
 
-        send_feature(
-            &device,
-            &frame(CTRL_AUTH, session, 0, &package.signature[..46])?,
-        )?;
-        send_feature(
-            &device,
-            &frame(CTRL_AUTH, session, 46, &package.signature[46..])?,
-        )?;
-        wait_status(&device, session, Duration::from_secs(15), |status| {
+        transport.send_feature(&frame(CTRL_AUTH, session, 0, &package.signature[..46])?)?;
+        transport.send_feature(&frame(CTRL_AUTH, session, 46, &package.signature[46..])?)?;
+        wait_status(transport, session, Duration::from_secs(15), |status| {
             status.state == STATE_RECEIVING
         })?;
         progress("Signature accepted; transferring OTA image".to_owned());
@@ -544,19 +566,16 @@ fn update_device(package: &OtaPackage, progress: &mut impl FnMut(String)) -> Res
                     break;
                 }
                 let end = (offset + DATA_BYTES_MAX).min(package.image.len());
-                send_output(
-                    &device,
-                    &frame(
-                        MSG_DATA,
-                        session,
-                        offset as u32,
-                        &package.image[offset..end],
-                    )?,
-                )?;
+                transport.send_output(&frame(
+                    MSG_DATA,
+                    session,
+                    offset as u32,
+                    &package.image[offset..end],
+                )?)?;
                 offset = end;
             }
             let expected = offset as u32;
-            wait_status(&device, session, Duration::from_secs(5), |status| {
+            wait_status(transport, session, Duration::from_secs(5), |status| {
                 status.accepted_offset >= expected
             })?;
             let percent = offset * 100 / package.image.len();
@@ -572,9 +591,9 @@ fn update_device(package: &OtaPackage, progress: &mut impl FnMut(String)) -> Res
             }
         }
 
-        send_feature(&device, &frame(CTRL_COMMIT, session, 0, &[])?)?;
+        transport.send_feature(&frame(CTRL_COMMIT, session, 0, &[])?)?;
         progress("Transfer complete; device is verifying and switching the A/B slot".to_owned());
-        match wait_status(&device, session, Duration::from_secs(15), |status| {
+        match wait_status(transport, session, Duration::from_secs(15), |status| {
             status.state == STATE_READY_REBOOT
         }) {
             Ok(status) => {
@@ -587,8 +606,9 @@ fn update_device(package: &OtaPackage, progress: &mut impl FnMut(String)) -> Res
             }
             Err(error) => {
                 // A planned reboot can remove the HID interface before the final poll.
-                if !format!("{error:#}").contains("HID") && !format!("{error:#}").contains("device")
-                {
+                // Never turn a protocol rejection (whose message also contains
+                // the word "device") into a false success.
+                if !is_expected_post_commit_disconnect(&error) {
                     return Err(error);
                 }
             }
@@ -597,56 +617,82 @@ fn update_device(package: &OtaPackage, progress: &mut impl FnMut(String)) -> Res
     })();
 
     if result.is_err() {
-        let _ = send_feature(&device, &frame(CTRL_ABORT, session, 0, &[])?);
+        let _ = transport.send_feature(&frame(CTRL_ABORT, session, 0, &[])?);
     }
     result
 }
 
-#[cfg(windows)]
-fn send_feature(device: &hidapi::HidDevice, wire: &[u8; WIRE_REPORT_SIZE]) -> Result<()> {
-    device
-        .send_feature_report(wire)
-        .context("failed to write OTA Feature Report")?;
-    Ok(())
+fn is_expected_post_commit_disconnect(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("failed to read ota status hid feature report")
+        && (message.contains("disconnected")
+            || message.contains("not connected")
+            || message.contains("no such device")
+            || message.contains("device not found")
+            || message.contains("could not read from hid device")
+            || message.contains("hidapi"))
 }
 
 #[cfg(windows)]
-fn send_output(device: &hidapi::HidDevice, wire: &[u8; WIRE_REPORT_SIZE]) -> Result<()> {
-    let written = device
-        .write(wire)
-        .context("failed to write OTA DATA report")?;
-    if written != wire.len() {
-        bail!("short OTA DATA report write: {written}/{}", wire.len())
+struct HidOtaTransport {
+    device: hidapi::HidDevice,
+    started_at: Instant,
+}
+
+#[cfg(windows)]
+impl OtaTransport for HidOtaTransport {
+    fn send_feature(&mut self, wire: &[u8; WIRE_REPORT_SIZE]) -> Result<()> {
+        self.device
+            .send_feature_report(wire)
+            .context("failed to write OTA Feature Report")?;
+        Ok(())
     }
-    Ok(())
+
+    fn send_output(&mut self, wire: &[u8; WIRE_REPORT_SIZE]) -> Result<()> {
+        let written = self
+            .device
+            .write(wire)
+            .context("failed to write OTA DATA report")?;
+        if written != wire.len() {
+            bail!("short OTA DATA report write: {written}/{}", wire.len())
+        }
+        Ok(())
+    }
+
+    fn read_status(&mut self) -> Result<Status> {
+        let mut wire = [0_u8; WIRE_REPORT_SIZE];
+        wire[0] = CONTROL_REPORT_ID;
+        let length = self
+            .device
+            .get_feature_report(&mut wire)
+            .context("failed to read OTA status HID Feature Report")?;
+        decode_status(&wire[..length])
+    }
+
+    fn monotonic(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
-#[cfg(windows)]
-fn read_status(device: &hidapi::HidDevice) -> Result<Status> {
-    let mut wire = [0_u8; WIRE_REPORT_SIZE];
-    wire[0] = CONTROL_REPORT_ID;
-    let length = device
-        .get_feature_report(&mut wire)
-        .context("failed to read OTA status HID Feature Report")?;
-    decode_status(&wire[..length])
-}
-
-#[cfg(windows)]
 fn wait_status(
-    device: &hidapi::HidDevice,
+    transport: &mut impl OtaTransport,
     session: u32,
     timeout: Duration,
     predicate: impl Fn(Status) -> bool,
 ) -> Result<Status> {
-    let deadline = Instant::now() + timeout;
+    let deadline = transport.monotonic().saturating_add(timeout);
     loop {
-        let status = match read_status(device) {
+        let status = match transport.read_status() {
             Ok(status) => status,
-            Err(_) if Instant::now() < deadline => {
+            Err(_) if transport.monotonic() < deadline => {
                 // Windows can transiently reject a Feature Report while the
                 // firmware is erasing/writing flash. Keep polling inside the
                 // caller's bounded timeout instead of aborting a valid OTA.
-                std::thread::sleep(Duration::from_millis(20));
+                transport.sleep(Duration::from_millis(20));
                 continue;
             }
             Err(error) => {
@@ -670,7 +716,7 @@ fn wait_status(
         {
             return Ok(status);
         }
-        if Instant::now() >= deadline {
+        if transport.monotonic() >= deadline {
             bail!(
                 "timed out waiting for OTA state (state={}, accepted={}, committed={})",
                 status.state,
@@ -678,7 +724,7 @@ fn wait_status(
                 status.committed_offset
             )
         }
-        std::thread::sleep(Duration::from_millis(20));
+        transport.sleep(Duration::from_millis(20));
     }
 }
 
@@ -694,6 +740,114 @@ fn new_session_id() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    struct MockTransport {
+        statuses: VecDeque<std::result::Result<Status, String>>,
+        fallback_error: Option<String>,
+        feature_frames: Vec<[u8; WIRE_REPORT_SIZE]>,
+        output_frames: Vec<[u8; WIRE_REPORT_SIZE]>,
+        elapsed: Duration,
+        fail_output_at: Option<usize>,
+    }
+
+    impl MockTransport {
+        fn scripted(statuses: impl IntoIterator<Item = Status>) -> Self {
+            Self {
+                statuses: statuses.into_iter().map(Ok).collect(),
+                fallback_error: None,
+                feature_frames: Vec::new(),
+                output_frames: Vec::new(),
+                elapsed: Duration::ZERO,
+                fail_output_at: None,
+            }
+        }
+
+        fn abort_count(&self) -> usize {
+            self.feature_frames
+                .iter()
+                .filter(|wire| wire[4] == CTRL_ABORT)
+                .count()
+        }
+    }
+
+    impl OtaTransport for MockTransport {
+        fn send_feature(&mut self, wire: &[u8; WIRE_REPORT_SIZE]) -> Result<()> {
+            self.feature_frames.push(*wire);
+            Ok(())
+        }
+
+        fn send_output(&mut self, wire: &[u8; WIRE_REPORT_SIZE]) -> Result<()> {
+            if self.fail_output_at == Some(self.output_frames.len()) {
+                bail!("injected OTA DATA write failure")
+            }
+            self.output_frames.push(*wire);
+            Ok(())
+        }
+
+        fn read_status(&mut self) -> Result<Status> {
+            match self.statuses.pop_front() {
+                Some(Ok(status)) => Ok(status),
+                Some(Err(message)) => bail!(message),
+                None => bail!(
+                    "{}",
+                    self.fallback_error
+                        .as_deref()
+                        .unwrap_or("mock status script exhausted")
+                ),
+            }
+        }
+
+        fn monotonic(&self) -> Duration {
+            self.elapsed
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.elapsed = self.elapsed.saturating_add(duration);
+        }
+    }
+
+    fn status(session: u32, state: u8, accepted: u32, committed: u32) -> Status {
+        Status {
+            opcode: CTRL_ACK,
+            session,
+            accepted_offset: accepted,
+            state,
+            error: 0,
+            committed_offset: committed,
+            total_size: accepted.max(committed),
+            max_file_size: 2 * 1024 * 1024,
+            capabilities: CAP_SIGNATURE_REQUIRED | CAP_KEY_CONFIGURED,
+            board: 1,
+            speed: 1,
+            max_data: DATA_BYTES_MAX as u8,
+            window: 8,
+        }
+    }
+
+    fn ota_package(profile: BuildProfile) -> OtaPackage {
+        let (image, manifest) = package_fixture(profile);
+        validate_package(image, manifest, profile, false).unwrap()
+    }
+
+    fn success_script(package: &OtaPackage, session: u32) -> Vec<Status> {
+        let size = package.image.len() as u32;
+        let batch = (DATA_BYTES_MAX * 8) as u32;
+        let mut statuses = vec![
+            status(0, STATE_IDLE, 0, 0),
+            status(session, STATE_AUTHORIZING, 0, 0),
+            status(session, STATE_RECEIVING, 0, 0),
+        ];
+        let mut accepted = 0;
+        while accepted < size {
+            accepted = accepted.saturating_add(batch).min(size);
+            statuses.push(status(session, STATE_RECEIVING, accepted, 0));
+        }
+        let mut final_status = status(session, STATE_READY_REBOOT, size, size);
+        final_status.total_size = size;
+        statuses.push(final_status);
+        statuses
+    }
 
     fn package_fixture(profile: BuildProfile) -> (Vec<u8>, OtaManifest) {
         let body = b"signed-test-body";
@@ -778,6 +932,36 @@ mod tests {
     }
 
     #[test]
+    fn post_commit_disconnect_never_masks_a_protocol_rejection() {
+        let rejected = anyhow::anyhow!(
+            "device rejected OTA command: HASH (error=13), state=6, accepted=927360"
+        );
+        assert!(!is_expected_post_commit_disconnect(&rejected));
+
+        let generic_hid_error = anyhow::anyhow!("failed to read OTA status HID Feature Report");
+        assert!(!is_expected_post_commit_disconnect(&generic_hid_error));
+
+        let disconnected = anyhow::anyhow!(
+            "failed to read OTA status HID Feature Report: HIDAPI device not connected"
+        );
+        assert!(is_expected_post_commit_disconnect(&disconnected));
+    }
+
+    #[test]
+    fn status_crc_corruption_is_rejected() {
+        let mut wire = frame(CTRL_STATUS, 0, 0, &[]).unwrap();
+        // Convert the request into a structurally valid status first.
+        wire[4] = CTRL_ACK;
+        wire[13] = 44;
+        let crc = crc32fast::hash(&wire[1..60]);
+        wire[60..64].copy_from_slice(&crc.to_le_bytes());
+        assert!(decode_status(&wire).is_ok());
+
+        wire[20] ^= 0x80;
+        assert!(decode_status(&wire).is_err());
+    }
+
+    #[test]
     fn validates_profile_bound_raw_package() {
         let (image, manifest) = package_fixture(BuildProfile::Diagnostic);
         let package =
@@ -795,5 +979,91 @@ mod tests {
                 .to_string()
                 .contains("P-256 signature verification failed")
         );
+    }
+
+    #[test]
+    fn scripted_transport_completes_full_state_machine() {
+        let package = ota_package(BuildProfile::Standard);
+        let session = 0x1020_3040;
+        let mut transport = MockTransport::scripted(success_script(&package, session));
+        let mut progress = Vec::new();
+
+        run_update(&mut transport, &package, session, &mut |line| {
+            progress.push(line)
+        })
+        .unwrap();
+
+        assert_eq!(transport.abort_count(), 0);
+        assert!(!transport.output_frames.is_empty());
+        assert_eq!(transport.feature_frames[0][4], CTRL_BEGIN);
+        assert_eq!(transport.feature_frames[1][4], CTRL_AUTH);
+        assert_eq!(transport.feature_frames[2][4], CTRL_AUTH);
+        assert_eq!(transport.feature_frames.last().unwrap()[4], CTRL_COMMIT);
+        assert!(progress.iter().any(|line| line.contains("100%")));
+    }
+
+    #[test]
+    fn authorization_rejection_aborts_without_sending_image() {
+        let package = ota_package(BuildProfile::Diagnostic);
+        let session = 0x1122_3344;
+        let mut rejected = status(session, STATE_ERROR, 0, 0);
+        rejected.opcode = CTRL_ERROR;
+        rejected.error = 17;
+        let mut transport = MockTransport::scripted([
+            status(0, STATE_IDLE, 0, 0),
+            status(session, STATE_AUTHORIZING, 0, 0),
+            rejected,
+        ]);
+
+        let error = run_update(&mut transport, &package, session, &mut |_| {}).unwrap_err();
+        assert!(format!("{error:#}").contains("AUTH_FAILED"));
+        assert!(transport.output_frames.is_empty());
+        assert_eq!(transport.abort_count(), 1);
+    }
+
+    #[test]
+    fn data_transport_failure_aborts_session() {
+        let package = ota_package(BuildProfile::Standard);
+        let session = 0x5566_7788;
+        let mut transport = MockTransport::scripted([
+            status(0, STATE_IDLE, 0, 0),
+            status(session, STATE_AUTHORIZING, 0, 0),
+            status(session, STATE_RECEIVING, 0, 0),
+        ]);
+        transport.fail_output_at = Some(2);
+
+        let error = run_update(&mut transport, &package, session, &mut |_| {}).unwrap_err();
+        assert!(format!("{error:#}").contains("injected OTA DATA write failure"));
+        assert_eq!(transport.abort_count(), 1);
+    }
+
+    #[test]
+    fn inconsistent_final_offsets_are_rejected_and_aborted() {
+        let package = ota_package(BuildProfile::Standard);
+        let session = 0x99aa_bbcc;
+        let mut script = success_script(&package, session);
+        let final_status = script.last_mut().unwrap();
+        final_status.committed_offset = final_status.committed_offset.saturating_sub(1);
+        let mut transport = MockTransport::scripted(script);
+
+        let error = run_update(&mut transport, &package, session, &mut |_| {}).unwrap_err();
+        assert!(format!("{error:#}").contains("inconsistent final OTA offsets"));
+        assert_eq!(transport.abort_count(), 1);
+    }
+
+    #[test]
+    fn protocol_error_after_commit_is_never_accepted_as_reboot() {
+        let package = ota_package(BuildProfile::Standard);
+        let session = 0xddee_ff01;
+        let mut script = success_script(&package, session);
+        let final_status = script.last_mut().unwrap();
+        final_status.state = STATE_ERROR;
+        final_status.opcode = CTRL_ERROR;
+        final_status.error = 13;
+        let mut transport = MockTransport::scripted(script);
+
+        let error = run_update(&mut transport, &package, session, &mut |_| {}).unwrap_err();
+        assert!(format!("{error:#}").contains("HASH"));
+        assert_eq!(transport.abort_count(), 1);
     }
 }

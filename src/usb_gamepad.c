@@ -83,6 +83,9 @@ typedef struct {
 } set_report_entry_t;
 
 static QueueHandle_t set_report_queue = NULL;
+static StaticQueue_t set_report_queue_control;
+static uint8_t set_report_queue_storage[
+    SET_REPORT_QUEUE_DEPTH * sizeof(set_report_entry_t)];
 
 /* Pending feature GET request, deferred from ISR to task context.
  * 0 = no pending request. Written by ISR, consumed by process_deferred(). */
@@ -984,6 +987,8 @@ void usb_gamepad_process_deferred(void)
 #endif
     taskEXIT_CRITICAL();
 
+    (void)unknown_event;
+
     if (event_logs & USB_LOG_CONFIGURED)
         LOG_INF("[USB-EVT] CONFIGURED - host enumeration complete\n");
     if (event_logs & USB_LOG_RESET)
@@ -1132,8 +1137,13 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     init_serial_string();
 
     if (!set_report_queue)
-        set_report_queue = xQueueCreate(SET_REPORT_QUEUE_DEPTH,
-                                        sizeof(set_report_entry_t));
+        set_report_queue = xQueueCreateStatic(
+            SET_REPORT_QUEUE_DEPTH, sizeof(set_report_entry_t),
+            set_report_queue_storage, &set_report_queue_control);
+    if (!set_report_queue) {
+        LOG_ERR("[USB-INIT] static SET_REPORT queue creation failed\n");
+        return -1;
+    }
 
     LOG_INF("[USB-INIT] === USB Initialization Start ===\n");
     if (config_get()->enable_usb_sn)
@@ -1221,6 +1231,8 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     {
         volatile uint32_t *dev_ctl = (volatile uint32_t *)(USB_BASE + 0x100);
         volatile uint32_t *phy_tst = (volatile uint32_t *)(USB_BASE + 0x114);
+        (void)dev_ctl;
+        (void)phy_tst;
         LOG_INF("[USB-INIT] PRE-init: DEV_CTL=0x%08lx PHY_TST=0x%08lx\n",
                (unsigned long)*dev_ctl, (unsigned long)*phy_tst);
     }
@@ -1234,6 +1246,8 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     {
         volatile uint32_t *dev_ctl = (volatile uint32_t *)(USB_BASE + 0x100);
         volatile uint32_t *phy_tst = (volatile uint32_t *)(USB_BASE + 0x114);
+        (void)dev_ctl;
+        (void)phy_tst;
         LOG_INF("[USB-INIT] POST-init (raw): DEV_CTL=0x%08lx PHY_TST=0x%08lx\n",
                (unsigned long)*dev_ctl, (unsigned long)*phy_tst);
         LOG_INF("[USB-INIT]   GLINT_EN=%d CHIP_EN=%d FORCE_FS=%d UNPLUG=%d\n",
@@ -1255,6 +1269,11 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
         volatile uint32_t *usb_phy_tst  = (volatile uint32_t *)(USB_BASE + 0x114);
         volatile uint32_t *usb_glb_int  = (volatile uint32_t *)(USB_BASE + 0x0C4);
         volatile uint32_t *usb_otg_csr  = (volatile uint32_t *)(USB_BASE + 0x080);
+        (void)pds_usb_ctl;
+        (void)usb_dev_ctl;
+        (void)usb_phy_tst;
+        (void)usb_glb_int;
+        (void)usb_otg_csr;
 
         LOG_INF("[USB-INIT] POST-fixup final state:\n");
         LOG_INF("[USB-INIT]   PDS_USB_CTL=0x%08lx\n", (unsigned long)*pds_usb_ctl);

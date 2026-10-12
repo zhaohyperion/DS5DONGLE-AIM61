@@ -1,6 +1,6 @@
 # M61 签名 A/B OTA 规范（协议 v2）
 
-本规范只适用于 **Ai-M61-32S-Kit / BL618 / USB High-Speed** 的 v3.6.2 常用版和诊断版。刷写器 v1.4.2 已实现原生 OTA 客户端，可在“固件刷写”页执行 `standard ↔ diagnostic` 双向切换。公开配置网站和网页 OTA 已下线。
+本规范只适用于 **Ai-M61-32S-Kit / BL618 / USB High-Speed** 的 v3.6.3 常用版和诊断版。刷写器 v1.4.3 已实现原生 OTA 客户端，可在“固件刷写”页执行 `standard ↔ diagnostic` 双向切换。公开配置网站和网页 OTA 已下线。
 
 第一次部署、Boot2/分区表损坏或两槽均不可启动时，必须使用 CH340 UART 完整刷写。OTA 只更新应用 RAW 镜像，绝不能写入 Boot2、分区表、整片 Flash、PSM/KEY/DATA 或其他板卡的镜像。
 
@@ -12,13 +12,13 @@ A/B 槽位位于板载 SPI Flash，不在 PSRAM。备用 FW 槽允许的 RAW bod
 
 ## Release 资产
 
-v3.6.2 Release 只公开：
+v3.6.3 Release 只公开：
 
-- `DS5Dongle-aim61-hs-standard-uart-full-v3.6.2.zip`；
-- `DS5Dongle-aim61-hs-standard-ota-v3.6.2.zip`；
-- `DS5Dongle-aim61-hs-diagnostic-uart-full-v3.6.2.zip`；
-- `DS5Dongle-aim61-hs-diagnostic-ota-v3.6.2.zip`；
-- `DS5Dongle-Flasher-Windows-v1.4.2.exe`；
+- `DS5Dongle-aim61-hs-standard-uart-full-v3.6.3.zip`；
+- `DS5Dongle-aim61-hs-standard-ota-v3.6.3.zip`；
+- `DS5Dongle-aim61-hs-diagnostic-uart-full-v3.6.3.zip`；
+- `DS5Dongle-aim61-hs-diagnostic-ota-v3.6.3.zip`；
+- `DS5Dongle-Flasher-Windows-v1.4.3.exe`；
 - `SHA256SUMS.txt`。
 
 `uart-full` 与 `ota` 是用途互斥的纯包。UART 包只包含 Boot2、分区表、应用 `.bin`、`firmware.json` 和校验表；OTA 包只包含一个 `.bin.ota`、对应 `.ota.json` 和校验表。刷写器拒绝把 OTA 文件混入完整刷写包，也拒绝 OTA 包携带 Boot2、分区表或普通应用 `.bin`。裸 OTA 文件不单独公开。
@@ -34,7 +34,7 @@ Bouffalo SDK 输出：
 16..19  "RAW "
 20..23  body_size, uint32 LE
 32..47  hardware version
-48..63  "EVENT_V3.6.2\0"
+48..63  "EVENT_V3.6.3\0"
 64..95  SHA-256(body)
 512..   application body
 ```
@@ -50,12 +50,12 @@ Bouffalo SDK 输出：
   "board": "aim61",
   "usb_speed": "hs",
   "profile": "standard",
-  "version": "3.6.2",
+  "version": "3.6.3",
   "size": 906832,
   "sha256": "<完整 .bin.ota SHA-256>",
   "body_size": 906320,
   "body_sha256": "<正文 SHA-256>",
-  "url": "https://github.com/.../DS5Dongle-aim61-hs-standard-ota-v3.6.2.zip",
+  "url": "https://github.com/.../DS5Dongle-aim61-hs-standard-ota-v3.6.3.zip",
   "signature": {
     "algorithm": "ECDSA-P256-SHA256",
     "key_id": "local-m61-2026",
@@ -166,7 +166,7 @@ GET `0xFC` 返回 `len=44` 状态数据，frame argument 是 `accepted_offset`�
 6. 等待 READY_REBOOT 或计划内 USB 断开；重启后重新读取 `0xF8` 的 `版本|配置`。
 7. 任一步骤失败时尽力发送 ABORT；原活动槽不被替换。60 秒无活动自动 TIMEOUT。
 
-同版本只允许配置不同的显式切换；同版本同配置被拒绝，版本降级被拒绝。v3.6.2 回退 v3.5.x 必须走 UART 完整刷写。v3.6.2 由签名 HID OTA 状态机统一执行版本/配置策略，不再同时启用 SDK 的纯语义版本检查；后者会误拒绝合法的同版本 `standard ↔ diagnostic` 切换。
+同版本只允许配置不同的显式切换；同版本同配置被拒绝，版本降级被拒绝。v3.6.3 回退旧版本必须走 UART 完整刷写。v3.6.3 由签名 HID OTA 状态机统一执行版本/配置策略，不再同时启用 SDK 的纯语义版本检查；后者会误拒绝合法的同版本 `standard ↔ diagnostic` 切换。
 
 ## 固定协议向量
 
@@ -187,13 +187,13 @@ ERROR  = 4f5402ff78563412001000002c0611030100100000f02b0d0000821600fb03000001000
 ```powershell
 python tools\ota_release.py inspect --image build\build_out\ds5dongle_bl618_bl616.bin.ota
 python tools\ota_release.py generate --image <image.bin.ota> --manifest <profile.ota.json> `
-  --channel beta --version 3.6.2 --usb-speed hs --profile standard `
-  --url https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/download/v3.6.2/DS5Dongle-aim61-hs-standard-ota-v3.6.2.zip `
+  --channel beta --version 3.6.3 --usb-speed hs --profile standard `
+  --url https://github.com/zhaohyperion/DS5DONGLE-AIM61/releases/download/v3.6.3/DS5Dongle-aim61-hs-standard-ota-v3.6.3.zip `
   --private-key <private.pem> --key-id <key-id>
 python tools\ota_release.py verify --image <image.bin.ota> --manifest <profile.ota.json> `
   --public-key <public.pem> --expected-key-id <key-id>
 python tools\package_ota_zip.py --image <image.bin.ota> --manifest <profile.ota.json> `
-  --archive DS5Dongle-aim61-hs-standard-ota-v3.6.2.zip
+  --archive DS5Dongle-aim61-hs-standard-ota-v3.6.3.zip
 ```
 
-发布前应验证：正常升级、Standard/Diagnostic 双向切换、传输中掉电、签名/hash/目标错误拒绝、试运行失败回滚、配对、映射、宏与设置保留、UART 救援。v3.6.2 预发布按用户要求不等待真机测试，但不能把“CI 通过”描述成“真机已验证”。
+发布前应验证：正常升级、Standard/Diagnostic 双向切换、传输中掉电、签名/hash/目标错误拒绝、试运行失败回滚、配对、映射、宏与设置保留、UART 救援。v3.6.3 预发布按用户要求不等待真机测试，但不能把“CI 通过”描述成“真机已验证”。

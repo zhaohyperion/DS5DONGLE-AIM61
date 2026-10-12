@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    DUALSENSE_PRODUCT_IDS, FIRMWARE_VERSION_REPORT_ID, SONY_VENDOR_ID,
+    DUALSENSE_PRODUCT_IDS, FIRMWARE_VERSION_REPORT_ID, SONY_VENDOR_ID, controller_identity,
     decode_firmware_identity_report,
 };
 
@@ -16,6 +16,7 @@ const HEADER_SIZE: usize = 16;
 const DATA_SIZE: usize = 43;
 const REQUIRED_PAGES: usize = 6;
 const MAX_PAGES: usize = 16;
+const SCHEDULER_TASK_NAMES: [&str; 7] = ["bt", "usb", "audio", "mic", "led", "ota", "diagnostics"];
 #[cfg(windows)]
 const READ_ATTEMPTS: usize = 4;
 #[cfg(windows)]
@@ -35,17 +36,66 @@ pub struct DiagnosticSnapshot {
     pub health_flags: u8,
     pub heap_free_bytes: u32,
     pub heap_min_free_bytes: u32,
+    pub memory_status_flags: u8,
     pub bt_rssi_dbm: Option<i8>,
     pub battery_percent: Option<u8>,
     pub battery_state: u8,
     pub usb_in_completed: u32,
     pub bt_input_reports: u32,
     pub bt_output_completed: u32,
+    pub usb_input_updates: u32,
+    pub usb_input_coalesced: u32,
+    pub usb_transfers_started: u32,
+    pub usb_start_errors: u32,
+    pub bt_game_enqueued: u32,
+    pub bt_game_coalesced: u32,
+    pub bt_game_completed: u32,
+    pub bt_game_pending: bool,
+    pub bt_tx_in_flight: bool,
+    pub bt_audio_queue_depth: u8,
+    pub bt_control_queue_depth: u8,
     pub pcm_blocks_queued: u32,
     pub bt_audio_pairs_submitted: u32,
     pub mic_underruns: u32,
     pub mic_overruns: u32,
     pub loss_pressure: u32,
+    pub bt_audio_backpressure: u32,
+    pub bt_audio_dropped_stale: u32,
+    pub bt_control_backpressure: u32,
+    pub bt_alloc_failures: u32,
+    pub bt_send_failures: u32,
+    pub bt_stale_completions: u32,
+    pub bt_audio_queue_high_watermark: u8,
+    pub bt_control_queue_high_watermark: u8,
+    pub audio_frames_processed: u32,
+    pub audio_pairs_rejected: u32,
+    pub audio_discontinuities: u32,
+    pub audio_encode_errors: u32,
+    pub audio_pipeline_resets: u32,
+    pub audio_deadline_misses: u32,
+    pub audio_block_p99_us: u16,
+    pub audio_block_max_us: u16,
+    pub audio_resample_p99_us: u16,
+    pub audio_resample_max_us: u16,
+    pub audio_encode_p99_us: u16,
+    pub audio_encode_max_us: u16,
+    pub audio_timing_flags: u8,
+    pub pcm_blocks_dropped: u32,
+    pub pcm_pool_starvations: u32,
+    pub pcm_queue_overruns: u32,
+    pub pcm_stale_blocks: u32,
+    pub pcm_ready_high_watermark: u32,
+    pub mic_endpoint_write_errors: u32,
+    pub speaker_stream_active: bool,
+    pub microphone_stream_active: bool,
+    pub mic_frames_received: Option<u32>,
+    pub mic_frames_decoded: Option<u32>,
+    pub mic_queue_overruns: Option<u32>,
+    pub mic_decode_errors: Option<u32>,
+    pub mic_queue_high_watermark: Option<u32>,
+    pub mic_decode_p99_us: Option<u16>,
+    pub mic_decode_max_us: Option<u16>,
+    pub mic_decode_timing_flags: Option<u8>,
     pub ota_state: u8,
     pub ota_error: u8,
     pub bridge_latency_samples: Option<u32>,
@@ -58,7 +108,238 @@ pub struct DiagnosticSnapshot {
     pub bridge_total_p99_us: Option<u16>,
     pub bridge_total_max_us: Option<u16>,
     pub bridge_timing_flags: Option<u8>,
+    pub scheduler_tasks: Option<Vec<FirmwareTaskMetric>>,
+    pub bridge_input_queue_depth: Option<u8>,
+    pub bridge_output_queue_depth: Option<u8>,
+    pub bridge_input_queue_high_watermark: Option<u8>,
+    pub bridge_output_queue_high_watermark: Option<u8>,
     pub raw_pages: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FirmwareTaskMetric {
+    pub name: String,
+    pub stack_min_free_words: Option<u16>,
+    pub cpu_permille: Option<u16>,
+    pub priority: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeHealthStatus {
+    Healthy,
+    Warning,
+    Critical,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeHealthFinding {
+    pub code: &'static str,
+    pub severity: RuntimeHealthStatus,
+    pub component: String,
+    pub observed: u64,
+    pub threshold: u64,
+    pub unit: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeHealthAssessment {
+    pub status: RuntimeHealthStatus,
+    pub scheduler_data_available: bool,
+    pub cpu_sample_available: bool,
+    pub findings: Vec<RuntimeHealthFinding>,
+}
+
+pub fn assess_runtime_health(snapshot: &DiagnosticSnapshot) -> RuntimeHealthAssessment {
+    const STACK_WARNING_WORDS: u64 = 256;
+    const STACK_CRITICAL_WORDS: u64 = 128;
+    const CPU_WARNING_PERMILLE: u64 = 850;
+    const CPU_CRITICAL_PERMILLE: u64 = 950;
+    const HEAP_WARNING_BYTES: u64 = 32 * 1024;
+    const HEAP_CRITICAL_BYTES: u64 = 16 * 1024;
+    const BRIDGE_P99_WARNING_US: u64 = 5_000;
+    const BRIDGE_P99_CRITICAL_US: u64 = 10_000;
+    const BRIDGE_MIN_SAMPLES: u32 = 100;
+    const OUTPUT_QUEUE_CAPACITY: u64 = 5;
+
+    fn add_finding(
+        findings: &mut Vec<RuntimeHealthFinding>,
+        code: &'static str,
+        severity: RuntimeHealthStatus,
+        component: impl Into<String>,
+        observed: u64,
+        threshold: u64,
+        unit: &'static str,
+    ) {
+        findings.push(RuntimeHealthFinding {
+            code,
+            severity,
+            component: component.into(),
+            observed,
+            threshold,
+            unit,
+        });
+    }
+
+    let mut findings = Vec::new();
+    let scheduler_data_available = snapshot.scheduler_tasks.is_some();
+    let cpu_sample_available = snapshot
+        .scheduler_tasks
+        .as_ref()
+        .is_some_and(|tasks| tasks.iter().any(|task| task.cpu_permille.is_some()));
+
+    if let Some(tasks) = &snapshot.scheduler_tasks {
+        for task in tasks {
+            if let Some(words) = task.stack_min_free_words {
+                let words = u64::from(words);
+                if words < STACK_CRITICAL_WORDS {
+                    add_finding(
+                        &mut findings,
+                        "task_stack_critical",
+                        RuntimeHealthStatus::Critical,
+                        &task.name,
+                        words,
+                        STACK_CRITICAL_WORDS,
+                        "words",
+                    );
+                } else if words < STACK_WARNING_WORDS {
+                    add_finding(
+                        &mut findings,
+                        "task_stack_low",
+                        RuntimeHealthStatus::Warning,
+                        &task.name,
+                        words,
+                        STACK_WARNING_WORDS,
+                        "words",
+                    );
+                }
+            }
+            if let Some(permille) = task.cpu_permille {
+                let permille = u64::from(permille);
+                if permille >= CPU_CRITICAL_PERMILLE {
+                    add_finding(
+                        &mut findings,
+                        "task_cpu_critical",
+                        RuntimeHealthStatus::Critical,
+                        &task.name,
+                        permille,
+                        CPU_CRITICAL_PERMILLE,
+                        "permille",
+                    );
+                } else if permille >= CPU_WARNING_PERMILLE {
+                    add_finding(
+                        &mut findings,
+                        "task_cpu_high",
+                        RuntimeHealthStatus::Warning,
+                        &task.name,
+                        permille,
+                        CPU_WARNING_PERMILLE,
+                        "permille",
+                    );
+                }
+            }
+        }
+    }
+
+    if snapshot.memory_status_flags & 1 != 0 {
+        let minimum_heap = u64::from(snapshot.heap_min_free_bytes);
+        if minimum_heap < HEAP_CRITICAL_BYTES {
+            add_finding(
+                &mut findings,
+                "heap_headroom_critical",
+                RuntimeHealthStatus::Critical,
+                "heap",
+                minimum_heap,
+                HEAP_CRITICAL_BYTES,
+                "bytes",
+            );
+        } else if minimum_heap < HEAP_WARNING_BYTES {
+            add_finding(
+                &mut findings,
+                "heap_headroom_low",
+                RuntimeHealthStatus::Warning,
+                "heap",
+                minimum_heap,
+                HEAP_WARNING_BYTES,
+                "bytes",
+            );
+        }
+    }
+
+    if snapshot.bridge_output_queue_high_watermark == Some(OUTPUT_QUEUE_CAPACITY as u8) {
+        add_finding(
+            &mut findings,
+            "bridge_output_queue_saturated",
+            RuntimeHealthStatus::Warning,
+            "outputQueue",
+            OUTPUT_QUEUE_CAPACITY,
+            OUTPUT_QUEUE_CAPACITY,
+            "items",
+        );
+    }
+
+    if snapshot.bridge_latency_samples.unwrap_or(0) >= BRIDGE_MIN_SAMPLES
+        && let Some(p99_us) = snapshot.bridge_total_p99_us
+    {
+        let p99_us = u64::from(p99_us);
+        if p99_us >= BRIDGE_P99_CRITICAL_US {
+            add_finding(
+                &mut findings,
+                "bridge_p99_critical",
+                RuntimeHealthStatus::Critical,
+                "bridgeLatency",
+                p99_us,
+                BRIDGE_P99_CRITICAL_US,
+                "us",
+            );
+        } else if p99_us >= BRIDGE_P99_WARNING_US {
+            add_finding(
+                &mut findings,
+                "bridge_p99_high",
+                RuntimeHealthStatus::Warning,
+                "bridgeLatency",
+                p99_us,
+                BRIDGE_P99_WARNING_US,
+                "us",
+            );
+        }
+    }
+
+    if snapshot.bridge_timing_flags.unwrap_or(0) != 0 {
+        add_finding(
+            &mut findings,
+            "bridge_timing_saturated",
+            RuntimeHealthStatus::Critical,
+            "bridgeLatency",
+            u64::from(snapshot.bridge_timing_flags.unwrap_or(0)),
+            0,
+            "flags",
+        );
+    }
+
+    let status = if findings
+        .iter()
+        .any(|finding| finding.severity == RuntimeHealthStatus::Critical)
+    {
+        RuntimeHealthStatus::Critical
+    } else if !findings.is_empty() {
+        RuntimeHealthStatus::Warning
+    } else if scheduler_data_available {
+        RuntimeHealthStatus::Healthy
+    } else {
+        RuntimeHealthStatus::Unavailable
+    };
+
+    RuntimeHealthAssessment {
+        status,
+        scheduler_data_available,
+        cpu_sample_available,
+        findings,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -69,6 +350,7 @@ pub struct DeviceDiagnostic {
     pub product_id: u16,
     pub firmware_version: Option<String>,
     pub build_profile: Option<String>,
+    pub controller_firmware: Option<controller_identity::ControllerFirmwareInfo>,
     pub snapshot: Option<DiagnosticSnapshot>,
     pub error: Option<String>,
 }
@@ -105,11 +387,14 @@ pub fn probe_runtime_diagnostics() -> Result<Vec<DeviceDiagnostic>> {
             product_id: info.product_id(),
             firmware_version: None,
             build_profile: None,
+            controller_firmware: None,
             snapshot: None,
             error: None,
         };
         match info.open_device(&api) {
             Ok(device) => {
+                report.controller_firmware =
+                    controller_identity::read_controller_firmware_info(&device, info.product_id());
                 if let Some((version, profile)) = read_firmware_identity(&device) {
                     report.firmware_version = Some(version);
                     report.build_profile = Some(profile.clone());
@@ -349,6 +634,56 @@ pub fn validate_runtime_snapshot(snapshot: &DiagnosticSnapshot) -> Result<()> {
     Ok(())
 }
 
+pub fn microphone_error_delta(before: &DiagnosticSnapshot, after: &DiagnosticSnapshot) -> u32 {
+    let mut delta = after
+        .mic_underruns
+        .wrapping_sub(before.mic_underruns)
+        .wrapping_add(after.mic_overruns.wrapping_sub(before.mic_overruns))
+        .wrapping_add(
+            after
+                .mic_endpoint_write_errors
+                .wrapping_sub(before.mic_endpoint_write_errors),
+        );
+    if let (Some(before), Some(after)) = (before.mic_queue_overruns, after.mic_queue_overruns) {
+        delta = delta.wrapping_add(after.wrapping_sub(before));
+    }
+    if let (Some(before), Some(after)) = (before.mic_decode_errors, after.mic_decode_errors) {
+        delta = delta.wrapping_add(after.wrapping_sub(before));
+    }
+    delta
+}
+
+pub fn audio_error_delta(before: &DiagnosticSnapshot, after: &DiagnosticSnapshot) -> u32 {
+    after
+        .audio_pairs_rejected
+        .wrapping_sub(before.audio_pairs_rejected)
+        .wrapping_add(
+            after
+                .audio_encode_errors
+                .wrapping_sub(before.audio_encode_errors),
+        )
+        .wrapping_add(
+            after
+                .audio_deadline_misses
+                .wrapping_sub(before.audio_deadline_misses),
+        )
+        .wrapping_add(
+            after
+                .pcm_blocks_dropped
+                .wrapping_sub(before.pcm_blocks_dropped),
+        )
+        .wrapping_add(
+            after
+                .pcm_pool_starvations
+                .wrapping_sub(before.pcm_pool_starvations),
+        )
+        .wrapping_add(
+            after
+                .pcm_queue_overruns
+                .wrapping_sub(before.pcm_queue_overruns),
+        )
+}
+
 fn selector_report(report_id: u8, protocol_version: u8, page_index: u8) -> [u8; WIRE_REPORT_SIZE] {
     let mut report = [0_u8; WIRE_REPORT_SIZE];
     report[0] = report_id;
@@ -465,10 +800,35 @@ fn decode_snapshot(pages: &[DiagnosticPage]) -> Result<DiagnosticSnapshot> {
     let p0 = page_data(pages, 0);
     let p1 = page_data(pages, 1);
     let p2 = page_data(pages, 2);
+    let p3 = page_data(pages, 3);
     let p4 = page_data(pages, 4);
     let p5 = page_data(pages, 5);
     let p6 = page_data(pages, 6);
+    let p7 = page_data(pages, 7);
+    let p8 = page_data(pages, 8);
     let bridge_supported = p6.len() >= 24 && read_u8(p6, 23, 0) == 1;
+    let mic_pipeline_supported = p7.len() >= 26 && read_u8(p7, 24, 0) == 1;
+    let scheduler_supported = p8.len() >= 43
+        && read_u8(p8, 0, 0) == 1
+        && read_u8(p8, 2, 0) as usize == SCHEDULER_TASK_NAMES.len();
+    let scheduler_cpu_valid = scheduler_supported && read_u8(p8, 1, 0) & 1 != 0;
+    let scheduler_tasks = scheduler_supported.then(|| {
+        SCHEDULER_TASK_NAMES
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let stack = read_u16(p8, 4 + index * 2);
+                let cpu = read_u16(p8, 18 + index * 2);
+                let priority = read_u8(p8, 32 + index, u8::MAX);
+                FirmwareTaskMetric {
+                    name: (*name).to_owned(),
+                    stack_min_free_words: (stack != u16::MAX).then_some(stack),
+                    cpu_permille: (scheduler_cpu_valid && cpu != u16::MAX).then_some(cpu),
+                    priority: (priority != u8::MAX).then_some(priority),
+                }
+            })
+            .collect()
+    });
     let rssi = read_i8(p0, 6);
     let battery = read_u8(p0, 7, 0xff);
     Ok(DiagnosticSnapshot {
@@ -483,17 +843,66 @@ fn decode_snapshot(pages: &[DiagnosticPage]) -> Result<DiagnosticSnapshot> {
         health_flags: read_u8(p0, 5, 0),
         heap_free_bytes: read_u32(p5, 0),
         heap_min_free_bytes: read_u32(p5, 4),
+        memory_status_flags: read_u8(p5, 42, 0),
         bt_rssi_dbm: (rssi != 127).then_some(rssi),
         battery_percent: (battery <= 100).then_some(battery),
         battery_state: read_u8(p0, 8, 0xff),
         usb_in_completed: read_u32(p1, 0),
         bt_input_reports: read_u32(p1, 4),
         bt_output_completed: read_u32(p1, 8),
+        usb_input_updates: read_u32(p1, 12),
+        usb_input_coalesced: read_u32(p1, 16),
+        usb_transfers_started: read_u32(p1, 20),
+        usb_start_errors: read_u32(p1, 24),
+        bt_game_enqueued: read_u32(p1, 28),
+        bt_game_coalesced: read_u32(p1, 32),
+        bt_game_completed: read_u32(p1, 36),
+        bt_game_pending: read_u8(p1, 40, 0) & 1 != 0,
+        bt_tx_in_flight: read_u8(p1, 40, 0) & 2 != 0,
+        bt_audio_queue_depth: read_u8(p1, 41, 0),
+        bt_control_queue_depth: read_u8(p1, 42, 0),
         pcm_blocks_queued: read_u32(p4, 0),
         bt_audio_pairs_submitted: read_u32(p4, 4),
         mic_underruns: read_u32(p4, 8),
         mic_overruns: read_u32(p4, 12),
         loss_pressure: read_u32(p2, 0),
+        bt_audio_backpressure: read_u32(p2, 8),
+        bt_audio_dropped_stale: read_u32(p2, 12),
+        bt_control_backpressure: read_u32(p2, 16),
+        bt_alloc_failures: read_u32(p2, 20),
+        bt_send_failures: read_u32(p2, 24),
+        bt_stale_completions: read_u32(p2, 28),
+        bt_audio_queue_high_watermark: read_u8(p2, 40, 0),
+        bt_control_queue_high_watermark: read_u8(p2, 41, 0),
+        audio_frames_processed: read_u32(p3, 0),
+        audio_pairs_rejected: read_u32(p3, 8),
+        audio_discontinuities: read_u32(p3, 12),
+        audio_encode_errors: read_u32(p3, 16),
+        audio_pipeline_resets: read_u32(p3, 20),
+        audio_deadline_misses: read_u32(p3, 24),
+        audio_block_p99_us: read_u16(p3, 28),
+        audio_block_max_us: read_u16(p3, 30),
+        audio_resample_p99_us: read_u16(p3, 32),
+        audio_resample_max_us: read_u16(p3, 34),
+        audio_encode_p99_us: read_u16(p3, 36),
+        audio_encode_max_us: read_u16(p3, 38),
+        audio_timing_flags: read_u8(p3, 40, 0),
+        pcm_blocks_dropped: read_u32(p4, 16),
+        pcm_pool_starvations: read_u32(p4, 20),
+        pcm_queue_overruns: read_u32(p4, 24),
+        pcm_stale_blocks: read_u32(p4, 28),
+        pcm_ready_high_watermark: read_u32(p4, 32),
+        mic_endpoint_write_errors: read_u32(p4, 36),
+        speaker_stream_active: read_u8(p4, 40, 0) & 1 != 0,
+        microphone_stream_active: read_u8(p4, 40, 0) & 2 != 0,
+        mic_frames_received: mic_pipeline_supported.then(|| read_u32(p7, 0)),
+        mic_frames_decoded: mic_pipeline_supported.then(|| read_u32(p7, 4)),
+        mic_queue_overruns: mic_pipeline_supported.then(|| read_u32(p7, 8)),
+        mic_decode_errors: mic_pipeline_supported.then(|| read_u32(p7, 12)),
+        mic_queue_high_watermark: mic_pipeline_supported.then(|| read_u32(p7, 16)),
+        mic_decode_p99_us: mic_pipeline_supported.then(|| read_u16(p7, 20)),
+        mic_decode_max_us: mic_pipeline_supported.then(|| read_u16(p7, 22)),
+        mic_decode_timing_flags: mic_pipeline_supported.then(|| read_u8(p7, 25, 0)),
         ota_state: read_u8(p5, 8, 0xff),
         ota_error: read_u8(p5, 9, 0xff),
         bridge_latency_samples: bridge_supported.then(|| read_u32(p6, 0)),
@@ -506,6 +915,11 @@ fn decode_snapshot(pages: &[DiagnosticPage]) -> Result<DiagnosticSnapshot> {
         bridge_total_p99_us: bridge_supported.then(|| read_u16(p6, 16)),
         bridge_total_max_us: bridge_supported.then(|| read_u16(p6, 18)),
         bridge_timing_flags: bridge_supported.then(|| read_u8(p6, 22, 0)),
+        scheduler_tasks,
+        bridge_input_queue_depth: scheduler_supported.then(|| read_u8(p8, 39, 0)),
+        bridge_output_queue_depth: scheduler_supported.then(|| read_u8(p8, 40, 0)),
+        bridge_input_queue_high_watermark: scheduler_supported.then(|| read_u8(p8, 41, 0)),
+        bridge_output_queue_high_watermark: scheduler_supported.then(|| read_u8(p8, 42, 0)),
         raw_pages: pages.iter().map(|page| hex::encode(&page.data)).collect(),
     })
 }
@@ -668,11 +1082,50 @@ mod tests {
         data[1][0..4].copy_from_slice(&1001_u32.to_le_bytes());
         data[1][4..8].copy_from_slice(&2002_u32.to_le_bytes());
         data[1][8..12].copy_from_slice(&3003_u32.to_le_bytes());
+        data[1][12..16].copy_from_slice(&3100_u32.to_le_bytes());
+        data[1][16..20].copy_from_slice(&11_u32.to_le_bytes());
+        data[1][20..24].copy_from_slice(&3200_u32.to_le_bytes());
+        data[1][24..28].copy_from_slice(&2_u32.to_le_bytes());
+        data[1][28..32].copy_from_slice(&3300_u32.to_le_bytes());
+        data[1][32..36].copy_from_slice(&12_u32.to_le_bytes());
+        data[1][36..40].copy_from_slice(&3288_u32.to_le_bytes());
+        data[1][40..43].copy_from_slice(&[3, 2, 1]);
         data[2][0..4].copy_from_slice(&7_u32.to_le_bytes());
+        data[2][8..12].copy_from_slice(&1_u32.to_le_bytes());
+        data[2][12..16].copy_from_slice(&2_u32.to_le_bytes());
+        data[2][16..20].copy_from_slice(&3_u32.to_le_bytes());
+        data[2][20..24].copy_from_slice(&4_u32.to_le_bytes());
+        data[2][24..28].copy_from_slice(&5_u32.to_le_bytes());
+        data[2][28..32].copy_from_slice(&6_u32.to_le_bytes());
+        data[2][40..42].copy_from_slice(&[3, 2]);
+        data[3][0..4].copy_from_slice(&41_u32.to_le_bytes());
+        data[3][8..12].copy_from_slice(&1_u32.to_le_bytes());
+        data[3][12..16].copy_from_slice(&2_u32.to_le_bytes());
+        data[3][16..20].copy_from_slice(&3_u32.to_le_bytes());
+        data[3][20..24].copy_from_slice(&4_u32.to_le_bytes());
+        data[3][24..28].copy_from_slice(&5_u32.to_le_bytes());
+        for (offset, value) in [
+            (28, 100_u16),
+            (30, 200_u16),
+            (32, 300_u16),
+            (34, 400_u16),
+            (36, 500_u16),
+            (38, 600_u16),
+        ] {
+            data[3][offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        data[3][40] = 4;
         data[4][0..4].copy_from_slice(&4004_u32.to_le_bytes());
         data[4][4..8].copy_from_slice(&5005_u32.to_le_bytes());
         data[4][8..12].copy_from_slice(&6_u32.to_le_bytes());
         data[4][12..16].copy_from_slice(&8_u32.to_le_bytes());
+        data[4][16..20].copy_from_slice(&9_u32.to_le_bytes());
+        data[4][20..24].copy_from_slice(&10_u32.to_le_bytes());
+        data[4][24..28].copy_from_slice(&11_u32.to_le_bytes());
+        data[4][28..32].copy_from_slice(&12_u32.to_le_bytes());
+        data[4][32..36].copy_from_slice(&3_u32.to_le_bytes());
+        data[4][36..40].copy_from_slice(&13_u32.to_le_bytes());
+        data[4][40] = 3;
         data[5][0..4].copy_from_slice(&(64_u32 * 1024).to_le_bytes());
         data[5][4..8].copy_from_slice(&(48_u32 * 1024).to_le_bytes());
         data[5][8..10].copy_from_slice(&[2, 0]);
@@ -687,8 +1140,23 @@ mod tests {
         assert_eq!(snapshot.bt_rssi_dbm, Some(-42));
         assert_eq!(snapshot.battery_percent, Some(87));
         assert_eq!(snapshot.usb_in_completed, 1001);
+        assert_eq!(snapshot.usb_input_updates, 3100);
+        assert_eq!(snapshot.usb_input_coalesced, 11);
+        assert_eq!(snapshot.usb_start_errors, 2);
+        assert!(snapshot.bt_game_pending);
+        assert!(snapshot.bt_tx_in_flight);
+        assert_eq!(snapshot.bt_audio_queue_depth, 2);
         assert_eq!(snapshot.loss_pressure, 7);
+        assert_eq!(snapshot.bt_audio_backpressure, 1);
+        assert_eq!(snapshot.bt_send_failures, 5);
+        assert_eq!(snapshot.audio_frames_processed, 41);
+        assert_eq!(snapshot.audio_encode_errors, 3);
+        assert_eq!(snapshot.audio_encode_max_us, 600);
         assert_eq!(snapshot.mic_underruns, 6);
+        assert_eq!(snapshot.pcm_blocks_dropped, 9);
+        assert_eq!(snapshot.mic_endpoint_write_errors, 13);
+        assert!(snapshot.speaker_stream_active);
+        assert!(snapshot.microphone_stream_active);
         assert_eq!(snapshot.heap_free_bytes, 64 * 1024);
         assert_eq!(snapshot.ota_state, 2);
         assert_eq!(snapshot.raw_pages.len(), 6);
@@ -752,5 +1220,97 @@ mod tests {
         assert_eq!(snapshot.bridge_total_max_us, Some(2100));
         assert_eq!(snapshot.bridge_timing_flags, Some(0));
         assert_eq!(snapshot.raw_pages.len(), 7);
+        assert_eq!(snapshot.mic_frames_received, None);
+    }
+
+    #[test]
+    fn decodes_optional_microphone_pipeline_page() {
+        let mut data = vec![vec![0_u8; DATA_SIZE]; 8];
+        for (offset, value) in [
+            (0, 10_001_u32),
+            (4, 9_998_u32),
+            (8, 2_u32),
+            (12, 1_u32),
+            (16, 4_u32),
+        ] {
+            data[7][offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        data[7][20..22].copy_from_slice(&750_u16.to_le_bytes());
+        data[7][22..24].copy_from_slice(&1250_u16.to_le_bytes());
+        data[7][24] = 1;
+        data[7][25] = 0;
+        let pages = data
+            .iter()
+            .enumerate()
+            .map(|(index, data)| {
+                decode_page(&make_page(index as u8, 8, 11, 101_000, data)).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let snapshot = decode_snapshot(&pages).unwrap();
+        assert_eq!(snapshot.mic_frames_received, Some(10_001));
+        assert_eq!(snapshot.mic_frames_decoded, Some(9_998));
+        assert_eq!(snapshot.mic_queue_overruns, Some(2));
+        assert_eq!(snapshot.mic_decode_errors, Some(1));
+        assert_eq!(snapshot.mic_queue_high_watermark, Some(4));
+        assert_eq!(snapshot.mic_decode_p99_us, Some(750));
+        assert_eq!(snapshot.mic_decode_max_us, Some(1250));
+        assert_eq!(snapshot.raw_pages.len(), 8);
+    }
+
+    #[test]
+    fn decodes_optional_scheduler_page() {
+        let mut data = vec![vec![0_u8; DATA_SIZE]; 9];
+        data[8][0] = 1;
+        data[8][1] = 1;
+        data[8][2] = 7;
+        for index in 0..7 {
+            let stack = 100_u16 + index as u16;
+            let cpu = 10_u16 + index as u16;
+            data[8][4 + index * 2..6 + index * 2].copy_from_slice(&stack.to_le_bytes());
+            data[8][18 + index * 2..20 + index * 2].copy_from_slice(&cpu.to_le_bytes());
+            data[8][32 + index] = 6 - index as u8;
+        }
+        data[8][39] = 1;
+        data[8][40] = 2;
+        data[8][41] = 1;
+        data[8][42] = 5;
+        let pages = data
+            .iter()
+            .enumerate()
+            .map(|(index, data)| {
+                decode_page(&make_page(index as u8, 9, 12, 102_000, data)).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let snapshot = decode_snapshot(&pages).unwrap();
+        let tasks = snapshot.scheduler_tasks.as_ref().unwrap();
+        assert_eq!(tasks.len(), 7);
+        assert_eq!(tasks[0].name, "bt");
+        assert_eq!(tasks[0].stack_min_free_words, Some(100));
+        assert_eq!(tasks[0].cpu_permille, Some(10));
+        assert_eq!(tasks[0].priority, Some(6));
+        assert_eq!(snapshot.bridge_input_queue_depth, Some(1));
+        assert_eq!(snapshot.bridge_output_queue_depth, Some(2));
+        assert_eq!(snapshot.bridge_input_queue_high_watermark, Some(1));
+        assert_eq!(snapshot.bridge_output_queue_high_watermark, Some(5));
+        assert_eq!(snapshot.raw_pages.len(), 9);
+
+        let assessment = assess_runtime_health(&snapshot);
+        assert_eq!(assessment.status, RuntimeHealthStatus::Critical);
+        assert!(assessment.scheduler_data_available);
+        assert!(assessment.cpu_sample_available);
+        assert!(
+            assessment
+                .findings
+                .iter()
+                .any(|finding| finding.code == "task_stack_critical")
+        );
+        assert!(
+            assessment
+                .findings
+                .iter()
+                .any(|finding| finding.code == "bridge_output_queue_saturated")
+        );
     }
 }

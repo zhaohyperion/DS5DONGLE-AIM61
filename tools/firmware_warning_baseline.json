@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "warnings": [
+    {
+      "id": "gnu-make-submake-jobserver",
+      "pattern": "^make\\[1\\]: warning: -jN forced in submake: disabling jobserver mode\\.$",
+      "maxCount": 1,
+      "owner": "Bouffalo SDK build system"
+    },
+    {
+      "id": "gcc-ar-lto-plugin-advisory",
+      "pattern": "^riscv64-unknown-elf-ar(?:\\.exe)?: .*: plugin needed to handle lto object$",
+      "maxCount": 24,
+      "owner": "T-Head GCC 10.2 LTO toolchain"
+    },
+    {
+      "id": "bouffalo-sdk-lto-type-mismatch",
+      "pattern": "^.*drivers[\\\\/]sys[\\\\/]bl616[\\\\/]bl616_lp_internal\\.h:[0-9]+:[0-9]+: warning: type of 'AON_Set_LDO11_SOC_Sstart_Delay' does not match original declaration \\[-Wlto-type-mismatch\\]$",
+      "maxCount": 1,
+      "owner": "Pinned Bouffalo SDK declaration mismatch"
+    },
+    {
+      "id": "bouffalo-packager-32bit-cryptography",
+      "pattern": "^PyInstaller.*: UserWarning: You are using cryptography on a 32-bit Python on a 64-bit Windows Operating System\\..*$",
+      "maxCount": 1,
+      "owner": "Bouffalo SDK packaged post-processing tool"
+    }
+  ]
+}

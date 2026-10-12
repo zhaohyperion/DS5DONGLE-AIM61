@@ -15,7 +15,7 @@
 #define RUNTIME_DIAG_HEADER_SIZE        16u
 #define RUNTIME_DIAG_DATA_OFFSET        16u
 #define RUNTIME_DIAG_DATA_MAX           43u
-#define RUNTIME_DIAG_PAGE_COUNT         7u
+#define RUNTIME_DIAG_PAGE_COUNT         9u
 #define RUNTIME_DIAG_SELECT_PAGE        0x01u
 #define RUNTIME_DIAG_SET_SESSION        0x02u
 #define RUNTIME_DIAG_SELECT_SIZE        3u
@@ -32,15 +32,38 @@ enum runtime_diag_page {
     RUNTIME_DIAG_PAGE_AUDIO_PIPELINE = 4,
     RUNTIME_DIAG_PAGE_OTA_MEMORY = 5,
     RUNTIME_DIAG_PAGE_BRIDGE_LATENCY = 6,
+    RUNTIME_DIAG_PAGE_MIC_PIPELINE = 7,
+    RUNTIME_DIAG_PAGE_SCHEDULER = 8,
+};
+
+enum runtime_diag_task_slot {
+    RUNTIME_DIAG_TASK_BT = 0,
+    RUNTIME_DIAG_TASK_USB = 1,
+    RUNTIME_DIAG_TASK_AUDIO = 2,
+    RUNTIME_DIAG_TASK_MIC = 3,
+    RUNTIME_DIAG_TASK_LED = 4,
+    RUNTIME_DIAG_TASK_OTA = 5,
+    RUNTIME_DIAG_TASK_DIAGNOSTICS = 6,
+    RUNTIME_DIAG_TASK_COUNT = 7,
 };
 
 #if DS5_DIAGNOSTIC_BUILD
 /* Prepare valid page-zero-selected reports before USB enumeration starts. */
 void runtime_diag_init(void);
 
-/* Called by the dedicated low-priority diagnostic task.  A complete six-page
+/* Called by the dedicated low-priority diagnostic task.  A complete paged
  * snapshot is generated at most once per interval, then atomically published. */
 void runtime_diag_task_update(uint64_t monotonic_us);
+
+/* Register application-owned tasks once before the scheduler starts.  Handles
+ * remain opaque here so including this protocol header does not pull FreeRTOS
+ * types into USB descriptor compilation units. */
+void runtime_diag_set_task_handle(enum runtime_diag_task_slot slot,
+                                  void *task_handle);
+void runtime_diag_set_bridge_queue_stats(uint8_t input_depth,
+                                         uint8_t output_depth,
+                                         uint8_t input_high_water,
+                                         uint8_t output_high_water);
 
 /* EP0-safe operations: bounded validation plus one byte store for SET, and a
  * fixed 63-byte copy from the published bank for GET. */

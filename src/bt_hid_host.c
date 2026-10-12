@@ -709,7 +709,7 @@ static const bt_addr_t *conn_get_br_addr(const struct bt_conn *conn)
     return NULL;
 }
 
-static const char *state_name(enum bt_hid_host_state s) {
+static __attribute__((unused)) const char *state_name(enum bt_hid_host_state s) {
     switch (s) {
     case BT_HID_STATE_IDLE:          return "IDLE";
     case BT_HID_STATE_SCANNING:      return "SCANNING";
@@ -943,6 +943,7 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
             net_buf_add_le16(buf, 0x1F40);
             int err = bt_hci_cmd_send_sync(
                 BT_OP(BT_OGF_BASEBAND, 0x0037), buf, NULL);
+            (void)err;
             LOG_INF("[BT] Write Link Supervision Timeout: handle=0x%04x "
                    "timeout=5s err=%d\n", handle, err);
         }
@@ -1305,6 +1306,7 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
     const char *r_str = reason == 0x08 ? "CONN_TIMEOUT" :
                         reason == 0x13 ? "REMOTE_USER" :
                         reason == 0x16 ? "LOCAL_HOST" : "OTHER";
+    (void)r_str;
     LOG_INF("[BT] Disconnected reason=0x%02x (%s)\n", reason, r_str);
 
     struct bt_conn *owned_conn = app_tx_abort_detach_conn(conn);
@@ -1673,6 +1675,8 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
             bd.val[5] = chipid[5] | 0xC0;
             int r1 = bt_set_bd_addr(&bd);
             int r2 = bt_set_local_public_address(bd.val);
+            (void)r1;
+            (void)r2;
             LOG_INF("[BT] Set BD_ADDR from chipid: %02X:%02X:%02X:%02X:%02X:%02X "
                    "(hci=%d host=%d)\n",
                    bd.val[5], bd.val[4], bd.val[3],
@@ -1716,6 +1720,7 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
             net_buf_add_le16(ps_buf, 0x0012);  /* window:   11.25ms */
             int ps_err = bt_hci_cmd_send_sync(
                 BT_OP(BT_OGF_BASEBAND, 0x001c), ps_buf, NULL);
+            (void)ps_err;
             LOG_INF("[BT] Write Page Scan Activity: interval=0x0012 "
                    "window=0x0012 err=%d\n", ps_err);
         }

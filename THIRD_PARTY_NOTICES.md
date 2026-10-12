@@ -67,6 +67,12 @@ extension.
 
 ## DualSense tester and calibration references
 
+- `ricardoquesada/bluepad32`, commit
+  `80d6314e46f871719fbb4b721a2cc02227c4f369` — Feature Report `0x05`
+  factory IMU calibration layout and defensive per-axis divisor handling.
+  Only the DualSense interoperability logic is adapted; the BlueKitchen
+  BTstack dependency is not included. Apache License 2.0; copyright 2019
+  Ricardo Quesada and contributors.
 - `daidr/dualsense-tester`, commit
   `d85bbaf2cf6ade22aae3983f22c99a176e50c827` — DualSense input, touch,
   motion, output and audio-test interaction reference. The native test-center
@@ -78,10 +84,33 @@ extension.
   `af58465fac3447eafa7949b65f0ae650df74a554` — 48-direction stick sampling,
   RMS circularity-error definition and DS5 `0x82`/`0x83` center/range
   calibration protocol reference. MIT License; copyright (c) 2024 the_al.
+- `DualSenseClient/DualSenseClient`, commit
+  `fff354fb7d37cb6e4f5ecb7ba4e72ba5b72094a0` — independent GPL-3.0
+  interoperability vectors for USB input offsets, touch/IMU decoding, Feature
+  Report `0x20`, the 47-byte USB SetState payload and all four adaptive-trigger
+  blocks. The vectors are retained as native Rust regression tests; no .NET
+  runtime or application code is bundled. Copyright its contributors.
+- `GeorgLegato/LinuxAudio4Dualsense5`, commit
+  `54c543ad78e17dd957d71051a5950327c09bb499` — independent AGPL-3.0
+  corroboration of the DualSense Bluetooth audio clock relationship: one
+  480-sample Opus frame is derived from each 512-sample/48-kHz producer block,
+  so transport pacing follows 10.667 ms rather than an independent 10 ms
+  timer. This project retains its existing `0x39` double-frame transport and
+  uses the external result only as a timing/protocol regression oracle.
 
 The Windows application is a native Rust implementation and does not embed or
 load either web application. The local SVG asset, model coordinates, protocol
 facts, algorithms and interaction patterns were adapted under their MIT terms.
+
+- `KaiwetN/windows-vds`, release 0.5.0 / commit `67f5ec2` — the native
+  flasher's privacy-preserving Feature Report `0x20` firmware/hardware parser,
+  board-model mapping, and expanded audio queue/underflow diagnostic taxonomy
+  were cross-checked against its `vds_device_info` and `vdsd` implementations.
+  The USB/IP bridge, HidHide integration, WPF GUI, kernel module, and DSX UDP
+  service are not incorporated. MIT License; copyright (c) 2026 Jihong Min
+  and windows-vds contributors. The repository records its own base as
+  `hurryman2212/vds` tag `0.4.0-rc1`, commit `ec53159`.
+
 The required MIT copyright and permission notices are retained below:
 
 > Permission is hereby granted, free of charge, to any person obtaining a copy

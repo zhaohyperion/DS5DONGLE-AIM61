@@ -11,6 +11,9 @@
 
 #include "usbd_core.h"
 
+#include "FreeRTOS.h"
+#include "task.h"
+
 #include <limits.h>
 #include <string.h>
 
@@ -31,6 +34,18 @@ static volatile uint32_t diag_select_errors;
 static uint32_t diag_sequence;
 static uint64_t diag_last_publish_us;
 static uint32_t diag_min_free_bytes;
+static TaskHandle_t diag_task_handles[RUNTIME_DIAG_TASK_COUNT];
+static uint32_t diag_task_runtime_previous[RUNTIME_DIAG_TASK_COUNT];
+static uint16_t diag_task_stack_free[RUNTIME_DIAG_TASK_COUNT];
+static uint16_t diag_task_cpu_permille[RUNTIME_DIAG_TASK_COUNT];
+static uint8_t diag_task_priorities[RUNTIME_DIAG_TASK_COUNT];
+static uint32_t diag_runtime_previous_total;
+static bool diag_cpu_sample_ready;
+static bool diag_cpu_sample_valid;
+static uint8_t diag_input_queue_depth;
+static uint8_t diag_output_queue_depth;
+static uint8_t diag_input_queue_high_water;
+static uint8_t diag_output_queue_high_water;
 
 extern uint8_t get_battery_level(void);
 extern uint8_t get_battery_state(void);
@@ -70,6 +85,7 @@ enum diag_capabilities {
     DIAG_CAP_READ_ONLY   = 1u << 4,
     DIAG_CAP_SELECT_PAGE = 1u << 5,
     DIAG_CAP_BRIDGE_LATENCY = 1u << 6,
+    DIAG_CAP_MIC_PIPELINE = 1u << 7,
 };
 
 static void write_le16(uint8_t *out, uint16_t value)
@@ -132,6 +148,53 @@ static uint8_t common_header_flags(bool ota_active)
     return flags;
 }
 
+static void collect_scheduler_stats(void)
+{
+    const uint32_t runtime_total = ds5_runtime_stats_counter();
+    const uint32_t runtime_delta = runtime_total - diag_runtime_previous_total;
+    const bool sample_valid = diag_cpu_sample_ready && runtime_delta != 0;
+
+    for (uint8_t slot = 0; slot < RUNTIME_DIAG_TASK_COUNT; slot++) {
+        TaskHandle_t handle = diag_task_handles[slot];
+        if (!handle) {
+            diag_task_stack_free[slot] = UINT16_MAX;
+            diag_task_cpu_permille[slot] = UINT16_MAX;
+            diag_task_priorities[slot] = UINT8_MAX;
+            continue;
+        }
+
+        TaskStatus_t status;
+        vTaskGetInfo(handle, &status, pdTRUE, eInvalid);
+        diag_task_stack_free[slot] =
+            status.usStackHighWaterMark > UINT16_MAX
+                ? UINT16_MAX
+                : (uint16_t)status.usStackHighWaterMark;
+        diag_task_priorities[slot] =
+            status.uxCurrentPriority > UINT8_MAX
+                ? UINT8_MAX
+                : (uint8_t)status.uxCurrentPriority;
+
+        const uint32_t task_runtime = (uint32_t)status.ulRunTimeCounter;
+        if (sample_valid) {
+            const uint32_t task_delta =
+                task_runtime - diag_task_runtime_previous[slot];
+            uint64_t permille =
+                ((uint64_t)task_delta * 1000u + runtime_delta / 2u) /
+                runtime_delta;
+            if (permille > 1000u)
+                permille = 1000u;
+            diag_task_cpu_permille[slot] = (uint16_t)permille;
+        } else {
+            diag_task_cpu_permille[slot] = 0;
+        }
+        diag_task_runtime_previous[slot] = task_runtime;
+    }
+
+    diag_runtime_previous_total = runtime_total;
+    diag_cpu_sample_valid = sample_valid;
+    diag_cpu_sample_ready = true;
+}
+
 void runtime_diag_init(void)
 {
     memset(diag_reports, 0, sizeof(diag_reports));
@@ -144,6 +207,19 @@ void runtime_diag_init(void)
     diag_sequence = 0;
     diag_last_publish_us = 0;
     diag_min_free_bytes = UINT32_MAX;
+    memset(diag_task_handles, 0, sizeof(diag_task_handles));
+    memset(diag_task_runtime_previous, 0,
+           sizeof(diag_task_runtime_previous));
+    memset(diag_task_stack_free, 0xff, sizeof(diag_task_stack_free));
+    memset(diag_task_cpu_permille, 0, sizeof(diag_task_cpu_permille));
+    memset(diag_task_priorities, 0xff, sizeof(diag_task_priorities));
+    diag_runtime_previous_total = 0;
+    diag_cpu_sample_ready = false;
+    diag_cpu_sample_valid = false;
+    diag_input_queue_depth = 0;
+    diag_output_queue_depth = 0;
+    diag_input_queue_high_water = 0;
+    diag_output_queue_high_water = 0;
 
     /* A host probing immediately after enumeration still receives a valid,
      * CRC-protected response.  The first usb_task pass replaces it with live
@@ -154,6 +230,25 @@ void runtime_diag_init(void)
                         DIAG_HEADER_VALID | DIAG_HEADER_COHERENT, 0, 0);
         }
     }
+}
+
+void runtime_diag_set_task_handle(enum runtime_diag_task_slot slot,
+                                  void *task_handle)
+{
+    if ((uint8_t)slot >= RUNTIME_DIAG_TASK_COUNT)
+        return;
+    diag_task_handles[(uint8_t)slot] = (TaskHandle_t)task_handle;
+}
+
+void runtime_diag_set_bridge_queue_stats(uint8_t input_depth,
+                                         uint8_t output_depth,
+                                         uint8_t input_high_water,
+                                         uint8_t output_high_water)
+{
+    diag_input_queue_depth = input_depth;
+    diag_output_queue_depth = output_depth;
+    diag_input_queue_high_water = input_high_water;
+    diag_output_queue_high_water = output_high_water;
 }
 
 void runtime_diag_task_update(uint64_t monotonic_us)
@@ -167,6 +262,7 @@ void runtime_diag_task_update(uint64_t monotonic_us)
         return;
     }
     diag_last_publish_us = monotonic_us;
+    collect_scheduler_stats();
 
     struct usb_gamepad_runtime_stats usb_stats;
     struct usb_gamepad_latency_stats latency_stats;
@@ -256,7 +352,8 @@ void runtime_diag_task_update(uint64_t monotonic_us)
     data[19] = bt_hid_host_is_switching() ? 1u : 0u;
     data[20] = DIAG_CAP_PAGED | DIAG_CAP_CRC32 | DIAG_CAP_COHERENT |
                DIAG_CAP_MONOTONIC | DIAG_CAP_READ_ONLY |
-               DIAG_CAP_SELECT_PAGE | DIAG_CAP_BRIDGE_LATENCY;
+               DIAG_CAP_SELECT_PAGE | DIAG_CAP_BRIDGE_LATENCY |
+               DIAG_CAP_MIC_PIPELINE;
     write_le32(data + 21, diag_get_requests);
     write_le32(data + 25, diag_select_requests);
     write_le32(data + 29, diag_select_errors);
@@ -303,7 +400,13 @@ void runtime_diag_task_update(uint64_t monotonic_us)
                         uac_stats.pcm_pool_starvations +
                         uac_stats.pcm_queue_overruns +
                         uac_stats.mic_ring_overruns +
-                        uac_stats.mic_ring_underruns;
+                        uac_stats.mic_ring_underruns +
+                        uac_stats.mic_ep_write_errors +
+                        audio_stats.pairs_rejected +
+                        audio_stats.encode_errors +
+                        audio_stats.deadline_misses +
+                        audio_stats.mic_queue_overruns +
+                        audio_stats.mic_decode_errors;
     write_le32(data + 0, pressure);
     write_le32(data + 4, usb_stats.start_errors);
     write_le32(data + 8, bt_stats.audio_backpressure);
@@ -459,6 +562,53 @@ void runtime_diag_task_update(uint64_t monotonic_us)
     data[23] = 1u; /* bridge latency schema version */
     finish_page(pages[RUNTIME_DIAG_PAGE_BRIDGE_LATENCY],
                 RUNTIME_DIAG_PAGE_BRIDGE_LATENCY, 24, header_flags,
+                sequence, monotonic_ms);
+
+    /* Page 7: controller microphone receive/decode path.  This separates
+     * Bluetooth Opus delivery and decoder health from the USB microphone
+     * ring/endpoint counters on page 4. */
+    data = pages[RUNTIME_DIAG_PAGE_MIC_PIPELINE] +
+           RUNTIME_DIAG_DATA_OFFSET;
+    uint8_t mic_timing_flags = 0;
+    write_le32(data + 0, audio_stats.mic_frames_received);
+    write_le32(data + 4, audio_stats.mic_frames_decoded);
+    write_le32(data + 8, audio_stats.mic_queue_overruns);
+    write_le32(data + 12, audio_stats.mic_decode_errors);
+    write_le32(data + 16, audio_stats.mic_queue_high_water);
+    write_le16(data + 20,
+               saturate_us(audio_stats.mic_decode_us_p99,
+                           1u << 0, &mic_timing_flags));
+    write_le16(data + 22,
+               saturate_us(audio_stats.mic_decode_us_max,
+                           1u << 0, &mic_timing_flags));
+    data[24] = 1u; /* page layout version */
+    data[25] = mic_timing_flags;
+    finish_page(pages[RUNTIME_DIAG_PAGE_MIC_PIPELINE],
+                RUNTIME_DIAG_PAGE_MIC_PIPELINE, 26, header_flags,
+                sequence, monotonic_ms);
+
+    /* Page 8: scheduler headroom.  Stack values are minimum free stack words
+     * since task creation. CPU values are per-mille over the last published
+     * interval, not lifetime averages.  0xffff marks a task that was not
+     * created (for example audio after codec initialization failure). */
+    data = pages[RUNTIME_DIAG_PAGE_SCHEDULER] +
+           RUNTIME_DIAG_DATA_OFFSET;
+    data[0] = 1u; /* page layout version */
+    data[1] = diag_cpu_sample_valid ? 1u : 0u;
+    data[2] = RUNTIME_DIAG_TASK_COUNT;
+    data[3] = 0;
+    for (uint8_t slot = 0; slot < RUNTIME_DIAG_TASK_COUNT; slot++) {
+        write_le16(data + 4u + slot * 2u, diag_task_stack_free[slot]);
+        write_le16(data + 18u + slot * 2u,
+                   diag_task_cpu_permille[slot]);
+        data[32u + slot] = diag_task_priorities[slot];
+    }
+    data[39] = diag_input_queue_depth;
+    data[40] = diag_output_queue_depth;
+    data[41] = diag_input_queue_high_water;
+    data[42] = diag_output_queue_high_water;
+    finish_page(pages[RUNTIME_DIAG_PAGE_SCHEDULER],
+                RUNTIME_DIAG_PAGE_SCHEDULER, 43, header_flags,
                 sequence, monotonic_ms);
 
     __asm volatile("fence rw, rw" ::: "memory");

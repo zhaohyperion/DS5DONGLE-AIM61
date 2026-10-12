@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{DUALSENSE_PRODUCT_IDS, SONY_VENDOR_ID};
+use super::{DUALSENSE_PRODUCT_IDS, SONY_VENDOR_ID, controller_calibration};
 
 #[cfg(windows)]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -60,6 +60,8 @@ pub struct InputState {
     pub accel_x: i16,
     pub accel_y: i16,
     pub accel_z: i16,
+    pub gyro_dps: Option<[f32; 3]>,
+    pub accel_g: Option<[f32; 3]>,
     pub touch: [TouchPoint; 2],
     pub battery_percent: Option<u8>,
     pub battery_charging: bool,
@@ -102,6 +104,8 @@ impl Default for InputState {
             accel_x: 0,
             accel_y: 0,
             accel_z: 0,
+            gyro_dps: None,
+            accel_g: None,
             touch: [TouchPoint::default(); 2],
             battery_percent: None,
             battery_charging: false,
@@ -336,6 +340,7 @@ enum TestCommand {
 #[derive(Debug)]
 pub enum TestEvent {
     Connected(String),
+    MotionCalibration(controller_calibration::MotionCalibrationInfo),
     Input(InputState),
     Metrics(DebugMetrics),
     OutputSent,
@@ -494,6 +499,11 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
             audio_restore,
         };
         let _ = events.send(TestEvent::Connected(name));
+        let motion_calibration =
+            controller_calibration::read_controller_motion_calibration(&device);
+        let _ = events.send(TestEvent::MotionCalibration(
+            motion_calibration.info.clone(),
+        ));
 
         let mut report_count = 0_u64;
         let mut rate_count = 0_u64;
@@ -520,6 +530,7 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                 match commands.try_recv() {
                     Ok(TestCommand::Output(state)) => {
                         guided_demo = None;
+                        stress_active = false;
                         output_state = state;
                         let report = pad_edge_report(
                             build_output_report_with_audio(&output_state, controller_tone),
@@ -531,9 +542,14 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                         let _ = events.send(TestEvent::OutputSent);
                     }
                     Ok(TestCommand::GuidedOutputDemo(kind)) => {
+                        stress_active = false;
                         guided_demo = Some(GuidedDemoState::new(kind));
                     }
                     Ok(TestCommand::StartControllerTone(target)) => {
+                        if stress_active {
+                            stress_active = false;
+                            output_state = OutputState::default();
+                        }
                         if guided_demo.take().is_some() {
                             output_state = OutputState::default();
                         }
@@ -571,6 +587,7 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                     }
                     Ok(TestCommand::StopAll) => {
                         guided_demo = None;
+                        stress_active = false;
                         if controller_tone.take().is_some() {
                             send_waveout_control(&device, false)
                                 .context("failed to stop the DualSense 1 kHz tone")?;
@@ -608,6 +625,11 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                     }
                     Ok(TestCommand::SetStressActive { active, rate_hz }) => {
                         guided_demo = None;
+                        if active && controller_tone.take().is_some() {
+                            send_waveout_control(&device, false)
+                                .context("failed to stop the DualSense tone before stress test")?;
+                            let _ = events.send(TestEvent::ControllerToneChanged(None));
+                        }
                         stress_active = active;
                         stress_interval = Duration::from_millis(1000 / rate_hz.max(1) as u64);
                         stress_started = Instant::now();
@@ -622,6 +644,7 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                     }
                     Ok(TestCommand::Calibrate(step)) => {
                         guided_demo = None;
+                        stress_active = false;
                         if controller_tone.take().is_some() {
                             send_waveout_control(&device, false)
                                 .context("failed to stop the DualSense tone before calibration")?;
@@ -701,6 +724,16 @@ fn run_hid_session(commands: Receiver<TestCommand>, events: Sender<TestEvent>) {
                 Ok(0) => {}
                 Ok(length) => {
                     if let Some(mut state) = parse_input_report(&report[..length]) {
+                        state.gyro_dps = Some(motion_calibration.calibrated_gyro_dps([
+                            state.gyro_x,
+                            state.gyro_y,
+                            state.gyro_z,
+                        ]));
+                        state.accel_g = Some(motion_calibration.calibrated_accel_g([
+                            state.accel_x,
+                            state.accel_y,
+                            state.accel_z,
+                        ]));
                         let now = Instant::now();
                         if metrics_active {
                             if let Some(previous) = metrics_last_report {
@@ -1048,6 +1081,8 @@ fn parse_input_report(source: &[u8]) -> Option<InputState> {
         accel_x: read_i16(payload, 21),
         accel_y: read_i16(payload, 23),
         accel_z: read_i16(payload, 25),
+        gyro_dps: None,
+        accel_g: None,
         touch: [parse_touch(payload, 32), parse_touch(payload, 36)],
         battery_percent: battery.percent,
         battery_charging: battery.charging,
@@ -1135,8 +1170,10 @@ fn build_output_report_with_audio(
     report[0] = OUTPUT_REPORT_ID;
     let data = &mut report[1..];
 
-    // Always claim every safe, transient control so moving a slider back to
-    // zero also clears the controller's state from the previous test frame.
+    // This is the 47-byte USB SetState layout used by Sony's 0x02 report and
+    // independently cross-checked against windows-vds v0.5.0. Always claim
+    // every safe, transient control so moving a slider back to zero also
+    // clears the controller's state from the previous test frame.
     data[0] = 0x0f;
     data[1] = 0x15;
     data[2] = state.rumble_right;
@@ -1168,7 +1205,10 @@ fn build_output_report_with_audio(
 }
 
 fn encode_trigger(data: &mut [u8], offset: usize, preset: TriggerPreset, force: u8) {
-    data[offset..offset + 8].fill(0);
+    // A DualSense trigger effect is one mode byte plus ten parameter bytes.
+    // Clear the complete block so a future reusable report buffer cannot leak
+    // parameters from the previous effect into an Off or shorter preset.
+    data[offset..offset + 11].fill(0);
     match preset {
         TriggerPreset::Off => {}
         TriggerPreset::Resistance => {
@@ -1420,22 +1460,33 @@ fn capture_m61_microphone_wasapi(seconds: u32) -> Result<(String, u32, u16, Vec<
             .name()
             .unwrap_or_else(|_| "<unnamed input>".to_owned());
         available.push(name.clone());
-        let lower = name.to_ascii_lowercase();
-        let rank = if lower.contains("dualsense wireless controller") {
-            Some(0_u8)
-        } else if lower.contains("m61") {
-            Some(1)
-        } else if lower.contains("wireless controller") {
-            Some(2)
-        } else {
-            None
+        let Some(name_rank) = m61_input_endpoint_name_rank(&name) else {
+            continue;
         };
-        if let Some(rank) = rank {
-            candidates.push((rank, name, device));
-        }
+        let mut configs = match device.supported_input_configs() {
+            Ok(configs) => configs
+                .filter(|range| {
+                    matches!(
+                        range.sample_format(),
+                        cpal::SampleFormat::I16 | cpal::SampleFormat::F32 | cpal::SampleFormat::U16
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                available.push(format!("{name} [format query failed: {error}]"));
+                continue;
+            }
+        };
+        configs.sort_by_key(m61_input_format_rank);
+        let Some(range) = configs.into_iter().next() else {
+            available.push(format!("{name} [no PCM input format]"));
+            continue;
+        };
+        let format_rank = m61_input_format_rank(&range);
+        candidates.push(((name_rank, format_rank), name, device, range));
     }
     candidates.sort_by_key(|candidate| candidate.0);
-    let (_, endpoint_name, device) = candidates.into_iter().next().ok_or_else(|| {
+    let (_, endpoint_name, device, range) = candidates.into_iter().next().ok_or_else(|| {
         anyhow::anyhow!(
             "M61/DualSense WASAPI microphone endpoint was not found; available inputs: {}",
             if available.is_empty() {
@@ -1445,29 +1496,6 @@ fn capture_m61_microphone_wasapi(seconds: u32) -> Result<(String, u32, u16, Vec<
             }
         )
     })?;
-
-    let mut configs = device
-        .supported_input_configs()
-        .context("unable to query the M61 WASAPI microphone formats")?
-        .collect::<Vec<_>>();
-    configs.sort_by_key(|range| {
-        let contains_48k =
-            range.min_sample_rate().0 <= 48_000 && range.max_sample_rate().0 >= 48_000;
-        (
-            !contains_48k,
-            range.channels() != 2,
-            match range.sample_format() {
-                cpal::SampleFormat::I16 => 0_u8,
-                cpal::SampleFormat::F32 => 1,
-                cpal::SampleFormat::U16 => 2,
-                _ => 3,
-            },
-        )
-    });
-    let range = configs
-        .into_iter()
-        .next()
-        .context("the M61 WASAPI endpoint exposes no supported input format")?;
     let sample_rate = if range.min_sample_rate().0 <= 48_000 && range.max_sample_rate().0 >= 48_000
     {
         cpal::SampleRate(48_000)
@@ -1536,6 +1564,40 @@ fn capture_m61_microphone_wasapi(seconds: u32) -> Result<(String, u32, u16, Vec<
         );
     }
     Ok((endpoint_name, sample_rate.0, channels, captured))
+}
+
+fn m61_input_endpoint_name_rank(name: &str) -> Option<u8> {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("dualsense wireless controller") {
+        Some(0)
+    } else if lower.contains("ds5dongle") || lower.contains("ds5 dongle") {
+        Some(1)
+    } else if lower.contains("ai-m61") || lower.contains("aim61") || lower.contains("m61") {
+        Some(2)
+    } else if lower.contains("wireless controller") {
+        // Compatibility fallback for older descriptors. Never select the
+        // Windows default microphone solely because no project endpoint exists.
+        Some(3)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn m61_input_format_rank(range: &cpal::SupportedStreamConfigRange) -> (bool, bool, u8, u32) {
+    let contains_48k = range.min_sample_rate().0 <= 48_000 && range.max_sample_rate().0 >= 48_000;
+    let format_rank = match range.sample_format() {
+        cpal::SampleFormat::I16 => 0,
+        cpal::SampleFormat::F32 => 1,
+        cpal::SampleFormat::U16 => 2,
+        _ => 3,
+    };
+    (
+        !contains_48k,
+        range.channels() != 2,
+        format_rank,
+        range.max_sample_rate().0.abs_diff(48_000),
+    )
 }
 
 #[cfg(windows)]
@@ -1731,6 +1793,61 @@ mod tests {
     }
 
     #[test]
+    fn parses_dualsenseclient_usb_golden_vector() {
+        // Interoperability vector from DualSenseClient commit
+        // fff354fb7d37cb6e4f5ecb7ba4e72ba5b72094a0 (GPL-3.0),
+        // InputReportTestData. Keeping a real, independently maintained vector
+        // here catches a one-byte report-ID or touch/IMU offset regression.
+        let report: [u8; 64] = [
+            0x01, 0, 255, 128, 128, 0, 255, 42, 0xf2, 0xff, 0xf7, 0, 0, 0, 0, 0, 0xe8, 0x03, 0x18,
+            0xfc, 0, 0, 0x00, 0x20, 0, 0, 0x00, 0xe0, 0x39, 0x30, 0, 0, 35, 0x05, 0x64, 0x80, 0x0c,
+            0x8a, 0, 0, 0, 0, 0x01, 0x02, 0x9f, 0x86, 0x01, 0x00, 0x03, 0x32, 0x09, 0x01, 0x00,
+            0x18, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+
+        let state = parse_input_report(&report).expect("valid 64-byte USB input report");
+        assert_eq!((state.lx, state.ly, state.rx, state.ry), (0, 255, 128, 128));
+        assert_eq!((state.l2, state.r2, state.dpad), (0, 255, 2));
+        assert!(state.square && state.cross && state.circle && state.triangle);
+        assert!(
+            state.l1
+                && state.r1
+                && state.l2_button
+                && state.r2_button
+                && state.create
+                && state.options
+                && state.l3
+                && state.r3
+        );
+        assert!(state.ps && state.touchpad_click && state.mute);
+        assert_eq!((state.gyro_x, state.gyro_y, state.gyro_z), (1000, -1000, 0));
+        assert_eq!(
+            (state.accel_x, state.accel_y, state.accel_z),
+            (8192, 0, -8192)
+        );
+        assert_eq!(
+            (
+                state.touch[0].active,
+                state.touch[0].id,
+                state.touch[0].x,
+                state.touch[0].y,
+            ),
+            (true, 5, 100, 200)
+        );
+        assert_eq!(state.touch[1].id, 10);
+        assert!(!state.touch[1].active);
+        assert_eq!(state.battery_percent, Some(85));
+        assert!(state.battery_charging && state.battery_cable_connected);
+        assert!(state.headphone_connected && state.headset_microphone_connected);
+
+        // hidapi can return a report with or without the report-ID byte. Both
+        // are accepted, but a truncated report is never guessed or zero-filled.
+        assert!(parse_input_report(&report[1..]).is_some());
+        assert!(parse_input_report(&report[..54]).is_none());
+        assert!(parse_input_report(&[]).is_none());
+    }
+
+    #[test]
     fn short_digital_transitions_bypass_the_ui_rate_limit() {
         let idle = InputState::default();
         let mut pressed = idle.clone();
@@ -1756,6 +1873,27 @@ mod tests {
     }
 
     #[test]
+    fn microphone_endpoint_matching_never_falls_back_to_an_unrelated_default() {
+        assert_eq!(
+            m61_input_endpoint_name_rank("Microphone (DualSense Wireless Controller)"),
+            Some(0)
+        );
+        assert_eq!(
+            m61_input_endpoint_name_rank("Microphone (DS5Dongle AIM61)"),
+            Some(1)
+        );
+        assert_eq!(m61_input_endpoint_name_rank("AI-M61 Microphone"), Some(2));
+        assert_eq!(
+            m61_input_endpoint_name_rank("Microphone (Wireless Controller)"),
+            Some(3)
+        );
+        assert_eq!(
+            m61_input_endpoint_name_rank("Realtek Microphone Array"),
+            None
+        );
+    }
+
+    #[test]
     fn builds_safe_standard_output_report() {
         let state = OutputState {
             rumble_right: 20,
@@ -1777,6 +1915,55 @@ mod tests {
         assert_eq!(&report[11..15], &[2, 15, 100, 222]);
         assert_eq!(&report[22..25], &[1, 40, 111]);
         assert_eq!(&report[45..48], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn output_report_layout_matches_windows_vds_set_state_contract() {
+        let state = OutputState {
+            lightbar_enabled: true,
+            lightbar_rgb: [0x11, 0x22, 0x33],
+            player_leds: 0x15,
+            mute_led: 2,
+            left_trigger: TriggerPreset::Resistance,
+            right_trigger: TriggerPreset::Automatic,
+            left_trigger_force: 96,
+            right_trigger_force: 144,
+            ..OutputState::default()
+        };
+        let report = build_output_report(&state);
+
+        assert_eq!(report.len(), OUTPUT_PAYLOAD_BYTES + 1);
+        assert_eq!(report[0], OUTPUT_REPORT_ID);
+        assert_eq!(report[1] & 0x0c, 0x0c, "both trigger allow bits");
+        assert_eq!(report[2] & 0x14, 0x14, "LED and player allow bits");
+        assert_eq!(report[9], 2, "mute-light byte");
+        assert_eq!(&report[11..22], &[6, 10, 144, 20, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&report[22..33], &[1, 40, 96, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(report[44], 0x15, "player indicator byte");
+        assert_eq!(&report[45..48], &[0x11, 0x22, 0x33]);
+
+        let stopped = build_stop_report();
+        assert_eq!(stopped.len(), OUTPUT_PAYLOAD_BYTES + 1);
+        assert!(stopped[3..39].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn trigger_blocks_match_dualsenseclient_interoperability_vectors() {
+        // Cross-checked against DualSenseClient TriggerEffectBuilderTests at
+        // commit fff354fb7d37cb6e4f5ecb7ba4e72ba5b72094a0.
+        let mut payload = [0xa5_u8; OUTPUT_PAYLOAD_BYTES];
+
+        encode_trigger(&mut payload, 10, TriggerPreset::Off, 230);
+        assert_eq!(&payload[10..21], &[0; 11]);
+
+        encode_trigger(&mut payload, 10, TriggerPreset::Resistance, 230);
+        assert_eq!(&payload[10..21], &[1, 40, 230, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        encode_trigger(&mut payload, 10, TriggerPreset::Weapon, 255);
+        assert_eq!(&payload[10..21], &[2, 15, 100, 255, 0, 0, 0, 0, 0, 0, 0]);
+
+        encode_trigger(&mut payload, 10, TriggerPreset::Automatic, 255);
+        assert_eq!(&payload[10..21], &[6, 10, 255, 20, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

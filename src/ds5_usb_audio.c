@@ -659,6 +659,10 @@ void usb_audio_process_deferred(void)
     spk_mute = deferred_spk_mute;
     taskEXIT_CRITICAL();
 
+    (void)mic_volume_db;
+    (void)mic_mute;
+    (void)spk_mute;
+
     if (events & AUDIO_DEFER_SPK_OPEN)
         LOG_INF("[AUDIO] Speaker stream opened\n");
     if (events & AUDIO_DEFER_SPK_CLOSE)

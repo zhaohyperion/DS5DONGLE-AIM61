@@ -19,7 +19,7 @@ elseif(DEFINED ENV{PROJECT_SDK_VERSION} AND
        NOT "$ENV{PROJECT_SDK_VERSION}" STREQUAL "")
     set(DS5_SELECTED_VERSION "$ENV{PROJECT_SDK_VERSION}")
 else()
-    set(DS5_SELECTED_VERSION "3.6.2")
+    set(DS5_SELECTED_VERSION "3.6.3")
 endif()
 if(NOT DS5_SELECTED_VERSION MATCHES
    "^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])\\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])\\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])$")
@@ -57,7 +57,7 @@ if(NOT "${DS5_LOG_LEVEL}" MATCHES "^[0-3]$")
 endif()
 message(STATUS "DS5Dongle custom log level: ${DS5_LOG_LEVEL}")
 
-# v3.6.2 is built as two deliberately separate HS profiles. Both reserve the
+# v3.6.3 is built as two deliberately separate HS profiles. Both reserve the
 # same HID Feature declaration to avoid stale Windows preparsed-data caches;
 # the standard image keeps the 0xFD handler, task graph, state and hot-path
 # counters out, while the diagnostic image enables the versioned protocol.
@@ -80,6 +80,12 @@ else()
     message(FATAL_ERROR "DS5_BUILD_PROFILE must be standard or diagnostic")
 endif()
 message(STATUS "DS5Dongle build profile: ${DS5_BUILD_PROFILE}")
+
+# FreeRTOSConfig.h is consumed while the SDK's kernel target is compiled, not
+# only by the application target below.  Publish the profile globally so the
+# diagnostic image can enable task run-time counters while the standard image
+# keeps the context-switch path unchanged.
+add_compile_definitions(DS5_DIAGNOSTIC_BUILD=${DS5_DIAGNOSTIC_BUILD})
 
 # A release public key is supplied as a 65-byte SEC1 uncompressed P-256 point
 # (04 || X || Y).  Only X || Y enters the generated build header.  No default
@@ -159,7 +165,7 @@ if(NOT DEFINED ENV{BOARD_LCTECH_616} AND
     set(DS5_TARGET_HAS_PSRAM ON)
 endif()
 
-# Both v3.6.2 profiles use the SDK-supported GCC whole-program optimizer.
+# Both v3.6.3 profiles use the SDK-supported GCC whole-program optimizer.
 # This keeps the standard image's realtime path small after diagnostic code is
 # compiled out and applies the same code-generation baseline to diagnostics.
 set(CONFIG_GCC_COMPILE_LTO y)

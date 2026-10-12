@@ -90,6 +90,9 @@ typedef struct {
 
 static ota_context_t ota_ctx;
 static QueueHandle_t ota_event_queue;
+static StaticQueue_t ota_event_queue_control;
+static uint8_t ota_event_queue_storage[
+    OTA_EVENT_QUEUE_DEPTH * sizeof(ota_event_t)];
 static volatile bool ota_queue_overflow;
 static volatile bool ota_maintenance;
 static ota_maintenance_hook_t maintenance_hook;
@@ -1184,8 +1187,9 @@ int ota_update_init(void)
     trial_boot = ota_ctx.trial_retry_byte >= 0xF0u;
     start_trial_watchdog_if_needed();
 
-    ota_event_queue = xQueueCreate(OTA_EVENT_QUEUE_DEPTH,
-                                   sizeof(ota_event_t));
+    ota_event_queue = xQueueCreateStatic(
+        OTA_EVENT_QUEUE_DEPTH, sizeof(ota_event_t),
+        ota_event_queue_storage, &ota_event_queue_control);
     if (!ota_event_queue) {
         ota_ctx.state = OTA_STATE_ERROR;
         ota_ctx.error = OTA_ERROR_INTERNAL;

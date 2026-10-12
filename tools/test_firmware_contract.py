@@ -7,6 +7,7 @@ standard library so they can run on Windows without the Bouffalo toolchain.
 
 from __future__ import annotations
 
+import json
 import re
 import struct
 import unittest
@@ -82,7 +83,7 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_PROTOCOL_VERSION"), 2)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_HEADER_SIZE"), 16)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_DATA_MAX"), 43)
-        self.assertEqual(integer_define(header, "RUNTIME_DIAG_PAGE_COUNT"), 7)
+        self.assertEqual(integer_define(header, "RUNTIME_DIAG_PAGE_COUNT"), 9)
         self.assertEqual(integer_define(header, "RUNTIME_DIAG_SELECT_PAGE"), 1)
 
         ota_header = "src/ota_update.h"
@@ -112,6 +113,36 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertIn("!(blob_flags() & 0x01u)", macro)
         self.assertIn("g_last_release_us[id] != 0", macro)
         self.assertIn("now_us - g_ps_press_us >= 2000000ULL", macro)
+        self.assertIn("MACRO_CMD_ERASE       = 0x08", macro)
+        self.assertIn("ef_del_env(inactive)", macro)
+        self.assertIn("ef_del_env(active)", macro)
+        self.assertLess(macro.index("ef_del_env(inactive)"), macro.index("ef_del_env(active)"))
+        self.assertIn("MACRO_STATE_ERASED", macro)
+        self.assertIn("g_trigger_head[4][REMAP_BTN_COUNT]", macro)
+        self.assertIn("schedule_long_trigger(id, now_us)", macro)
+        self.assertIn("MACRO_PLAYBACK_RESYNC_US", macro)
+        self.assertIn("Every state is therefore", macro)
+        self.assertIn("g_record_encoded_state", macro)
+        self.assertIn("recorder_prepare_limits(g_record_trigger)", macro)
+        self.assertIn("ef_get_env_blob(key, &g_transfer", macro)
+        self.assertIn(
+            "g_state == MACRO_STATE_RECEIVING ? g_received : g_read_offset",
+            macro,
+        )
+        self.assertNotIn("for (uint16_t i = 0; i < count; ++i) {\n"
+                         "        const uint8_t *d = descriptor_at(i);\n"
+                         "        if (!d || d[4] != blob_profile() || d[5] != trigger",
+                         macro)
+
+        macro_host = read("tools/ds5dongle-flasher/src/macro_config.rs")
+        self.assertIn("pub fn clear_device_macro_storage()", macro_host)
+        self.assertIn("let mut erase = macro_frame(0x08)", macro_host)
+        self.assertIn("wait_for_state(&device, &[4])", macro_host)
+        self.assertIn("read_device_macro_set()?", macro_host)
+        self.assertIn("fn wait_for_transfer_offset(", macro_host)
+        self.assertIn("let mut acknowledged_chunks = true", macro_host)
+        self.assertIn("allow_legacy_without_ack", macro_host)
+        self.assertIn("macro_frame(0x04)", macro_host)
 
         ep0_region = usb[
             usb.index("void usbd_hid_get_report") :
@@ -145,6 +176,18 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertIn("free_bytes < diag_min_free_bytes", diag)
         self.assertNotIn("kmin_free_size(", diag)
         self.assertIn("audio_get_runtime_diag_stats(&audio_stats)", diag)
+        self.assertIn("RUNTIME_DIAG_PAGE_MIC_PIPELINE", diag)
+        self.assertIn("audio_stats.mic_frames_received", diag)
+        self.assertIn("audio_stats.mic_frames_decoded", diag)
+        self.assertIn("audio_stats.mic_queue_overruns", diag)
+        self.assertIn("audio_stats.mic_decode_errors", diag)
+        self.assertIn("audio_stats.mic_decode_us_p99", diag)
+        self.assertIn("audio_stats.mic_decode_us_max", diag)
+        self.assertIn("RUNTIME_DIAG_PAGE_SCHEDULER", diag)
+        self.assertIn("vTaskGetInfo(handle, &status, pdTRUE, eInvalid)", diag)
+        self.assertIn("diag_task_stack_free", diag)
+        self.assertIn("diag_task_cpu_permille", diag)
+
         self.assertNotIn("audio_get_runtime_stats(&audio_stats)", diag)
         self.assertNotIn("xPortGetFreeHeapSize", diag)
         self.assertNotIn("xPortGetMinimumEverFreeHeapSize", diag)
@@ -238,6 +281,18 @@ class FirmwareContractTests(unittest.TestCase):
         ):
             self.assertIn(fragment, docs)
 
+    def test_runtime_queues_use_static_storage(self) -> None:
+        for source in (
+            "src/main.c",
+            "src/audio.c",
+            "src/macro_engine.c",
+            "src/usb_gamepad.c",
+            "src/ota_update.c",
+        ):
+            text = read(source)
+            self.assertIn("xQueueCreateStatic(", text, source)
+            self.assertNotIn("xQueueCreate(", text, source)
+
     def test_custom_log_level_build_contract(self) -> None:
         cmake = read("CMakeLists.txt")
         self.assertIn('set(DS5_LOG_LEVEL "0" CACHE STRING', cmake)
@@ -259,6 +314,27 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertIn("Invalid DS5_LOG_LEVEL", windows)
 
         self.assertIn("DS5_LOG_LEVEL = \"0\"", read("README.md"))
+
+    def test_firmware_warning_baseline_is_enforced_in_ci(self) -> None:
+        workflow = read(".github/workflows/release.yml")
+        checker = read("tools/check_firmware_warnings.py")
+        baseline = json.loads(read("tools/firmware_warning_baseline.json"))
+        self.assertIn("check_firmware_warnings.py", workflow)
+        self.assertIn("unbaselined warning", checker)
+        self.assertEqual(baseline["schema"], 1)
+        ids = {item["id"] for item in baseline["warnings"]}
+        self.assertIn("gcc-ar-lto-plugin-advisory", ids)
+        self.assertIn("bouffalo-sdk-lto-type-mismatch", ids)
+
+    def test_flasher_ui_is_split_from_business_entrypoint(self) -> None:
+        main = read("tools/ds5dongle-flasher/src/main.rs")
+        app_ui = read("tools/ds5dongle-flasher/src/app_ui.rs")
+        theme = read("tools/ds5dongle-flasher/src/ui_theme.rs")
+        self.assertIn("mod app_ui;", main)
+        self.assertIn("mod ui_theme;", main)
+        self.assertNotIn("impl eframe::App for FlasherApp", main)
+        self.assertIn("impl eframe::App for FlasherApp", app_ui)
+        self.assertIn("pub(crate) const COLOR_APP_BG", theme)
 
     def test_cherryusb_init_events_are_deferred_not_unknown(self) -> None:
         usb = read("src/usb_gamepad.c")
@@ -368,6 +444,27 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertIn("encoded != OPUS_OUT_SIZE", audio)
         self.assertIn("deadline_misses", audio)
         self.assertIn("static __attribute__((noinline)) void resample_512_480", audio)
+
+        # The controller consumes one 480-sample Opus frame per 512-sample
+        # USB producer block. The producer cadence (10.667 ms), not an
+        # independent 10 ms timer, prevents long-run clock drift.
+        self.assertIn("INPUT_FRAME_SAMPLES * 1000000u", audio)
+        self.assertIn("USB_AUDIO_SAMPLE_RATE - 1u", audio)
+        self.assertIn("OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS)", audio)
+        self.assertIn("OPUS_SET_BITRATE(200 * 8 * 100)", audio)
+        self.assertIn("OPUS_SET_VBR(0)", audio)
+
+        send_start = audio.index("static int send_audio_report")
+        send_end = audio.index("/* ---- Public API ---- */", send_start)
+        send = audio[send_start:send_end]
+        success = send[send.index("if (ret == 0)") :]
+        self.assertIn("audio_seq = next_audio_seq", success)
+        self.assertIn("packet_counter = next_packet_counter", success)
+        self.assertNotIn("audio_seq = next_audio_seq", send[: send.index("if (ret == 0)")])
+        self.assertNotIn(
+            "packet_counter = next_packet_counter",
+            send[: send.index("if (ret == 0)")],
+        )
 
     def test_bounded_realtime_schedulers(self) -> None:
         bt = read("src/bt_hid_host.c")

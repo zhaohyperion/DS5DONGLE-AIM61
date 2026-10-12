@@ -42,6 +42,13 @@ typedef struct {
     uint32_t resample_us_p99;
     uint32_t encode_us_max;
     uint32_t encode_us_p99;
+    uint32_t mic_frames_received;
+    uint32_t mic_frames_decoded;
+    uint32_t mic_queue_overruns;
+    uint32_t mic_decode_errors;
+    uint32_t mic_queue_high_water;
+    uint32_t mic_decode_us_max;
+    uint32_t mic_decode_us_p99;
 } audio_runtime_diag_stats_t;
 
 /**
